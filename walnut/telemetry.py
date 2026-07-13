@@ -1,14 +1,11 @@
-"""Observability wiring for walnut.
+"""Structured logging for the server.
 
-The signals follow the common inference-server split:
+Installs a JSON formatter on the root logger so walnut's logs and uvicorn's
+both come out as single-line JSON on stdout, ready for a log collector to
+parse. Set up once from `walnut.server.serve`.
 
-- **Logs** — structured JSON to stdout via `configure_logging`, suitable for
-  collection by the platform (k8s, Loki, CloudWatch, ...). Configured once at
-  the server entry point (`walnut.server.serve`).
-- **Metrics** — Prometheus, scraped at ``/metrics`` (wired in `walnut.server`
-  via ``prometheus-fastapi-instrumentator`` plus walnut-specific counters).
-- **Traces** — not yet wired. OpenTelemetry traces are the intended next layer
-  once the real engine produces meaningful spans (prefill/decode/queue).
+Metrics live in `walnut.server` (Prometheus at ``/metrics``); traces aren't
+wired yet.
 """
 
 from __future__ import annotations
@@ -19,11 +16,13 @@ from datetime import UTC, datetime
 
 _LOGGING_CONFIGURED = False
 
-# Standard LogRecord attributes; anything else on a record is treated as
-# structured context passed via ``logger.info(..., extra={...})``.
+# Attributes on a stdlib LogRecord are machinery, not context; everything else
+# on a record is user-supplied ``extra=`` and gets serialized. ``color_message``
+# is the one exception we add by hand: uvicorn injects an ANSI-colored copy of
+# the message via ``extra=``, so it's noise rather than a built-in attribute.
 _RESERVED_LOG_ATTRS = frozenset(
     logging.LogRecord("", 0, "", 0, "", None, None).__dict__
-) | {"message", "asctime", "taskName"}
+) | {"color_message"}
 
 
 class JsonFormatter(logging.Formatter):
@@ -41,7 +40,7 @@ class JsonFormatter(logging.Formatter):
                 payload[key] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload, default=str)
+        return json.dumps(payload, default=str, ensure_ascii=False)
 
 
 def configure_logging(level: str = "INFO") -> None:
