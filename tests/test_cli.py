@@ -1,3 +1,4 @@
+import click
 from typer.testing import CliRunner
 
 import walnut.server as server_module
@@ -5,20 +6,26 @@ from walnut.cli import app
 
 runner = CliRunner()
 
+# Typer renders help through Rich, which styles option names with ANSI color.
+# On CI (color forced) the two leading dashes land in separate escape spans, so
+# "--host" isn't a literal substring — unstyle before matching.
+
 
 def test_serve_help_lists_arguments():
     result = runner.invoke(app, ["serve", "--help"])
     assert result.exit_code == 0
-    assert "MODEL" in result.output
-    assert "--host" in result.output
-    assert "--port" in result.output
+    out = click.unstyle(result.output)
+    assert "MODEL" in out
+    assert "--host" in out
+    assert "--port" in out
 
 
 def test_chat_help_lists_options():
     result = runner.invoke(app, ["chat", "--help"])
     assert result.exit_code == 0
+    out = click.unstyle(result.output)
     for opt in ("--model", "--url", "--quick"):
-        assert opt in result.output
+        assert opt in out
 
 
 def test_serve_loads_model_and_starts_server(monkeypatch):
