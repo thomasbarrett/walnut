@@ -2,10 +2,8 @@ apiVersion: v2
 name: walnut
 description: OpenAI-compatible inference server for walnut.
 type: application
-# version is the chart version; appVersion tracks the walnut release and is the
-# default image tag. release-please bumps appVersion on each release.
-version: 0.1.0 # x-release-please-version
-appVersion: "0.1.0" # x-release-please-version
+version: 0.2.0
+appVersion: 0.1.0
 home: https://github.com/thomasbarrett/walnut
 sources:
   - https://github.com/thomasbarrett/walnut
