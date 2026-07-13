@@ -1,0 +1,88 @@
+[project]
+name = "walnut"
+version = "0.1.0"
+description = "An inference engine, built on PyTorch."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.139.0",
+    "httpx>=0.28.1",
+    "prometheus-client>=0.25.0",
+    "prometheus-fastapi-instrumentator>=8.0.2",
+    "typer>=0.26.8",
+    "uvicorn>=0.51.0",
+]
+
+# torch is variant-specific: install exactly one of these extras.
+#   uv sync --extra cpu     # CPU wheels (dev, CI, CPU image)
+#   uv sync --extra cu130   # CUDA 13.0 wheels (GPU image)
+[project.optional-dependencies]
+cpu = ["torch>=2.13.0"]
+cu130 = ["torch>=2.13.0"]
+
+[project.scripts]
+walnut = "walnut.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+# The cpu and cu130 extras pull torch from different indexes; never both.
+conflicts = [[{ extra = "cpu" }, { extra = "cu130" }]]
+
+# On Linux (Docker/CI) torch comes from the variant-specific PyTorch index.
+# macOS has no CUDA build and no CPU-index wheels, so it falls back to the
+# default PyPI build (already CPU/MPS-only) — hence the linux markers.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu130", extra = "cu130", marker = "sys_platform == 'linux'" },
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["walnut"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort (import sorting)
+    "UP",   # pyupgrade (modern syntax)
+    "B",    # flake8-bugbear (likely bugs)
+    "C4",   # flake8-comprehensions
+    "SIM",  # flake8-simplify
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.21",
+    "ty>=0.0.59",
+]
+docs = [
+    "mkdocs-material>=9.7.6",
+    "mkdocs-typer2>=0.4.1",
+    "mkdocstrings[python]>=1.0.6",
+]

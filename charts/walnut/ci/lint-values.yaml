@@ -1,0 +1,2 @@
+# Values used only to satisfy `helm lint --strict` in CI (model is required).
+model: Qwen/Qwen3-0.6B-FP8

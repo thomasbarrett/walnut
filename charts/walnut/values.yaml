@@ -1,0 +1,105 @@
+# Model to serve: a Hugging Face id or in-image/local path. REQUIRED.
+# Passed as `walnut serve <model>` (models cannot be set via env var).
+model: ""
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/thomasbarrett/walnut
+  pullPolicy: IfNotPresent
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Port walnut binds inside the container (exported as WALNUT_PORT).
+containerPort: 8000
+
+# Extra args appended after `serve <model>` (e.g. ["--host", "0.0.0.0"]).
+extraArgs: []
+
+# Extra environment variables, in Kubernetes env[] form.
+env: []
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+service:
+  type: ClusterIP
+  port: 80
+
+# Prometheus metrics are always served at /metrics on the service port.
+# Optionally render a ServiceMonitor (requires the Prometheus Operator CRD).
+metrics:
+  serviceMonitor:
+    enabled: false
+    # Extra labels so your Prometheus selects this monitor, e.g.:
+    #   labels: { release: kube-prometheus-stack }
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+
+resources: {}
+  # For real GPU inference, e.g.:
+  # limits:
+  #   nvidia.com/gpu: 1
+
+# Probes hit /v1/models, which only responds once the model is loaded and the
+# server is bound. The startup probe gates liveness so a slow model load does
+# not trigger restarts.
+startupProbe:
+  httpGet:
+    path: /v1/models
+    port: http
+  periodSeconds: 10
+  failureThreshold: 60
+readinessProbe:
+  httpGet:
+    path: /v1/models
+    port: http
+  periodSeconds: 10
+livenessProbe:
+  httpGet:
+    path: /v1/models
+    port: http
+  periodSeconds: 20
+  failureThreshold: 3
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: walnut.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

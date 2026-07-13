@@ -1,0 +1,18 @@
+# Keep the build context small and reproducible.
+.git
+.github
+.venv
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Dev-only files not needed in the runtime image
+tests/
+.python-version
+.ruff_cache/
+.pytest_cache/
+*.md
+!README.md
