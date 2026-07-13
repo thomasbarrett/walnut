@@ -6,8 +6,14 @@ from walnut.cli import app
 runner = CliRunner()
 
 
+# Typer renders help through Rich, which wraps to the terminal width (80 in a
+# no-TTY CI shell) and truncates option names. Force a wide console so the
+# assertions see the full flags.
+WIDE = {"COLUMNS": "200"}
+
+
 def test_serve_help_lists_arguments():
-    result = runner.invoke(app, ["serve", "--help"])
+    result = runner.invoke(app, ["serve", "--help"], env=WIDE)
     assert result.exit_code == 0
     assert "MODEL" in result.output
     assert "--host" in result.output
@@ -15,7 +21,7 @@ def test_serve_help_lists_arguments():
 
 
 def test_chat_help_lists_options():
-    result = runner.invoke(app, ["chat", "--help"])
+    result = runner.invoke(app, ["chat", "--help"], env=WIDE)
     assert result.exit_code == 0
     for opt in ("--model", "--url", "--quick"):
         assert opt in result.output
