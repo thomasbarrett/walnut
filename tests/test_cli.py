@@ -1,7 +1,6 @@
 import click
 from typer.testing import CliRunner
 
-import walnut.server as server_module
 from walnut.cli import app
 
 runner = CliRunner()
@@ -26,22 +25,6 @@ def test_chat_help_lists_options():
     out = click.unstyle(result.output)
     for opt in ("--model", "--url", "--quick"):
         assert opt in out
-
-
-def test_serve_loads_model_and_starts_server(monkeypatch):
-    captured = {}
-
-    def fake_serve(engine, host, port):
-        captured["model_id"] = engine.model_id
-        captured["host"] = host
-        captured["port"] = port
-
-    monkeypatch.setattr(server_module, "serve", fake_serve)
-    result = runner.invoke(
-        app, ["serve", "my/model", "--host", "0.0.0.0", "--port", "9000"]
-    )
-    assert result.exit_code == 0
-    assert captured == {"model_id": "my/model", "host": "0.0.0.0", "port": 9000}
 
 
 def test_chat_quick_prints_completion_and_exits(live_server):

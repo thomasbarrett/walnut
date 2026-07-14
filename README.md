@@ -26,15 +26,15 @@ brew bundle          # installs uv, helm, hadolint, prek, gh
 uv sync --extra cpu --dev
 
 # Serve a model behind an OpenAI-compatible API (Hugging Face id or local path)
-uv run walnut serve Qwen/Qwen3-0.6B-FP8 --host 0.0.0.0 --port 8000
+uv run walnut serve Qwen/Qwen3.5-0.8B --host 0.0.0.0 --port 8000
 
 # Chat with it (defaults to the first model the backend reports)
-uv run walnut chat --quick "Hello!"
+uv run walnut chat --quick 'Hello!'
 ```
 
-> Model inference is currently a placeholder (`EchoEngine`). The real engine
-> plugs in at `walnut/engine.py:load_model`; the HTTP layer depends only on the
-> `Engine` interface.
+> Inference runs through `TorchEngine` (`walnut/engine.py:load_model`), which
+> loads a Hugging Face checkpoint and runs it in PyTorch. The HTTP layer depends
+> only on the `Engine` interface, so an alternative engine drops in unchanged.
 
 ### CLI
 
@@ -82,7 +82,7 @@ the [Observability guide](https://thomasbarrett.github.io/walnut/observability/)
 
 ```bash
 docker build -t walnut .          # CPU image (default)
-docker run --rm -p 8000:8000 walnut serve Qwen/Qwen3-0.6B-FP8
+docker run --rm -p 8000:8000 walnut serve Qwen/Qwen3.5-0.8B
 ```
 
 The image runs as a non-root user and reads `WALNUT_HOST` (default `0.0.0.0`)
@@ -100,7 +100,7 @@ tags, CUDA under `-cuda` tags when enabled.
 ## Kubernetes (Helm)
 
 ```bash
-helm install walnut charts/walnut --set model=Qwen/Qwen3-0.6B-FP8
+helm install walnut charts/walnut --set model=Qwen/Qwen3.5-0.8B
 ```
 
 The chart requires `model` and wires startup/readiness/liveness probes against

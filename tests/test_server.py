@@ -1,16 +1,7 @@
 import json
 
-from fastapi.testclient import TestClient
 
-from walnut.engine import EchoEngine
-from walnut.server import create_app
-
-
-def make_client() -> TestClient:
-    return TestClient(create_app(EchoEngine("test-model")))
-
-
-def test_list_models():
+def test_list_models(make_client):
     resp = make_client().get("/v1/models")
     assert resp.status_code == 200
     body = resp.json()
@@ -18,7 +9,7 @@ def test_list_models():
     assert [m["id"] for m in body["data"]] == ["test-model"]
 
 
-def test_chat_completion():
+def test_chat_completion(make_client):
     resp = make_client().post(
         "/v1/chat/completions",
         json={"messages": [{"role": "user", "content": "ping"}]},
@@ -31,12 +22,12 @@ def test_chat_completion():
     assert body["choices"][0]["finish_reason"] == "stop"
 
 
-def test_chat_completion_rejects_empty_messages():
+def test_chat_completion_rejects_empty_messages(make_client):
     resp = make_client().post("/v1/chat/completions", json={"messages": []})
     assert resp.status_code == 400
 
 
-def test_chat_completion_streaming():
+def test_chat_completion_streaming(make_client):
     with (
         make_client() as client,
         client.stream(

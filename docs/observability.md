@@ -1,7 +1,7 @@
 # Observability
 
-walnut exposes three signals: **structured logs**, **Prometheus metrics**, and
-(later) **OpenTelemetry traces**.
+walnut exposes **structured logs** and **Prometheus metrics** today, with
+**OpenTelemetry traces** planned.
 
 ## Logs
 
@@ -33,8 +33,8 @@ curl http://127.0.0.1:8000/metrics
 ```
 
 Model metrics (token throughput, time-to-first-token, queue depth) belong at the
-`Engine` boundary and will land with the real engine. Today's metrics cover the
-HTTP layer.
+`Engine` boundary and aren't instrumented yet; today's metrics cover the HTTP
+layer.
 
 ### Scraping in Kubernetes
 
@@ -52,5 +52,5 @@ metrics:
 
 ## Traces
 
-Not yet wired. OpenTelemetry traces are the next layer, once the real engine
+Not yet wired. OpenTelemetry traces are the next layer, once the engine
 produces spans worth tracing (prefill, decode, queue).
