@@ -1,13 +1,46 @@
 import socket
 import threading
 import time
+from collections.abc import Callable
 
 import httpx
 import pytest
 import uvicorn
+from fastapi.testclient import TestClient
 
-from walnut.engine import EchoEngine
+from walnut.engine import Engine, GenerationConfig, Message
 from walnut.server import create_app
+
+
+class StubEngine(Engine):
+    """Test double that echoes the last user turn without loading any weights.
+
+    Lets the HTTP layer be exercised end to end with assertable responses.
+    """
+
+    def __init__(self, model_id: str = "test-model") -> None:
+        self.model_id = model_id
+
+    def generate(self, messages: list[Message], config: GenerationConfig) -> str:
+        last_user = next(
+            (m.content for m in reversed(messages) if m.role == "user"), ""
+        )
+        return f"echo: {last_user}".strip()
+
+
+@pytest.fixture
+def stub_engine() -> StubEngine:
+    return StubEngine("test-model")
+
+
+@pytest.fixture
+def make_client() -> Callable[..., TestClient]:
+    """Factory for a TestClient over a fresh app backed by a StubEngine."""
+
+    def _make(model_id: str = "test-model") -> TestClient:
+        return TestClient(create_app(StubEngine(model_id)))
+
+    return _make
 
 
 def _free_port() -> int:
@@ -20,10 +53,10 @@ def _free_port() -> int:
 def live_server():
     """Run the OpenAI-compatible server in a background thread.
 
-    Yields the ``/v1`` base URL of a server backed by the EchoEngine.
+    Yields the ``/v1`` base URL of a server backed by the StubEngine.
     """
     port = _free_port()
-    app = create_app(EchoEngine("test-model"))
+    app = create_app(StubEngine("test-model"))
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)

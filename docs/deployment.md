@@ -4,7 +4,7 @@
 
 ```bash
 docker build -t walnut .
-docker run --rm -p 8000:8000 walnut serve Qwen/Qwen3-0.6B-FP8
+docker run --rm -p 8000:8000 walnut serve Qwen/Qwen3.5-0.8B
 ```
 
 The image runs as a non-root user and reads `WALNUT_HOST` (default `0.0.0.0`)
@@ -16,7 +16,7 @@ the release version (see [Development → Releases](development.md#releases)).
 ## Kubernetes (Helm)
 
 ```bash
-helm install walnut charts/walnut --set model=Qwen/Qwen3-0.6B-FP8
+helm install walnut charts/walnut --set model=Qwen/Qwen3.5-0.8B
 ```
 
 The chart **requires** `model` and wires startup, readiness, and liveness

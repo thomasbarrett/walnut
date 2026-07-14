@@ -17,7 +17,7 @@ Serve a model (a Hugging Face id or a local path) behind an OpenAI-compatible
 API:
 
 ```bash
-uv run walnut serve Qwen/Qwen3-0.6B-FP8 --host 0.0.0.0 --port 8000
+uv run walnut serve Qwen/Qwen3.5-0.8B --host 0.0.0.0 --port 8000
 ```
 
 The server exposes `/v1` — see the [HTTP API](http-api.md) reference.

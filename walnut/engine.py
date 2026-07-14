@@ -11,8 +11,19 @@ weights in ``__init__`` / a classmethod and producing tokens in
 
 from __future__ import annotations
 
+import glob
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import Any
+
+import torch
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+from transformers import AutoConfig, AutoTokenizer
+
+from walnut.models import resolve_model_class
+from walnut.sampler import SamplingParams
 
 
 @dataclass(frozen=True)
@@ -60,35 +71,90 @@ class Engine:
         yield self.generate(messages, config)
 
 
-class EchoEngine(Engine):
-    """Placeholder engine used until the native walnut engine is wired in.
+def _load_hf_weights(model: Any, model_id: str) -> None:
+    """Download the checkpoint's safetensors and stream them into ``model``."""
+    root = snapshot_download(model_id, allow_patterns=["*.safetensors", "*.json"])
+    files = sorted(glob.glob(os.path.join(root, "*.safetensors")))
+    if not files:
+        raise FileNotFoundError(f"no .safetensors weights found for {model_id!r}")
 
-    It performs no real inference — it just echoes the last user turn so the
-    server and client can be exercised end to end. Replace it in
-    `load_model` with the real engine.
+    def weights() -> Iterator[tuple[str, torch.Tensor]]:
+        for path in files:
+            with safe_open(path, framework="pt", device="cpu") as shard:
+                for name in shard.keys():  # noqa: SIM118 (safetensors handle)
+                    yield name, shard.get_tensor(name)
+
+    model.load_weights(weights())
+
+
+def _first_stop(text: str, stops: list[str] | None) -> int | None:
+    """Earliest index at which any stop string occurs, else ``None``."""
+    if not stops:
+        return None
+    hits = [i for s in stops if s and (i := text.find(s)) >= 0]
+    return min(hits) if hits else None
+
+
+class TorchEngine(Engine):
+    """Serves a walnut PyTorch model behind the `Engine` interface.
+
+    Builds the model from its Hugging Face config, streams the checkpoint
+    weights in, and drives generation with an ``AutoTokenizer`` (chat template
+    for encoding, incremental detokenization for streaming).
     """
 
     def __init__(self, model_id: str) -> None:
         self.model_id = model_id
+        config = AutoConfig.from_pretrained(model_id)
+        model: Any = resolve_model_class(config)(config)
+        _load_hf_weights(model, model_id)
+        self.model: Any = model.eval()
+        self.tokenizer: Any = AutoTokenizer.from_pretrained(model_id)
+
+    def _encode(self, messages: list[Message]) -> torch.Tensor:
+        chat = [{"role": m.role, "content": m.content} for m in messages]
+        encoded = self.tokenizer.apply_chat_template(
+            chat, add_generation_prompt=True, return_tensors="pt"
+        )
+        # transformers may return a bare tensor or a BatchEncoding mapping.
+        return encoded if isinstance(encoded, torch.Tensor) else encoded["input_ids"]
+
+    def _params(self, config: GenerationConfig) -> SamplingParams:
+        return SamplingParams(
+            max_new_tokens=config.max_tokens,
+            temperature=config.temperature,
+            top_p=config.top_p,
+        )
 
     def generate(self, messages: list[Message], config: GenerationConfig) -> str:
-        last_user = next(
-            (m.content for m in reversed(messages) if m.role == "user"), ""
-        )
-        text = f"[{self.model_id} placeholder] {last_user}".strip()
-        # Approximate max_tokens by trimming on whitespace so limits are visible.
-        if config.max_tokens > 0:
-            words = text.split()
-            if len(words) > config.max_tokens:
-                text = " ".join(words[: config.max_tokens])
-        return text
+        input_ids = self._encode(messages)
+        ids = list(self.model.iter_generate(input_ids, self._params(config)))
+        text = self.tokenizer.decode(ids, skip_special_tokens=True)
+        cut = _first_stop(text, config.stop)
+        return text if cut is None else text[:cut]
+
+    def stream(
+        self, messages: list[Message], config: GenerationConfig
+    ) -> Iterator[str]:
+        input_ids = self._encode(messages)
+        ids: list[int] = []
+        emitted = ""
+        for tok in self.model.iter_generate(input_ids, self._params(config)):
+            ids.append(tok)
+            text = self.tokenizer.decode(ids, skip_special_tokens=True)
+            # Wait for complete characters (partial multi-byte decodes to U+FFFD).
+            if text.endswith("�"):
+                continue
+            cut = _first_stop(text, config.stop)
+            if cut is not None:
+                if cut > len(emitted):
+                    yield text[len(emitted) : cut]
+                return
+            if len(text) > len(emitted):
+                yield text[len(emitted) :]
+                emitted = text
 
 
 def load_model(model: str) -> Engine:
-    """Load ``model`` (a Hugging Face id or local path) into an engine.
-
-    This is the integration point for the native walnut inference engine.
-    It currently returns an `EchoEngine` placeholder so ``serve`` runs
-    end to end; swap the return value for the real engine once it exists.
-    """
-    return EchoEngine(model_id=model)
+    """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`."""
+    return TorchEngine(model_id=model)

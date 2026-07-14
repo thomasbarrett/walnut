@@ -4,12 +4,13 @@ An inference engine, built on PyTorch, with an OpenAI-compatible API.
 
 walnut serves a model over the OpenAI chat API and ships a small CLI for
 serving and chatting. The HTTP layer depends only on a narrow
-[`Engine`](architecture.md) interface, so a real inference engine drops in
+[`Engine`](architecture.md) interface, so an alternative engine drops in
 without touching the server.
 
-!!! note "Placeholder inference"
-    Model inference is currently a placeholder (`EchoEngine`) that echoes the
-    last user turn. The real engine plugs in at `walnut/engine.py:load_model`.
+!!! note "Pluggable engine"
+    Inference runs through `TorchEngine` (`walnut/engine.py:load_model`), which
+    loads a Hugging Face checkpoint and runs it in PyTorch. The server depends
+    only on the `Engine` interface, so an alternative engine drops in unchanged.
     See [Architecture](architecture.md).
 
 ## Highlights
