@@ -29,6 +29,7 @@ from walnut.layers import (
 from walnut.layers.attention import KVCache
 from walnut.layers.cache import Cache
 from walnut.layers.linear_attention import ConvState
+from walnut.models.loader import copy_weights
 from walnut.sampler import Sampler, SamplingParams
 
 
@@ -587,50 +588,6 @@ class Qwen3_5Model(nn.Module):
         )
 
 
-#: Checkpoint prefixes walnut has no module for. ``mtp`` is the multi-token
-#: prediction head, used for speculative decoding.
-_SKIPPED_PREFIXES = ("mtp.",)
-
-
-def _sample(names: list[str], limit: int = 3) -> str:
-    shown = ", ".join(names[:limit])
-    return shown if len(names) <= limit else f"{shown}, ... (+{len(names) - limit})"
-
-
-def _copy_weights(
-    module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
-) -> None:
-    """Copy ``weights`` into ``module``'s parameters, matching by name.
-
-    Strict in both directions, because a naming mismatch is otherwise silent:
-    a parameter the checkpoint never fills keeps its random init, and a
-    checkpoint tensor with nowhere to go is dropped. Heads walnut doesn't
-    implement are skipped by explicit prefix, so they stay a deliberate choice.
-    """
-    params = dict(module.named_parameters())
-    filled: set[str] = set()
-    unmatched: list[str] = []
-    for name, tensor in weights:
-        param = params.get(name)
-        if param is None:
-            if not name.startswith(_SKIPPED_PREFIXES):
-                unmatched.append(name)
-            continue
-        param.data.copy_(tensor)
-        filled.add(name)
-
-    problems = []
-    if missing := sorted(params.keys() - filled):
-        problems.append(f"{len(missing)} unfilled parameter(s): {_sample(missing)}")
-    if unmatched:
-        problems.append(
-            f"{len(unmatched)} unmatched checkpoint tensor(s): "
-            f"{_sample(sorted(unmatched))}"
-        )
-    if problems:
-        raise ValueError("checkpoint does not match the model — " + "; ".join(problems))
-
-
 class Qwen3_5ForConditionalGeneration(nn.Module):
     """Top-level Qwen3.5 model: backbone + LM head."""
 
@@ -719,5 +676,9 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         return torch.cat([input_ids, new], dim=1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        """Copy checkpoint tensors into parameters by matching name."""
-        _copy_weights(self, weights)
+        """Copy checkpoint tensors into parameters by matching name.
+
+        ``mtp`` is the multi-token prediction head, used for speculative
+        decoding; walnut has no module for it, so those tensors are skipped.
+        """
+        copy_weights(self, weights, skip_prefixes=("mtp.",))
