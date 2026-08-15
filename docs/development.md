@@ -26,6 +26,24 @@ uv run pytest          # run tests
 done. `pyproject.toml` is the source of truth for dependencies and the
 ruff/ty/pytest settings.
 
+## Analyzing profiles
+
+`walnut profile` writes a Chrome trace that opens at
+<https://ui.perfetto.dev/>. To query one instead:
+
+```bash
+uv run python .claude/skills/analyze-trace/scripts/analyze_trace.py \
+    overview profiles/walnut-20260815-205304-497286.trace.json.gz
+```
+
+The commands are `overview`, `top-ops`, `device`, `launch`, and `sql`; pass
+`--help` for their options, or `--json` for machine-readable output. It needs
+`perfetto` from the `dev` group, and downloads `trace_processor_shell` on
+first use.
+
+`.claude/skills/analyze-trace/` documents which command answers which
+question, and the trace schema for writing your own queries.
+
 ## Git hooks
 
 Local hooks are managed with [prek](https://prek.j178.dev) (a drop-in

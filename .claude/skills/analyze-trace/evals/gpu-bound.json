@@ -1,0 +1,148 @@
+{
+ "traceEvents": [
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 0,
+   "dur": 10
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "sgemm_128x128",
+   "pid": 1,
+   "tid": 7,
+   "ts": 20,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaDeviceSynchronize",
+   "pid": 1,
+   "tid": 1,
+   "ts": 20,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 2000,
+   "dur": 10
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "sgemm_128x128",
+   "pid": 1,
+   "tid": 7,
+   "ts": 2020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaDeviceSynchronize",
+   "pid": 1,
+   "tid": 1,
+   "ts": 2020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 4000,
+   "dur": 10
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "sgemm_128x128",
+   "pid": 1,
+   "tid": 7,
+   "ts": 4020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaDeviceSynchronize",
+   "pid": 1,
+   "tid": 1,
+   "ts": 4020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 6000,
+   "dur": 10
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "sgemm_128x128",
+   "pid": 1,
+   "tid": 7,
+   "ts": 6020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaDeviceSynchronize",
+   "pid": 1,
+   "tid": 1,
+   "ts": 6020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 8000,
+   "dur": 10
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "sgemm_128x128",
+   "pid": 1,
+   "tid": 7,
+   "ts": 8020,
+   "dur": 1000
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaDeviceSynchronize",
+   "pid": 1,
+   "tid": 1,
+   "ts": 8020,
+   "dur": 1000
+  },
+  {
+   "ph": "M",
+   "name": "thread_name",
+   "pid": 1,
+   "tid": 7,
+   "args": {
+    "name": "stream 7"
+   }
+  }
+ ]
+}

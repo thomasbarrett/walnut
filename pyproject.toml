@@ -74,8 +74,14 @@ select = [
     "SIM",  # flake8-simplify
 ]
 
+[tool.ty.environment]
+# The trace-analysis script sits with its skill, not on the default path.
+extra-paths = [".claude/skills/analyze-trace/scripts"]
+
 [tool.pytest.ini_options]
-pythonpath = ["."]
+# The trace-analysis script lives with the skill that documents it, not in the
+# walnut package; it is still covered by tests.
+pythonpath = [".", ".claude/skills/analyze-trace/scripts"]
 testpaths = ["tests"]
 
 [dependency-groups]
@@ -83,6 +89,10 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.15.21",
     "ty>=0.0.59",
+    # Reads traces in .claude/skills/analyze-trace; a developer tool, so it
+    # stays out of the served image. Downloads trace_processor_shell on first
+    # use.
+    "perfetto>=0.57.0",
 ]
 docs = [
     "mkdocs-material>=9.7.6",
