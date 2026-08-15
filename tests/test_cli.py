@@ -15,8 +15,8 @@ def test_serve_help_lists_arguments():
     assert result.exit_code == 0
     out = click.unstyle(result.output)
     assert "MODEL" in out
-    assert "--host" in out
-    assert "--port" in out
+    for opt in ("--host", "--port", "--device", "--dtype"):
+        assert opt in out
 
 
 def test_chat_help_lists_options():

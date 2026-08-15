@@ -33,14 +33,42 @@ def serve(
     port: Annotated[
         int, typer.Option(envvar="WALNUT_PORT", help="Port to listen on.")
     ] = 8000,
+    device: Annotated[
+        str,
+        typer.Option(
+            envvar="WALNUT_DEVICE",
+            help="Device to run on: 'auto' (CUDA when available), 'cpu', "
+            "'cuda', 'cuda:1', ...",
+        ),
+    ] = "auto",
+    dtype: Annotated[
+        str,
+        typer.Option(
+            envvar="WALNUT_DTYPE",
+            help="Weight/activation dtype: 'auto' (the checkpoint's own dtype, "
+            "downcast from float32 on accelerators), 'bfloat16', 'float16', "
+            "'float32'.",
+        ),
+    ] = "auto",
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
-    from .engine import load_model
+    from .engine import load_model, parse_dtype, resolve_device
     from .server import serve as run_server
 
+    # Resolve the flags before the (slow) load, so a typo fails fast and a real
+    # load failure surfaces as itself rather than as a bad-parameter error.
+    try:
+        target = resolve_device(device)
+        precision = parse_dtype(dtype)
+    except (ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
     typer.echo(f"Loading '{model}'...")
-    engine = load_model(model)
-    typer.echo(f"Serving '{engine.model_id}' on http://{host}:{port}/v1")
+    engine = load_model(model, device=target, dtype=precision)
+    typer.echo(
+        f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
+        f"({engine.device}, {str(engine.dtype).removeprefix('torch.')})"
+    )
     run_server(engine, host=host, port=port)
 
 
