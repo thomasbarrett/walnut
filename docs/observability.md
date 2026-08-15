@@ -1,7 +1,7 @@
 # Observability
 
-walnut exposes **structured logs** and **Prometheus metrics** today, with
-**OpenTelemetry traces** planned.
+walnut exposes **structured logs**, **Prometheus metrics**, and an opt-in
+**torch profiler**, with **OpenTelemetry traces** planned.
 
 ## Logs
 
@@ -114,6 +114,74 @@ Two values walnut had to choose:
     `gen_ai.*` names are at Development stability and may change before GA.
     `error.type`, `server.address`, and `server.port` are Stable, being core
     conventions rather than GenAI ones.
+
+## Profiling
+
+walnut profiles with `torch.profiler` and writes a **Chrome trace**, as vLLM
+and SGLang do. Traces open in [ui.perfetto.dev](https://ui.perfetto.dev/);
+walnut ships no viewer of its own. Each trace has a `.summary.txt` beside it —
+the profiler's `key_averages()` table — so a run can also be read as text.
+
+Profiling is off unless you ask for it: it adds per-op overhead and buffers for
+as long as the window is open.
+
+### One-shot, from the CLI
+
+`walnut profile` loads a model, warms it up, and profiles a single generation:
+
+```bash
+uv run walnut profile Qwen/Qwen3.5-0.8B --max-tokens 32 --output-dir ./profiles
+```
+
+```
+trace:   profiles/walnut-20260815-182128-392836.trace.json.gz
+summary: profiles/walnut-20260815-182128-392836.summary.txt
+```
+
+CUDA graphs are **off** by default here: a replayed graph profiles as a single
+`cudaGraphLaunch`, hiding the per-op breakdown. Pass `--cuda-graph` to measure
+the graph path as it actually serves.
+
+### On a running server
+
+Set `WALNUT_TORCH_PROFILER_DIR` to enable `/start_profile` and `/stop_profile`,
+then bracket the traffic you want to capture:
+
+```bash
+WALNUT_TORCH_PROFILER_DIR=./profiles walnut serve Qwen/Qwen3.5-0.8B
+```
+
+```bash
+curl -X POST localhost:8000/start_profile
+# ...drive the traffic you care about...
+curl -X POST localhost:8000/stop_profile
+```
+
+`stop_profile` returns the paths it wrote:
+
+```json
+{"status": "stopped",
+ "trace": "profiles/walnut-20260815-182128-392836.trace.json.gz",
+ "summary": "profiles/walnut-20260815-182128-392836.summary.txt"}
+```
+
+Both routes return 404 without the variable. Starting twice, or stopping when
+idle, is a 409.
+
+`summary` is `null` when the averages table couldn't be built. The trace is
+written first, so a capture survives that.
+
+!!! note "Server profiles show kernels, not `aten::` ops"
+
+    kineto records framework-level ops only on the thread that started the
+    profile; GPU kernels are recorded from any thread. Requests run on
+    threadpool workers, so a server profile gives the CUDA timeline without the
+    `aten::` names above it. Use `walnut profile` for that attribution — it
+    runs the model on the profiling thread.
+
+    The server also profiles without stacks: worker frames aren't recorded
+    anyway, and collecting them inflates the trace and trips a parse failure in
+    the averages table.
 
 ## Traces
 

@@ -81,6 +81,79 @@ def serve(
 
 
 @app.command()
+def profile(
+    model: Annotated[
+        str,
+        typer.Argument(metavar="MODEL", help="Hugging Face model id or local path."),
+    ],
+    prompt: Annotated[
+        str, typer.Option(help="Prompt to generate from while profiling.")
+    ] = "Explain how a transformer works.",
+    max_tokens: Annotated[
+        int, typer.Option(help="Tokens to decode in the profiled window.")
+    ] = 32,
+    output_dir: Annotated[
+        str,
+        typer.Option(
+            envvar="WALNUT_TORCH_PROFILER_DIR",
+            help="Directory to write the trace and summary to.",
+        ),
+    ] = "./profiles",
+    device: Annotated[
+        str, typer.Option(envvar="WALNUT_DEVICE", help="Device to run on.")
+    ] = "auto",
+    dtype: Annotated[
+        str, typer.Option(envvar="WALNUT_DTYPE", help="Weight/activation dtype.")
+    ] = "auto",
+    cuda_graph: Annotated[
+        bool,
+        typer.Option(
+            "--cuda-graph/--no-cuda-graph",
+            help="Replay decode from a captured CUDA graph. Off by default: a "
+            "replayed graph profiles as one launch, hiding the per-op breakdown.",
+        ),
+    ] = False,
+) -> None:
+    """Profile one generation with MODEL and write a Chrome trace.
+
+    The trace opens at https://ui.perfetto.dev/; the summary beside it is the
+    same run as text.
+    """
+    from .engine import GenerationConfig, Message, load_model, parse_dtype
+    from .engine import resolve_device as resolve
+    from .profiler import TorchProfiler
+
+    try:
+        target = resolve(device)
+        precision = parse_dtype(dtype)
+    except (ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    typer.echo(f"Loading '{model}'...")
+    engine = load_model(model, device=target, dtype=precision, cuda_graph=cuda_graph)
+    config = GenerationConfig(max_tokens=max_tokens)
+    messages = [Message(role="user", content=prompt)]
+
+    # A cold pass pays for autotuning and lazy init, swamping the real numbers.
+    typer.echo("Warming up...")
+    engine.generate(messages, GenerationConfig(max_tokens=4))
+
+    typer.echo(f"Profiling {max_tokens} tokens on {engine.device}...")
+    profiler = TorchProfiler(output_dir)
+    profiler.start()
+    try:
+        engine.generate(messages, config)
+    finally:
+        artifacts = profiler.stop()
+
+    typer.echo(f"trace:   {artifacts.trace}  (open at https://ui.perfetto.dev/)")
+    if artifacts.summary is not None:
+        typer.echo(f"summary: {artifacts.summary}")
+    else:
+        typer.echo("summary: unavailable (see the log)")
+
+
+@app.command()
 def chat(
     model: Annotated[
         str | None,
