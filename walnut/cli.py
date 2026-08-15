@@ -14,16 +14,46 @@ app = typer.Typer(
 
 DEFAULT_URL = "http://127.0.0.1:8000/v1"
 
+# Every command that loads a model takes these, spelled the same way: a flag
+# that means one thing under `serve` and another under `profile` is a trap.
+Model = Annotated[
+    str,
+    typer.Argument(
+        metavar="MODEL",
+        help="Hugging Face model id or local path.",
+    ),
+]
+Device = Annotated[
+    str,
+    typer.Option(
+        envvar="WALNUT_DEVICE",
+        help="Device to run on: 'auto' (CUDA when available), 'cpu', "
+        "'cuda', 'cuda:1', ...",
+    ),
+]
+Dtype = Annotated[
+    str,
+    typer.Option(
+        envvar="WALNUT_DTYPE",
+        help="Weight/activation dtype: 'auto' (the checkpoint's own dtype, "
+        "downcast from float32 on accelerators), 'bfloat16', 'float16', "
+        "'float32'.",
+    ),
+]
+CudaGraph = Annotated[
+    bool,
+    typer.Option(
+        "--cuda-graph/--no-cuda-graph",
+        envvar="WALNUT_CUDA_GRAPH",
+        help="Replay decode from a captured CUDA graph, dropping the "
+        "per-token launch cost. Ignored off CUDA.",
+    ),
+]
+
 
 @app.command()
 def serve(
-    model: Annotated[
-        str,
-        typer.Argument(
-            metavar="MODEL",
-            help="Hugging Face model id or local path to serve.",
-        ),
-    ],
+    model: Model,
     host: Annotated[
         str,
         typer.Option(
@@ -33,31 +63,9 @@ def serve(
     port: Annotated[
         int, typer.Option(envvar="WALNUT_PORT", help="Port to listen on.")
     ] = 8000,
-    device: Annotated[
-        str,
-        typer.Option(
-            envvar="WALNUT_DEVICE",
-            help="Device to run on: 'auto' (CUDA when available), 'cpu', "
-            "'cuda', 'cuda:1', ...",
-        ),
-    ] = "auto",
-    dtype: Annotated[
-        str,
-        typer.Option(
-            envvar="WALNUT_DTYPE",
-            help="Weight/activation dtype: 'auto' (the checkpoint's own dtype, "
-            "downcast from float32 on accelerators), 'bfloat16', 'float16', "
-            "'float32'.",
-        ),
-    ] = "auto",
-    cuda_graph: Annotated[
-        bool,
-        typer.Option(
-            "--cuda-graph/--no-cuda-graph",
-            envvar="WALNUT_CUDA_GRAPH",
-            help="Replay decode from a captured CUDA graph. Ignored off CUDA.",
-        ),
-    ] = True,
+    device: Device = "auto",
+    dtype: Dtype = "auto",
+    cuda_graph: CudaGraph = True,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -82,10 +90,7 @@ def serve(
 
 @app.command()
 def profile(
-    model: Annotated[
-        str,
-        typer.Argument(metavar="MODEL", help="Hugging Face model id or local path."),
-    ],
+    model: Model,
     prompt: Annotated[
         str, typer.Option(help="Prompt to generate from while profiling.")
     ] = "Explain how a transformer works.",
@@ -99,21 +104,9 @@ def profile(
             help="Directory to write the trace and summary to.",
         ),
     ] = "./profiles",
-    device: Annotated[
-        str, typer.Option(envvar="WALNUT_DEVICE", help="Device to run on.")
-    ] = "auto",
-    dtype: Annotated[
-        str, typer.Option(envvar="WALNUT_DTYPE", help="Weight/activation dtype.")
-    ] = "auto",
-    cuda_graph: Annotated[
-        bool,
-        typer.Option(
-            "--cuda-graph/--no-cuda-graph",
-            help="Replay decode from a captured CUDA graph. Off by default: "
-            "replayed kernels have no CPU-side dispatch, so they trace without "
-            "their aten:: attribution.",
-        ),
-    ] = False,
+    device: Device = "auto",
+    dtype: Dtype = "auto",
+    cuda_graph: CudaGraph = True,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 

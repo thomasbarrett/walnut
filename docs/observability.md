@@ -140,11 +140,9 @@ trace:   profiles/walnut-20260815-182128-392836.trace.json.gz
 summary: profiles/walnut-20260815-182128-392836.summary.txt
 ```
 
-CUDA graphs are off by default here. Kernels inside a replayed graph are traced
-either way, but they carry no CPU-side dispatch, so they arrive as bare kernel
-names with no `aten::` op above them; on a 32-token run, `aten::` attribution
-falls from 35% of CUDA time to 4%. Pass `--cuda-graph` to measure the path as
-it actually serves.
+CUDA graphs are on by default here, as everywhere else: replaying decode from a
+captured graph drops the per-token launch cost, so that is the configuration
+worth measuring. `--no-cuda-graph` turns it off.
 
 ### On a running server
 
