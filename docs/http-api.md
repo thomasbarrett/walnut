@@ -21,6 +21,11 @@ walnut implements the subset needed by chat clients:
 - `POST /v1/chat/completions` — generate a completion (set `"stream": true`
   for a streamed response).
 
+Two operational routes sit outside the OpenAI surface (and outside `/docs`):
+`POST /start_profile` and `POST /stop_profile`, which return 404 unless the
+server was started with `WALNUT_TORCH_PROFILER_DIR` set. See
+[Observability](observability.md#profiling).
+
 ## walnut-specific behavior
 
 Where walnut narrows or diverges from the spec:

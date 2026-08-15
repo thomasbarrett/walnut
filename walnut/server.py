@@ -6,28 +6,36 @@ OpenAI client) needs:
 - ``GET  /v1/models``            — list the loaded model
 - ``POST /v1/chat/completions``  — generate a completion (streaming optional)
 - ``GET  /metrics``              — Prometheus metrics
+- ``POST /start_profile``        — open a torch profiler window (opt-in)
+- ``POST /stop_profile``         — close it and write a trace
 
 All inference is delegated to an `Engine`, so this module has no knowledge of
-PyTorch or model internals. Logging is set up in `walnut.telemetry`.
+PyTorch or model internals — the profiler arrives as a handle from `serve`
+rather than being built here. Logging is set up in `walnut.telemetry`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from prometheus_client import Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .engine import Engine, GenerationConfig, Message
 from .telemetry import configure_logging
+
+if TYPE_CHECKING:  # importing the profiler pulls in torch; keep it off the hot path
+    from .profiler import ProfileArtifacts, TorchProfiler
 
 logger = logging.getLogger("walnut.server")
 
@@ -88,6 +96,20 @@ TIME_PER_OUTPUT_TOKEN = Histogram(
 )
 
 
+#: Profiling window if the caller doesn't say, and the ceiling it may ask for.
+#: Bounded on purpose: an open-ended window grows the trace buffer until the
+#: server dies. pprof, JFR, and Perfetto all take a duration for the same
+#: reason.
+DEFAULT_PROFILE_SECONDS = 30.0
+MAX_PROFILE_SECONDS = 300.0
+
+
+class ProfileRequest(BaseModel):
+    duration_seconds: float = Field(
+        DEFAULT_PROFILE_SECONDS, gt=0, le=MAX_PROFILE_SECONDS
+    )
+
+
 class ChatMessage(BaseModel):
     role: str
     content: str
@@ -137,11 +159,14 @@ def _observe_duration(
     )
 
 
-def create_app(engine: Engine) -> FastAPI:
+def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI:
     """Build a FastAPI app serving ``engine`` over the OpenAI-compatible API.
 
     A pure factory: it wires app-scoped instrumentation but does not configure
     global logging (that happens once in `serve`).
+
+    ``profiler`` enables ``/start_profile`` and ``/stop_profile``; without one
+    those routes report 404.
     """
     app = FastAPI(title="walnut", version="0.1.0")
 
@@ -231,6 +256,68 @@ def create_app(engine: Engine) -> FastAPI:
             ],
         }
 
+    def _profiler() -> TorchProfiler:
+        if profiler is None:
+            raise HTTPException(
+                status_code=404,
+                detail="profiling is disabled; restart the server with "
+                "WALNUT_TORCH_PROFILER_DIR set to an output directory",
+            )
+        return profiler
+
+    # Both handlers are async on purpose. A sync handler runs in the threadpool,
+    # which would start and stop the window on two different workers — kineto
+    # segfaults on that. On the event loop they share one thread.
+    deadline: asyncio.TimerHandle | None = None
+
+    async def _end_window() -> ProfileArtifacts:
+        """End the window here, then export off the event loop.
+
+        `TorchProfiler.close` has to run on the thread that started the window,
+        which is this one. Writing the trace can take seconds and is safe
+        anywhere once the window is closed, so it goes to a worker rather than
+        stalling every other request.
+        """
+        profiler = _profiler()
+        profile = profiler.close()
+        return await asyncio.get_running_loop().run_in_executor(
+            None, profiler.write, profile
+        )
+
+    @app.post("/start_profile", include_in_schema=False)
+    async def start_profile(req: ProfileRequest | None = None) -> dict:
+        nonlocal deadline
+        seconds = (req or ProfileRequest()).duration_seconds
+        try:
+            _profiler().start()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        async def expire() -> None:
+            try:
+                await _end_window()
+            except RuntimeError:
+                pass  # stopped by hand in the meantime
+            except Exception:
+                logger.exception("profile_autostop_failed")
+
+        deadline = asyncio.get_running_loop().call_later(
+            seconds, lambda: asyncio.ensure_future(expire())
+        )
+        return {"status": "profiling", "duration_seconds": seconds}
+
+    @app.post("/stop_profile", include_in_schema=False)
+    async def stop_profile() -> dict:
+        nonlocal deadline
+        if deadline is not None:
+            deadline.cancel()
+            deadline = None
+        try:
+            artifacts = await _end_window()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"status": "stopped", **artifacts.as_dict()}
+
     return app
 
 
@@ -289,13 +376,21 @@ def serve(engine: Engine, host: str, port: int) -> None:
 
     This is the application entry point, so it always configures logging.
     uvicorn's access log is disabled in favor of the structured ``http_request``
-    log emitted by the request middleware.
+    log emitted by the request middleware. Profiling is wired here too, since
+    reading the environment is an entry-point concern.
     """
+    from .profiler import DIR_ENV, TorchProfiler
+
     configure_logging()
+    profiler = TorchProfiler.from_env()
+    if profiler is not None:
+        logger.info("profiling_enabled", extra={"directory": str(profiler.directory)})
+    else:
+        logger.debug("profiling_disabled", extra={"env": DIR_ENV})
     # log_config=None lets uvicorn's loggers propagate to our JSON root handler
     # instead of installing its own plain-text formatters.
     uvicorn.run(
-        create_app(engine),
+        create_app(engine, profiler=profiler),
         host=host,
         port=port,
         access_log=False,
