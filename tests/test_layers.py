@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from walnut.layers.attention import Attention, KVCache
+from walnut.layers.linear_attention import GatedDeltaNet
 from walnut.layers.norm import RMSNorm
 from walnut.layers.rotary import (
     RotaryEmbedding,
@@ -137,6 +138,49 @@ def test_attention_incremental_matches_prefill():
     incremental = torch.cat(steps, dim=1)
 
     assert torch.allclose(full, incremental, atol=1e-5)
+
+
+def _delta_net() -> GatedDeltaNet:
+    torch.manual_seed(0)
+    return GatedDeltaNet(
+        hidden_size=16,
+        num_key_heads=2,
+        num_value_heads=2,
+        key_head_dim=4,
+        value_head_dim=4,
+        conv_kernel_dim=4,
+    )
+
+
+def test_gated_delta_net_incremental_matches_prefill():
+    net = _delta_net()
+    seq = 6
+    x = torch.randn(1, seq, 16)
+
+    full = net(x)
+
+    cache = net.make_cache(1, seq, torch.float32, None)
+    steps = [net(x[:, i : i + 1], cache) for i in range(seq)]
+    incremental = torch.cat(steps, dim=1)
+
+    assert torch.allclose(full, incremental, atol=1e-5)
+
+
+def test_gated_delta_net_writes_cache_buffers_in_place():
+    # A captured CUDA graph replays into the buffers it recorded, so the state
+    # must stay at one address rather than being rebound to a fresh tensor.
+    net = _delta_net()
+    cache = net.make_cache(1, 8, torch.float32, None)
+    conv, recurrent = cache.conv, cache.recurrent
+
+    assert cache.empty
+    net(torch.randn(1, 3, 16), cache)
+    assert not cache.empty
+    net(torch.randn(1, 1, 16), cache)
+
+    assert cache.conv is conv
+    assert cache.recurrent is recurrent
+    assert recurrent.abs().sum() > 0
 
 
 def test_attention_is_causal_in_prefill():
