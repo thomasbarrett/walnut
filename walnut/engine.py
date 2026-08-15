@@ -218,8 +218,10 @@ class TorchEngine(Engine):
         model_id: str,
         device: str | torch.device | None = None,
         dtype: str | torch.dtype | None = None,
+        cuda_graph: bool = True,
     ) -> None:
         self.model_id = model_id
+        self.cuda_graph = cuda_graph
         config = AutoConfig.from_pretrained(model_id)
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype, config, self.device)
@@ -249,7 +251,11 @@ class TorchEngine(Engine):
 
     def generate(self, messages: list[Message], config: GenerationConfig) -> str:
         input_ids = self._encode(messages)
-        ids = list(self.model.iter_generate(input_ids, self._params(config)))
+        ids = list(
+            self.model.iter_generate(
+                input_ids, self._params(config), cuda_graph=self.cuda_graph
+            )
+        )
         text = self.tokenizer.decode(ids, skip_special_tokens=True)
         cut = _first_stop(text, config.stop)
         return text if cut is None else text[:cut]
@@ -260,7 +266,9 @@ class TorchEngine(Engine):
         input_ids = self._encode(messages)
         ids: list[int] = []
         emitted = ""
-        for tok in self.model.iter_generate(input_ids, self._params(config)):
+        for tok in self.model.iter_generate(
+            input_ids, self._params(config), cuda_graph=self.cuda_graph
+        ):
             ids.append(tok)
             text = self.tokenizer.decode(ids, skip_special_tokens=True)
             # Wait for complete characters (partial multi-byte decodes to U+FFFD).
@@ -280,10 +288,14 @@ def load_model(
     model: str,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
+    cuda_graph: bool = True,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
     ``device`` and ``dtype`` default to auto-selection; see `resolve_device`
-    and `resolve_dtype`.
+    and `resolve_dtype`. ``cuda_graph`` replays decode from a captured graph
+    and has no effect off CUDA.
     """
-    return TorchEngine(model_id=model, device=device, dtype=dtype)
+    return TorchEngine(
+        model_id=model, device=device, dtype=dtype, cuda_graph=cuda_graph
+    )

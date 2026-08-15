@@ -25,9 +25,21 @@ $ uv run walnut serve Qwen/Qwen3.5-0.8B --device cuda:1 --dtype bfloat16
 `bfloat16` on an accelerator (but left alone on CPU), and `bfloat16` falls back
 to `float16`, with a warning, on pre-Ampere CUDA devices.
 
+## CUDA graphs
+
+Decode is replayed from a captured CUDA graph by default, which removes the
+per-token kernel launch cost. Capture happens once per request, after prefill,
+and adds to time-to-first-token; `--no-cuda-graph` turns it off. The flag is
+ignored when serving off CUDA.
+
+```console
+$ uv run walnut serve Qwen/Qwen3.5-0.8B --no-cuda-graph
+```
+
 ## Environment variables
 
 - `WALNUT_HOST` — default host for `walnut serve` (overridden by `--host`).
 - `WALNUT_PORT` — default port for `walnut serve` (overridden by `--port`).
 - `WALNUT_DEVICE` — default device for `walnut serve` (overridden by `--device`).
 - `WALNUT_DTYPE` — default dtype for `walnut serve` (overridden by `--dtype`).
+- `WALNUT_CUDA_GRAPH` — set to `0` to disable CUDA graph decode by default.
