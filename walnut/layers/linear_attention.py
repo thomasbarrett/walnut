@@ -6,15 +6,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from walnut.layers.cache import Cache
+
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
-class ConvState:
+class ConvState(Cache):
+    """Rolling conv window + delta-rule recurrent state for linear attention."""
+
     def __init__(self) -> None:
         self.conv: torch.Tensor | None = None  # last conv_kernel-1 conv inputs
         self.recurrent: torch.Tensor | None = None  # delta-rule state (float32)
+
+    @property
+    def empty(self) -> bool:
+        return self.recurrent is None
 
 
 def _recurrent_gated_delta_rule(
@@ -125,6 +133,11 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(hidden_size, num_value_heads, bias=False)
         self.in_proj_a = nn.Linear(hidden_size, num_value_heads, bias=False)
 
+    def make_cache(self, *args: object, **kwargs: object) -> ConvState:
+        """Fresh recurrent state; conv/state are already fixed-size, so the KV
+        sizing args are ignored."""
+        return ConvState()
+
     def forward(
         self, hidden_states: torch.Tensor, cache: ConvState | None = None
     ) -> torch.Tensor:
@@ -136,7 +149,7 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        decoding = cache is not None and cache.recurrent is not None
+        decoding = cache is not None and not cache.empty
         if decoding:
             assert cache is not None and cache.conv is not None
             # Prepend cached conv context; unpadded conv yields exactly S outputs.

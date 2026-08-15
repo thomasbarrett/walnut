@@ -27,6 +27,7 @@ from walnut.layers import (
     apply_rotary_pos_emb,
 )
 from walnut.layers.attention import KVCache
+from walnut.layers.cache import Cache
 from walnut.layers.linear_attention import ConvState
 from walnut.sampler import Sampler, SamplingParams
 
@@ -74,12 +75,22 @@ class Qwen3_5Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.attn = Attention(self.num_heads, self.num_kv_heads, self.head_dim)
 
+    def make_cache(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> KVCache:
+        return self.attn.make_cache(max_batch_size, max_seq_len, dtype, device)
+
     def forward(
         self,
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: KVCache | None = None,
+        input_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, seq, _ = x.shape
 
@@ -98,7 +109,7 @@ class Qwen3_5Attention(nn.Module):
         k = self.k_norm(k)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        attn = self.attn(q, k, v, cache).reshape(bsz, seq, -1)
+        attn = self.attn(q, k, v, cache, input_pos).reshape(bsz, seq, -1)
         if gate is not None:
             attn = attn * torch.sigmoid(gate)
         return self.o_proj(attn)
@@ -129,20 +140,30 @@ class Qwen3_5DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def make_cache(self) -> KVCache | ConvState:
-        return KVCache() if self.block_type == "full_attention" else ConvState()
+    def make_cache(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> Cache:
+        mixer = (
+            self.self_attn if self.block_type == "full_attention" else self.linear_attn
+        )
+        return mixer.make_cache(max_batch_size, max_seq_len, dtype, device)
 
     def forward(
         self,
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cache: KVCache | ConvState | None = None,
+        cache: Cache | None = None,
+        input_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
         normed = self.input_layernorm(x)
         if self.block_type == "full_attention":
             assert not isinstance(cache, ConvState)
-            x = x + self.self_attn(normed, cos, sin, cache)
+            x = x + self.self_attn(normed, cos, sin, cache, input_pos)
         else:
             assert not isinstance(cache, KVCache)
             x = x + self.linear_attn(normed, cache)
@@ -172,16 +193,28 @@ class Qwen3_5TextModel(nn.Module):
             mrope_section=rope["mrope_section"],
         )
 
-    def make_cache(self) -> list[KVCache | ConvState]:
-        """Build a fresh per-layer cache (KV for attention, conv/state for linear)."""
-        return [cast(Qwen3_5DecoderLayer, layer).make_cache() for layer in self.layers]
+    def make_cache(
+        self,
+        max_seq_len: int,
+        max_batch_size: int = 1,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+    ) -> list[Cache]:
+        """Build a fresh per-layer cache (static KV for full attention, conv +
+        recurrent state for linear attention), sized for ``max_seq_len`` tokens."""
+        return [
+            cast(Qwen3_5DecoderLayer, layer).make_cache(
+                max_batch_size, max_seq_len, dtype, device
+            )
+            for layer in self.layers
+        ]
 
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        cache: list[KVCache | ConvState] | None = None,
+        cache: list[Cache] | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             assert input_ids is not None
@@ -192,7 +225,13 @@ class Qwen3_5TextModel(nn.Module):
 
         cos, sin = self.rotary(positions)
         for i, layer in enumerate(self.layers):
-            h = layer(h, cos, sin, cache[i] if cache is not None else None)
+            h = layer(
+                h,
+                cos,
+                sin,
+                cache[i] if cache is not None else None,
+                input_pos=positions,
+            )
         return self.norm(h)
 
 
@@ -523,7 +562,7 @@ class Qwen3_5Model(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        cache: list[KVCache | ConvState] | None = None,
+        cache: list[Cache] | None = None,
     ) -> torch.Tensor:
         if pixel_values is None:
             return self.language_model(input_ids, positions, cache=cache)
@@ -571,7 +610,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        cache: list[KVCache | ConvState] | None = None,
+        cache: list[Cache] | None = None,
     ) -> torch.Tensor:
         hidden = self.model(
             input_ids,
@@ -602,8 +641,13 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         if params.seed is not None:
             gen = torch.Generator(device=input_ids.device).manual_seed(params.seed)
 
-        cache = self.model.language_model.make_cache()
         seq = input_ids.shape[1]
+        cache = self.model.language_model.make_cache(
+            max_seq_len=seq + params.max_new_tokens,
+            max_batch_size=input_ids.shape[0],
+            dtype=self.lm_head.weight.dtype,
+            device=input_ids.device,
+        )
         positions = torch.arange(seq, device=input_ids.device)
         logits = self(input_ids, positions=positions, cache=cache)
         next_token = self.sampler(logits[:, -1], params, gen)

@@ -121,9 +121,17 @@ def test_attention_incremental_matches_prefill():
 
     full = attn(q, k, v)
 
-    cache = KVCache()
+    cache = KVCache(
+        max_batch_size=1, n_kv_heads=2, max_seq_len=seq, head_dim=8, dtype=q.dtype
+    )
     steps = [
-        attn(q[:, i : i + 1], k[:, i : i + 1], v[:, i : i + 1], cache)
+        attn(
+            q[:, i : i + 1],
+            k[:, i : i + 1],
+            v[:, i : i + 1],
+            cache,
+            input_pos=torch.tensor([i]),
+        )
         for i in range(seq)
     ]
     incremental = torch.cat(steps, dim=1)
