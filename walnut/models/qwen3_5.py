@@ -29,6 +29,7 @@ from walnut.layers import (
 from walnut.layers.attention import KVCache
 from walnut.layers.cache import Cache
 from walnut.layers.linear_attention import ConvState
+from walnut.models.loader import copy_weights
 from walnut.sampler import Sampler, SamplingParams
 
 
@@ -333,16 +334,16 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3_5VisionMLP(nn.Module):
-    """Vision feed-forward: ``fc2(gelu_tanh(fc1(x)))``."""
+    """Vision feed-forward: ``linear_fc2(gelu_tanh(linear_fc1(x)))``."""
 
     def __init__(self, config: Any) -> None:
         super().__init__()
         hidden, inter = config.hidden_size, config.intermediate_size
-        self.fc1 = nn.Linear(hidden, inter)
-        self.fc2 = nn.Linear(inter, hidden)
+        self.linear_fc1 = nn.Linear(hidden, inter)
+        self.linear_fc2 = nn.Linear(inter, hidden)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+        return self.linear_fc2(F.gelu(self.linear_fc1(x), approximate="tanh"))
 
 
 class Qwen3_5VisionBlock(nn.Module):
@@ -677,12 +678,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Copy checkpoint tensors into parameters by matching name.
 
-        Parameters absent from the model (e.g. vision-tower weights, until it is
-        wired) are skipped. Assumes checkpoint names match the module tree.
+        ``mtp`` is the multi-token prediction head, used for speculative
+        decoding; walnut has no module for it, so those tensors are skipped.
         """
-        params = dict(self.named_parameters())
-        for name, tensor in weights:
-            param = params.get(name)
-            if param is None:
-                continue
-            param.data.copy_(tensor)
+        copy_weights(self, weights, skip_prefixes=("mtp.",))
