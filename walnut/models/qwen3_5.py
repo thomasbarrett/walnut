@@ -333,16 +333,16 @@ def _vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3_5VisionMLP(nn.Module):
-    """Vision feed-forward: ``fc2(gelu_tanh(fc1(x)))``."""
+    """Vision feed-forward: ``linear_fc2(gelu_tanh(linear_fc1(x)))``."""
 
     def __init__(self, config: Any) -> None:
         super().__init__()
         hidden, inter = config.hidden_size, config.intermediate_size
-        self.fc1 = nn.Linear(hidden, inter)
-        self.fc2 = nn.Linear(inter, hidden)
+        self.linear_fc1 = nn.Linear(hidden, inter)
+        self.linear_fc2 = nn.Linear(inter, hidden)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+        return self.linear_fc2(F.gelu(self.linear_fc1(x), approximate="tanh"))
 
 
 class Qwen3_5VisionBlock(nn.Module):
@@ -587,6 +587,50 @@ class Qwen3_5Model(nn.Module):
         )
 
 
+#: Checkpoint prefixes walnut has no module for. ``mtp`` is the multi-token
+#: prediction head, used for speculative decoding.
+_SKIPPED_PREFIXES = ("mtp.",)
+
+
+def _sample(names: list[str], limit: int = 3) -> str:
+    shown = ", ".join(names[:limit])
+    return shown if len(names) <= limit else f"{shown}, ... (+{len(names) - limit})"
+
+
+def _copy_weights(
+    module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
+) -> None:
+    """Copy ``weights`` into ``module``'s parameters, matching by name.
+
+    Strict in both directions, because a naming mismatch is otherwise silent:
+    a parameter the checkpoint never fills keeps its random init, and a
+    checkpoint tensor with nowhere to go is dropped. Heads walnut doesn't
+    implement are skipped by explicit prefix, so they stay a deliberate choice.
+    """
+    params = dict(module.named_parameters())
+    filled: set[str] = set()
+    unmatched: list[str] = []
+    for name, tensor in weights:
+        param = params.get(name)
+        if param is None:
+            if not name.startswith(_SKIPPED_PREFIXES):
+                unmatched.append(name)
+            continue
+        param.data.copy_(tensor)
+        filled.add(name)
+
+    problems = []
+    if missing := sorted(params.keys() - filled):
+        problems.append(f"{len(missing)} unfilled parameter(s): {_sample(missing)}")
+    if unmatched:
+        problems.append(
+            f"{len(unmatched)} unmatched checkpoint tensor(s): "
+            f"{_sample(sorted(unmatched))}"
+        )
+    if problems:
+        raise ValueError("checkpoint does not match the model — " + "; ".join(problems))
+
+
 class Qwen3_5ForConditionalGeneration(nn.Module):
     """Top-level Qwen3.5 model: backbone + LM head."""
 
@@ -675,14 +719,5 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         return torch.cat([input_ids, new], dim=1)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        """Copy checkpoint tensors into parameters by matching name.
-
-        Parameters absent from the model (e.g. vision-tower weights, until it is
-        wired) are skipped. Assumes checkpoint names match the module tree.
-        """
-        params = dict(self.named_parameters())
-        for name, tensor in weights:
-            param = params.get(name)
-            if param is None:
-                continue
-            param.data.copy_(tensor)
+        """Copy checkpoint tensors into parameters by matching name."""
+        _copy_weights(self, weights)
