@@ -14,15 +14,42 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 class ConvState(Cache):
-    """Rolling conv window + delta-rule recurrent state for linear attention."""
+    """Static, pre-allocated conv window + delta-rule recurrent state.
 
-    def __init__(self) -> None:
-        self.conv: torch.Tensor | None = None  # last conv_kernel-1 conv inputs
-        self.recurrent: torch.Tensor | None = None  # delta-rule state (float32)
+    Written in place, like `KVCache`, so the buffers keep one address for the
+    life of the sequence.
+    """
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        conv_dim: int,
+        conv_kernel_size: int,
+        num_value_heads: int,
+        key_head_dim: int,
+        value_head_dim: int,
+        dtype: torch.dtype = torch.float32,
+        device: torch.device | str | None = None,
+    ) -> None:
+        # Last conv_kernel-1 conv inputs, so decode convs stay causal.
+        self.conv = torch.zeros(
+            max_batch_size, conv_dim, conv_kernel_size - 1, dtype=dtype, device=device
+        )
+        # The delta rule accumulates in float32.
+        self.recurrent = torch.zeros(
+            max_batch_size,
+            num_value_heads,
+            key_head_dim,
+            value_head_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.primed = False
 
     @property
     def empty(self) -> bool:
-        return self.recurrent is None
+        """True until a forward pass has written state into the buffers."""
+        return not self.primed
 
 
 def _recurrent_gated_delta_rule(
@@ -133,10 +160,25 @@ class GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(hidden_size, num_value_heads, bias=False)
         self.in_proj_a = nn.Linear(hidden_size, num_value_heads, bias=False)
 
-    def make_cache(self, *args: object, **kwargs: object) -> ConvState:
-        """Fresh recurrent state; conv/state are already fixed-size, so the KV
-        sizing args are ignored."""
-        return ConvState()
+    def make_cache(
+        self,
+        max_batch_size: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> ConvState:
+        """Fresh recurrent state; conv/state are already fixed-size, so
+        ``max_seq_len`` is ignored."""
+        return ConvState(
+            max_batch_size,
+            self.conv_dim,
+            self.conv_kernel_size,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            dtype,
+            device,
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, cache: ConvState | None = None
@@ -151,20 +193,21 @@ class GatedDeltaNet(nn.Module):
 
         decoding = cache is not None and not cache.empty
         if decoding:
-            assert cache is not None and cache.conv is not None
+            assert cache is not None
             # Prepend cached conv context; unpadded conv yields exactly S outputs.
+            # ``cat`` copies, so writing the window back now cannot disturb it.
             conv_in = torch.cat([cache.conv, qkv_pre], dim=-1)
-            cache.conv = conv_in[..., -pad:]
+            cache.conv.copy_(conv_in[..., -pad:])
             conv_out = F.conv1d(conv_in, self.conv1d.weight, groups=self.conv_dim)
             mixed_qkv = F.silu(conv_out).transpose(1, 2)
         else:
             mixed_qkv = F.silu(self.conv1d(qkv_pre)[:, :, :seq]).transpose(1, 2)
             if cache is not None:
-                cache.conv = (
+                cache.conv.copy_(
                     qkv_pre[..., -pad:]
                     if qkv_pre.shape[-1] >= pad
                     else F.pad(qkv_pre, (pad - qkv_pre.shape[-1], 0))
-                ).contiguous()
+                )
 
         query, key, value = torch.split(
             mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
@@ -183,7 +226,8 @@ class GatedDeltaNet(nn.Module):
         init = cache.recurrent if decoding else None
         core, state = _recurrent_gated_delta_rule(query, key, value, g, beta, init)
         if cache is not None:
-            cache.recurrent = state
+            cache.recurrent.copy_(state)
+            cache.primed = True
         core = self.norm(
             core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
         )
