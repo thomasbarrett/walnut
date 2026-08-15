@@ -109,8 +109,9 @@ def profile(
         bool,
         typer.Option(
             "--cuda-graph/--no-cuda-graph",
-            help="Replay decode from a captured CUDA graph. Off by default: a "
-            "replayed graph profiles as one launch, hiding the per-op breakdown.",
+            help="Replay decode from a captured CUDA graph. Off by default: "
+            "replayed kernels have no CPU-side dispatch, so they trace without "
+            "their aten:: attribution.",
         ),
     ] = False,
 ) -> None:
