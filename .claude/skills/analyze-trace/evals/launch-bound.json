@@ -1,0 +1,373 @@
+{
+ "traceEvents": [
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 0,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 14,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 40,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 54,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 80,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_2",
+   "pid": 1,
+   "tid": 7,
+   "ts": 94,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 120,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 134,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 160,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 174,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 200,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_2",
+   "pid": 1,
+   "tid": 7,
+   "ts": 214,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 240,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 254,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 280,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 294,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 320,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_2",
+   "pid": 1,
+   "tid": 7,
+   "ts": 334,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 360,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 374,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 400,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 414,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 440,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_2",
+   "pid": 1,
+   "tid": 7,
+   "ts": 454,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 480,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 494,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 520,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 534,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 560,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_2",
+   "pid": 1,
+   "tid": 7,
+   "ts": 574,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 600,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 614,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 640,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 654,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 680,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_2",
+   "pid": 1,
+   "tid": 7,
+   "ts": 694,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 720,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_0",
+   "pid": 1,
+   "tid": 7,
+   "ts": 734,
+   "dur": 3
+  },
+  {
+   "ph": "X",
+   "cat": "cuda_runtime",
+   "name": "cudaLaunchKernel",
+   "pid": 1,
+   "tid": 1,
+   "ts": 760,
+   "dur": 12
+  },
+  {
+   "ph": "X",
+   "cat": "kernel",
+   "name": "elementwise_1",
+   "pid": 1,
+   "tid": 7,
+   "ts": 774,
+   "dur": 3
+  },
+  {
+   "ph": "M",
+   "name": "thread_name",
+   "pid": 1,
+   "tid": 7,
+   "args": {
+    "name": "stream 7"
+   }
+  }
+ ]
+}

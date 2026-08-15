@@ -1,0 +1,130 @@
+{
+ "traceEvents": [
+  {
+   "ph": "X",
+   "cat": "cpu_op",
+   "name": "aten::mm",
+   "pid": 1,
+   "tid": 1,
+   "ts": 0,
+   "dur": 50,
+   "args": {
+    "Input Dims": [
+     [
+      256,
+      512
+     ],
+     [
+      512,
+      512
+     ]
+    ]
+   }
+  },
+  {
+   "ph": "X",
+   "cat": "cpu_op",
+   "name": "aten::mm",
+   "pid": 1,
+   "tid": 1,
+   "ts": 100,
+   "dur": 50,
+   "args": {
+    "Input Dims": [
+     [
+      128,
+      512
+     ],
+     [
+      512,
+      512
+     ]
+    ]
+   }
+  },
+  {
+   "ph": "X",
+   "cat": "cpu_op",
+   "name": "aten::mm",
+   "pid": 1,
+   "tid": 1,
+   "ts": 200,
+   "dur": 50,
+   "args": {
+    "Input Dims": [
+     [
+      256,
+      512
+     ],
+     [
+      512,
+      512
+     ]
+    ]
+   }
+  },
+  {
+   "ph": "X",
+   "cat": "cpu_op",
+   "name": "aten::mm",
+   "pid": 1,
+   "tid": 1,
+   "ts": 300,
+   "dur": 50,
+   "args": {
+    "Input Dims": [
+     [
+      128,
+      512
+     ],
+     [
+      512,
+      512
+     ]
+    ]
+   }
+  },
+  {
+   "ph": "X",
+   "cat": "cpu_op",
+   "name": "aten::mm",
+   "pid": 1,
+   "tid": 1,
+   "ts": 400,
+   "dur": 50,
+   "args": {
+    "Input Dims": [
+     [
+      256,
+      512
+     ],
+     [
+      512,
+      512
+     ]
+    ]
+   }
+  },
+  {
+   "ph": "X",
+   "cat": "cpu_op",
+   "name": "aten::mm",
+   "pid": 1,
+   "tid": 1,
+   "ts": 500,
+   "dur": 50,
+   "args": {
+    "Input Dims": [
+     [
+      128,
+      512
+     ],
+     [
+      512,
+      512
+     ]
+    ]
+   }
+  }
+ ]
+}

@@ -122,6 +122,9 @@ Two values walnut had to choose:
 Beside each trace is a `.summary.txt`, the profiler's `key_averages()` table,
 for reading a run without a browser.
 
+To query a trace rather than look at it — GPU idle time, launch overhead, the
+hottest kernels — see [Analyzing profiles](development.md#analyzing-profiles).
+
 Profiling is expensive. On an RTX 5090 running Qwen3.5-0.8B it costs about 38%
 of throughput (256 down to 185 tok/s) and grows the trace buffer by roughly
 0.5 MB per token, which is only released when the window closes. So it is off

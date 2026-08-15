@@ -23,6 +23,12 @@ An inference engine, built on PyTorch, exposing an OpenAI-compatible API.
   settings — check there, don't restate settings elsewhere.
 - Tests live in `tests/`, named `test_*.py`.
 
+## Profiles
+
+Analyze traces from `walnut profile` (or `/stop_profile`) with the
+`analyze-trace` skill in `.claude/skills/`, which wraps Perfetto's
+`trace_processor`. Don't read a `.trace.json.gz` by hand.
+
 ## Docs
 
 MkDocs Material under `docs/` (deps in the `docs` group).
