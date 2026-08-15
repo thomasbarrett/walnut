@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import glob
 import os
-from collections.abc import Iterator
+import warnings
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -71,7 +73,112 @@ class Engine:
         yield self.generate(messages, config)
 
 
-def _load_hf_weights(model: Any, model_id: str) -> None:
+def resolve_device(device: str | torch.device | None = None) -> torch.device:
+    """Resolve a ``--device`` selection to a concrete `torch.device`.
+
+    ``None`` and ``"auto"`` pick CUDA when it is available and CPU otherwise;
+    anything else is passed through to `torch.device`. An unusable CUDA
+    selection is a ``ValueError`` here rather than a failure after the load.
+    """
+    if device is None or device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved = torch.device(device)
+    if resolved.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError(
+                "CUDA is unavailable; install the CUDA wheels with "
+                "`uv sync --extra cu130`"
+            )
+        count = torch.cuda.device_count()
+        if resolved.index is not None and resolved.index >= count:
+            raise ValueError(f"no CUDA device {resolved.index}; {count} visible")
+    return resolved
+
+
+def _named_dtype(name: str) -> torch.dtype:
+    """Look up a floating-point `torch.dtype` by name (e.g. ``"bfloat16"``)."""
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype) or not dtype.is_floating_point:
+        raise ValueError(f"{name!r} is not a floating-point torch dtype")
+    return dtype
+
+
+def _config_dtype(config: Any) -> torch.dtype | None:
+    """The checkpoint's declared dtype, or ``None`` if it doesn't state one."""
+    # transformers>=5 renamed ``torch_dtype`` to ``dtype``.
+    declared = getattr(config, "dtype", None)
+    if isinstance(declared, str):
+        return _named_dtype(declared)
+    return declared if isinstance(declared, torch.dtype) else None
+
+
+def parse_dtype(dtype: str | torch.dtype | None) -> torch.dtype | None:
+    """Parse a ``--dtype`` selection without consulting a checkpoint.
+
+    Returns ``None`` for ``None``/``"auto"`` (see `resolve_dtype`), so a
+    mistyped flag can be rejected before a multi-gigabyte download.
+    """
+    if dtype is None or dtype == "auto":
+        return None
+    if isinstance(dtype, str):
+        return _named_dtype(dtype)
+    if not dtype.is_floating_point:
+        raise ValueError(f"{dtype} is not a floating-point torch dtype")
+    return dtype
+
+
+def resolve_dtype(
+    dtype: str | torch.dtype | None,
+    config: Any,
+    device: torch.device,
+) -> torch.dtype:
+    """Resolve a ``--dtype`` selection against the checkpoint and the device.
+
+    ``None`` and ``"auto"`` take the dtype the checkpoint declares. A float32
+    checkpoint is downcast on accelerators, where fp32 wastes both memory and
+    throughput, but is left alone on CPU. bfloat16 falls back to float16 on
+    CUDA devices that can't do bf16 (pre-Ampere).
+    """
+    resolved = parse_dtype(dtype)
+    if resolved is None:  # auto: follow the checkpoint, then adjust for device
+        declared = _config_dtype(config)
+        resolved = declared if declared is not None else torch.float32
+        if resolved == torch.float32 and device.type != "cpu":
+            resolved = torch.bfloat16
+
+    if (
+        resolved == torch.bfloat16
+        and device.type == "cuda"
+        and torch.cuda.is_available()
+        and not torch.cuda.is_bf16_supported()
+    ):
+        warnings.warn(
+            f"bfloat16 is unsupported on {torch.cuda.get_device_name(device)}; "
+            "using float16 instead",
+            stacklevel=2,
+        )
+        return torch.float16
+    return resolved
+
+
+@contextmanager
+def _build_on(device: torch.device, dtype: torch.dtype) -> Generator[None, None, None]:
+    """Make module construction allocate on ``device`` in ``dtype``.
+
+    Parameters land on the target device at the target precision, so no float32
+    copy is materialized on the host. The defaults it swaps are process-global:
+    one load at a time.
+    """
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def _load_hf_weights(model: Any, model_id: str, device: torch.device) -> None:
     """Download the checkpoint's safetensors and stream them into ``model``."""
     root = snapshot_download(model_id, allow_patterns=["*.safetensors", "*.json"])
     files = sorted(glob.glob(os.path.join(root, "*.safetensors")))
@@ -80,7 +187,7 @@ def _load_hf_weights(model: Any, model_id: str) -> None:
 
     def weights() -> Iterator[tuple[str, torch.Tensor]]:
         for path in files:
-            with safe_open(path, framework="pt", device="cpu") as shard:
+            with safe_open(path, framework="pt", device=str(device)) as shard:
                 for name in shard.keys():  # noqa: SIM118 (safetensors handle)
                     yield name, shard.get_tensor(name)
 
@@ -101,13 +208,25 @@ class TorchEngine(Engine):
     Builds the model from its Hugging Face config, streams the checkpoint
     weights in, and drives generation with an ``AutoTokenizer`` (chat template
     for encoding, incremental detokenization for streaming).
+
+    The engine owns placement: it builds on `device` in `dtype` and encodes
+    input ids there, and the KV cache and positions follow the ids.
     """
 
-    def __init__(self, model_id: str) -> None:
+    def __init__(
+        self,
+        model_id: str,
+        device: str | torch.device | None = None,
+        dtype: str | torch.dtype | None = None,
+    ) -> None:
         self.model_id = model_id
         config = AutoConfig.from_pretrained(model_id)
-        model: Any = resolve_model_class(config)(config)
-        _load_hf_weights(model, model_id)
+        self.device = resolve_device(device)
+        self.dtype = resolve_dtype(dtype, config, self.device)
+        model_class = resolve_model_class(config)
+        with _build_on(self.device, self.dtype):
+            model: Any = model_class(config)
+        _load_hf_weights(model, model_id, self.device)
         self.model: Any = model.eval()
         self.tokenizer: Any = AutoTokenizer.from_pretrained(model_id)
 
@@ -117,7 +236,9 @@ class TorchEngine(Engine):
             chat, add_generation_prompt=True, return_tensors="pt"
         )
         # transformers may return a bare tensor or a BatchEncoding mapping.
-        return encoded if isinstance(encoded, torch.Tensor) else encoded["input_ids"]
+        if not isinstance(encoded, torch.Tensor):
+            encoded = encoded["input_ids"]
+        return encoded.to(self.device)
 
     def _params(self, config: GenerationConfig) -> SamplingParams:
         return SamplingParams(
@@ -155,6 +276,14 @@ class TorchEngine(Engine):
                 emitted = text
 
 
-def load_model(model: str) -> Engine:
-    """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`."""
-    return TorchEngine(model_id=model)
+def load_model(
+    model: str,
+    device: str | torch.device | None = None,
+    dtype: str | torch.dtype | None = None,
+) -> TorchEngine:
+    """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
+
+    ``device`` and ``dtype`` default to auto-selection; see `resolve_device`
+    and `resolve_dtype`.
+    """
+    return TorchEngine(model_id=model, device=device, dtype=dtype)
