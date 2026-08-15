@@ -22,7 +22,7 @@ from collections.abc import Iterator
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from prometheus_client import Counter
+from prometheus_client import Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
@@ -31,11 +31,106 @@ from .telemetry import configure_logging
 
 logger = logging.getLogger("walnut.server")
 
-# Walnut-specific metric, on top of the HTTP metrics the instrumentator adds.
-CHAT_COMPLETIONS = Counter(
-    "walnut_chat_completions_total",
-    "Number of chat completion requests received.",
-    ["model", "stream"],
+# Model-server metrics from the OpenTelemetry GenAI semantic conventions:
+# https://github.com/open-telemetry/semantic-conventions-genai
+#
+# The spec names these gen_ai.server.*; Prometheus spells the same instruments
+# with underscores and a unit suffix. Buckets are the ones it prescribes, which
+# queries written against the conventions assume.
+_OPERATION = "chat"
+
+# The attribute says which provider's telemetry flavor to expect. walnut is
+# OpenAI-compatible but not OpenAI, so it uses its own name.
+_PROVIDER = "walnut"
+
+_LABELS = [
+    "gen_ai_operation_name",
+    "gen_ai_provider_name",
+    "gen_ai_request_model",
+    "gen_ai_response_model",
+]
+
+# fmt: off
+_DURATION_BUCKETS = (
+    0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64,
+    1.28, 2.56, 5.12, 10.24, 20.48, 40.96, 81.92
+)
+_TTFT_BUCKETS = (
+    0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1,
+    0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0
+)
+_TPOT_BUCKETS = (
+    0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2,
+    0.3, 0.4, 0.5, 0.75, 1.0, 2.5
+)
+# fmt: on
+
+REQUEST_DURATION = Histogram(
+    "gen_ai_server_request_duration_seconds",
+    "Generative AI server request duration such as time-to-last byte or last "
+    "output token.",
+    [*_LABELS, "error_type"],
+    buckets=(
+        0.01,
+        0.02,
+        0.04,
+        0.08,
+        0.16,
+        0.32,
+        0.64,
+        1.28,
+        2.56,
+        5.12,
+        10.24,
+        20.48,
+        40.96,
+        81.92,
+    ),
+)
+
+TIME_TO_FIRST_TOKEN = Histogram(
+    "gen_ai_server_time_to_first_token_seconds",
+    "Time to generate first token for successful responses.",
+    _LABELS,
+    buckets=(
+        0.001,
+        0.005,
+        0.01,
+        0.02,
+        0.04,
+        0.06,
+        0.08,
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        2.5,
+        5.0,
+        7.5,
+        10.0,
+    ),
+)
+
+TIME_PER_OUTPUT_TOKEN = Histogram(
+    "gen_ai_server_time_per_output_token_seconds",
+    "Time per output token generated after the first token for successful responses.",
+    _LABELS,
+    buckets=(
+        0.01,
+        0.025,
+        0.05,
+        0.075,
+        0.1,
+        0.15,
+        0.2,
+        0.3,
+        0.4,
+        0.5,
+        0.75,
+        1.0,
+        2.5,
+    ),
 )
 
 
@@ -58,6 +153,34 @@ def _stop_list(stop: list[str] | str | None) -> list[str] | None:
     if stop is None:
         return None
     return [stop] if isinstance(stop, str) else stop
+
+
+def _labels(engine: Engine) -> dict[str, str]:
+    """Attributes shared by every GenAI metric.
+
+    Both model attributes name the loaded model: the engine ignores the
+    request's ``model`` field, and a client-supplied label value would let any
+    caller mint unbounded series.
+    """
+    return {
+        "gen_ai_operation_name": _OPERATION,
+        "gen_ai_provider_name": _PROVIDER,
+        "gen_ai_request_model": engine.model_id,
+        "gen_ai_response_model": engine.model_id,
+    }
+
+
+def _observe_duration(
+    labels: dict[str, str], start: float, error_type: str = ""
+) -> None:
+    """Record one request against `REQUEST_DURATION`.
+
+    The conventions omit ``error.type`` on success, but a Prometheus histogram
+    needs a fixed label set, so absence is an empty value.
+    """
+    REQUEST_DURATION.labels(**labels, error_type=error_type).observe(
+        time.perf_counter() - start
+    )
 
 
 def create_app(engine: Engine) -> FastAPI:
@@ -121,17 +244,25 @@ def create_app(engine: Engine) -> FastAPI:
         )
         completion_id = f"chatcmpl-{int(time.time() * 1000):x}"
         created = int(time.time())
-        CHAT_COMPLETIONS.labels(
-            model=engine.model_id, stream=str(req.stream).lower()
-        ).inc()
+        labels = _labels(engine)
+        # Timed from here, past validation: a rejected request never ran the
+        # model, and folding those in would skew the latency histogram low.
+        start = time.perf_counter()
 
         if req.stream:
             return StreamingResponse(
-                _stream_chunks(engine, messages, config, completion_id, created),
+                _stream_chunks(
+                    engine, messages, config, completion_id, created, labels, start
+                ),
                 media_type="text/event-stream",
             )
 
-        content = engine.generate(messages, config)
+        try:
+            content = engine.generate(messages, config)
+        except Exception as exc:
+            _observe_duration(labels, start, type(exc).__qualname__)
+            raise
+        _observe_duration(labels, start)
         return {
             "id": completion_id,
             "object": "chat.completion",
@@ -155,8 +286,15 @@ def _stream_chunks(
     config: GenerationConfig,
     completion_id: str,
     created: int,
+    labels: dict[str, str],
+    start: float,
 ) -> Iterator[str]:
-    """Yield Server-Sent Events in the OpenAI streaming chunk format."""
+    """Yield Server-Sent Events in the OpenAI streaming chunk format.
+
+    Token timings are taken here: the streamed pieces are the only
+    token-granular signal `Engine` exposes, so only streaming requests get
+    them.
+    """
 
     def event(delta: dict, finish_reason: str | None) -> str:
         chunk = {
@@ -168,12 +306,28 @@ def _stream_chunks(
         }
         return f"data: {json.dumps(chunk)}\n\n"
 
+    # The role delta carries no generated text, so it doesn't mark first token.
     yield event({"role": "assistant"}, None)
-    for piece in engine.stream(messages, config):
-        if piece:
+    previous: float | None = None
+    error_type = ""
+    try:
+        for piece in engine.stream(messages, config):
+            if not piece:
+                continue
+            now = time.perf_counter()
+            if previous is None:
+                TIME_TO_FIRST_TOKEN.labels(**labels).observe(now - start)
+            else:
+                TIME_PER_OUTPUT_TOKEN.labels(**labels).observe(now - previous)
+            previous = now
             yield event({"content": piece}, None)
-    yield event({}, "stop")
-    yield "data: [DONE]\n\n"
+        yield event({}, "stop")
+        yield "data: [DONE]\n\n"
+    except Exception as exc:
+        error_type = type(exc).__qualname__
+        raise
+    finally:
+        _observe_duration(labels, start, error_type)
 
 
 def serve(engine: Engine, host: str, port: int) -> None:
