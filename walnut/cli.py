@@ -50,6 +50,14 @@ def serve(
             "'float32'.",
         ),
     ] = "auto",
+    cuda_graph: Annotated[
+        bool,
+        typer.Option(
+            "--cuda-graph/--no-cuda-graph",
+            envvar="WALNUT_CUDA_GRAPH",
+            help="Replay decode from a captured CUDA graph. Ignored off CUDA.",
+        ),
+    ] = True,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -64,7 +72,7 @@ def serve(
         raise typer.BadParameter(str(exc)) from exc
 
     typer.echo(f"Loading '{model}'...")
-    engine = load_model(model, device=target, dtype=precision)
+    engine = load_model(model, device=target, dtype=precision, cuda_graph=cuda_graph)
     typer.echo(
         f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
         f"({engine.device}, {str(engine.dtype).removeprefix('torch.')})"

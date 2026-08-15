@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from walnut.graph import DecodeGraph
 from walnut.layers import (
     Attention,
     GatedDeltaNet,
@@ -628,11 +629,16 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         self,
         input_ids: torch.Tensor,
         params: SamplingParams | None = None,
+        cuda_graph: bool = True,
     ) -> Iterator[int]:
         """Yield generated token ids (text-only, batch 1), one per step.
 
         Sampling follows `params`. A stop id (any ``params.stop_token_ids``,
         defaulting to ``eos_token_id``) is yielded and then ends the stream.
+
+        ``cuda_graph`` captures the decode step and replays it, trading a
+        one-off capture for the per-step kernel launch cost (see `DecodeGraph`).
+        It has no effect off CUDA.
         """
         params = params or SamplingParams()
         stop_ids = set(params.stop_token_ids)
@@ -653,13 +659,22 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         logits = self(input_ids, positions=positions, cache=cache)
         next_token = self.sampler(logits[:, -1], params, gen)
 
+        # Capture after prefill: the decode branch only exists once the caches
+        # hold state, and capture records whichever branch it runs.
+        graph = None
+        if cuda_graph and input_ids.device.type == "cuda":
+            graph = DecodeGraph(self, cache, input_ids.device)
+
         for step in range(params.max_new_tokens):
             tok = int(next_token.item())
             yield tok
             if tok in stop_ids:
                 return
-            pos = torch.tensor([seq + step], device=input_ids.device)
-            logits = self(next_token, positions=pos, cache=cache)
+            if graph is not None:
+                logits = graph.replay(next_token, seq + step)
+            else:
+                pos = torch.tensor([seq + step], device=input_ids.device)
+                logits = self(next_token, positions=pos, cache=cache)
             next_token = self.sampler(logits[:, -1], params, gen)
 
     @torch.no_grad()

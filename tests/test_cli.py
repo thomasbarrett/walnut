@@ -15,8 +15,30 @@ def test_serve_help_lists_arguments():
     assert result.exit_code == 0
     out = click.unstyle(result.output)
     assert "MODEL" in out
-    for opt in ("--host", "--port", "--device", "--dtype"):
+    for opt in ("--host", "--port", "--device", "--dtype", "--no-cuda-graph"):
         assert opt in out
+
+
+def test_serve_passes_cuda_graph_through(monkeypatch):
+    seen: dict[str, bool] = {}
+
+    class _Engine:
+        model_id = "m"
+        device = "cpu"
+        dtype = "float32"
+
+    def fake_load_model(model, device=None, dtype=None, cuda_graph=True):
+        seen["cuda_graph"] = cuda_graph
+        return _Engine()
+
+    monkeypatch.setattr("walnut.engine.load_model", fake_load_model)
+    monkeypatch.setattr("walnut.server.serve", lambda *args, **kwargs: None)
+
+    assert runner.invoke(app, ["serve", "m"]).exit_code == 0
+    assert seen["cuda_graph"] is True
+
+    assert runner.invoke(app, ["serve", "m", "--no-cuda-graph"]).exit_code == 0
+    assert seen["cuda_graph"] is False
 
 
 def test_chat_help_lists_options():
