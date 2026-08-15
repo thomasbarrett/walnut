@@ -117,13 +117,15 @@ Two values walnut had to choose:
 
 ## Profiling
 
-walnut profiles with `torch.profiler` and writes a **Chrome trace**, as vLLM
-and SGLang do. Traces open in [ui.perfetto.dev](https://ui.perfetto.dev/);
-walnut ships no viewer of its own. Each trace has a `.summary.txt` beside it —
-the profiler's `key_averages()` table — so a run can also be read as text.
+`torch.profiler` records a window and writes a Chrome trace, which opens at
+[ui.perfetto.dev](https://ui.perfetto.dev/). walnut ships no viewer of its own.
+Beside each trace is a `.summary.txt`, the profiler's `key_averages()` table,
+for reading a run without a browser.
 
-Profiling is off unless you ask for it: it adds per-op overhead and buffers for
-as long as the window is open.
+Profiling is expensive. On an RTX 5090 running Qwen3.5-0.8B it costs about 38%
+of throughput (256 down to 185 tok/s) and grows the trace buffer by roughly
+0.5 MB per token, which is only released when the window closes. So it is off
+unless you turn it on, and every window is bounded.
 
 ### One-shot, from the CLI
 
@@ -138,25 +140,24 @@ trace:   profiles/walnut-20260815-182128-392836.trace.json.gz
 summary: profiles/walnut-20260815-182128-392836.summary.txt
 ```
 
-CUDA graphs are **off** by default here. Kernels inside a replayed graph are
-traced either way, but they carry no CPU-side dispatch, so they arrive as bare
-kernel names with no `aten::` op above them — on a 32-token run, `aten::`
-attribution drops from 35% of CUDA time to 4%. Pass `--cuda-graph` to measure
-the path as it actually serves; the kernel timeline is intact there, and the
-host-side cost is far lower (0.68 s vs 1.95 s of CPU time).
+CUDA graphs are off by default here. Kernels inside a replayed graph are traced
+either way, but they carry no CPU-side dispatch, so they arrive as bare kernel
+names with no `aten::` op above them; on a 32-token run, `aten::` attribution
+falls from 35% of CUDA time to 4%. Pass `--cuda-graph` to measure the path as
+it actually serves.
 
 ### On a running server
 
 Set `WALNUT_TORCH_PROFILER_DIR` to enable `/start_profile` and `/stop_profile`,
-then bracket the traffic you want to capture:
+then bracket the traffic you want:
 
 ```bash
 WALNUT_TORCH_PROFILER_DIR=./profiles walnut serve Qwen/Qwen3.5-0.8B
 ```
 
 ```bash
-curl -X POST localhost:8000/start_profile
-# ...drive the traffic you care about...
+curl -X POST localhost:8000/start_profile -d '{"duration_seconds": 30}'
+# ...drive traffic...
 curl -X POST localhost:8000/stop_profile
 ```
 
@@ -168,19 +169,30 @@ curl -X POST localhost:8000/stop_profile
  "summary": "profiles/walnut-20260815-182128-392836.summary.txt"}
 ```
 
-Both routes return 404 without the variable. Starting twice, or stopping when
-idle, is a 409.
+Windows are bounded. `duration_seconds` defaults to 30 and cannot exceed 300;
+asking for more is a 422. When it expires the window closes itself and writes
+the trace, so a caller that never sends `/stop_profile` cannot run the server
+out of memory. `/stop_profile` ends a window early. pprof, JFR, and Perfetto
+all bound captures the same way.
 
-`summary` is `null` when the averages table couldn't be built. The trace is
-written first, so a capture survives that.
+Without the environment variable both routes return 404. Starting twice, or
+stopping when idle, is a 409. `summary` is `null` when the table could not be
+built; the trace is written first and survives that.
+
+!!! warning "These are admin endpoints"
+
+    `/start_profile` is unauthenticated and sits on the API port. Anyone who
+    can reach `/v1/chat/completions` can cost you a third of your throughput.
+    Keep the port private, or leave `WALNUT_TORCH_PROFILER_DIR` unset in
+    production. Kubernetes ships the same switch as `--profiling=false`, and
+    the CIS benchmark requires it.
 
 !!! note "Server profiles show kernels, not `aten::` ops"
 
     kineto records framework-level ops only on the thread that started the
     profile; GPU kernels are recorded from any thread. Requests run on
     threadpool workers, so a server profile gives the CUDA timeline without the
-    `aten::` names above it. Use `walnut profile` for that attribution — it
-    runs the model on the profiling thread.
+    `aten::` names above it. Use `walnut profile` for that attribution.
 
     The server also profiles without stacks: worker frames aren't recorded
     anyway, and collecting them inflates the trace and trips a parse failure in

@@ -1,14 +1,50 @@
 import gzip
 import json
 import threading
+import time
+from typing import Any
 
 import pytest
 import torch
 from fastapi.testclient import TestClient
 
 from tests.conftest import StubEngine
-from walnut.profiler import DIR_ENV, TorchProfiler
-from walnut.server import create_app
+from walnut.profiler import DIR_ENV, ProfileArtifacts, TorchProfiler
+from walnut.server import DEFAULT_PROFILE_SECONDS, MAX_PROFILE_SECONDS, create_app
+
+
+class FakeProfiler(TorchProfiler):
+    """Stands in for kineto in the HTTP tests.
+
+    TestClient runs the event loop on a background thread, and a real capture
+    opened there segfaults on export. The routes' own logic — the deadline, the
+    conflicts — doesn't need a real profile.
+    """
+
+    def __init__(self, directory) -> None:
+        super().__init__(directory)
+        self._open = False
+
+    @property
+    def running(self) -> bool:
+        return self._open
+
+    def start(self) -> None:
+        if self._open:
+            raise RuntimeError("profiling is already running")
+        self._open = True
+
+    def close(self) -> Any:
+        if not self._open:
+            raise RuntimeError("profiling is not running")
+        self._open = False
+        return None
+
+    def write(self, profile: Any) -> ProfileArtifacts:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        trace = self.directory / "fake.trace.json.gz"
+        trace.write_bytes(b"")
+        return ProfileArtifacts(trace, None)
 
 
 def _work() -> None:
@@ -131,7 +167,61 @@ def test_endpoints_404_when_disabled():
     assert client.post("/stop_profile").status_code == 404
 
 
+def test_start_reports_the_window_it_will_keep(tmp_path):
+    profiler = FakeProfiler(tmp_path)
+    client = TestClient(create_app(StubEngine(), profiler=profiler))
+    body = client.post("/start_profile", json={"duration_seconds": 5}).json()
+    assert body == {"status": "profiling", "duration_seconds": 5}
+    client.post("/stop_profile")
+
+
+def test_start_defaults_to_a_bounded_window(tmp_path):
+    """An open-ended window grows the trace buffer until the server dies."""
+    profiler = FakeProfiler(tmp_path)
+    client = TestClient(create_app(StubEngine(), profiler=profiler))
+    assert client.post("/start_profile").json()["duration_seconds"] == (
+        DEFAULT_PROFILE_SECONDS
+    )
+    client.post("/stop_profile")
+
+
+def test_start_refuses_a_window_over_the_ceiling(tmp_path):
+    profiler = FakeProfiler(tmp_path)
+    client = TestClient(create_app(StubEngine(), profiler=profiler))
+    resp = client.post(
+        "/start_profile", json={"duration_seconds": MAX_PROFILE_SECONDS + 1}
+    )
+    assert resp.status_code == 422
+    assert not profiler.running
+
+
+def test_the_window_closes_on_its_own(tmp_path):
+    """Left open, the trace buffer grows until the server dies."""
+    profiler = FakeProfiler(tmp_path)
+    # As a context manager, so one event loop outlives the request that armed
+    # the deadline; a bare TestClient tears its loop down per request.
+    with TestClient(create_app(StubEngine(), profiler=profiler)) as client:
+        client.post("/start_profile", json={"duration_seconds": 0.05})
+        deadline = time.monotonic() + 10
+        while profiler.running and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not profiler.running
+    assert list(tmp_path.glob("*.trace.json.gz"))
+
+
+def test_stopping_by_hand_cancels_the_deadline(tmp_path):
+    profiler = FakeProfiler(tmp_path)
+    with TestClient(create_app(StubEngine(), profiler=profiler)) as client:
+        client.post("/start_profile", json={"duration_seconds": 0.05})
+        assert client.post("/stop_profile").json()["status"] == "stopped"
+        time.sleep(0.2)  # long enough that a live deadline would have fired
+        # A second window opens cleanly, so the first deadline didn't fire into
+        # it and leave the profiler in a surprising state.
+        assert client.post("/start_profile").status_code == 200
+        assert client.post("/stop_profile").status_code == 200
+
+
 def test_stop_without_start_is_a_conflict(tmp_path):
-    profiler = TorchProfiler(tmp_path, with_stack=False)
+    profiler = FakeProfiler(tmp_path)
     client = TestClient(create_app(StubEngine(), profiler=profiler))
     assert client.post("/stop_profile").status_code == 409

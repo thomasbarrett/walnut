@@ -16,6 +16,7 @@ rather than being built here. Logging is set up in `walnut.telemetry`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -28,13 +29,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from prometheus_client import Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .engine import Engine, GenerationConfig, Message
 from .telemetry import configure_logging
 
 if TYPE_CHECKING:  # importing the profiler pulls in torch; keep it off the hot path
-    from .profiler import TorchProfiler
+    from .profiler import ProfileArtifacts, TorchProfiler
 
 logger = logging.getLogger("walnut.server")
 
@@ -93,6 +94,20 @@ TIME_PER_OUTPUT_TOKEN = Histogram(
     _LABELS,
     buckets=_TPOT_BUCKETS,
 )
+
+
+#: Profiling window if the caller doesn't say, and the ceiling it may ask for.
+#: Bounded on purpose: an open-ended window grows the trace buffer until the
+#: server dies. pprof, JFR, and Perfetto all take a duration for the same
+#: reason.
+DEFAULT_PROFILE_SECONDS = 30.0
+MAX_PROFILE_SECONDS = 300.0
+
+
+class ProfileRequest(BaseModel):
+    duration_seconds: float = Field(
+        DEFAULT_PROFILE_SECONDS, gt=0, le=MAX_PROFILE_SECONDS
+    )
 
 
 class ChatMessage(BaseModel):
@@ -253,18 +268,52 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
     # Both handlers are async on purpose. A sync handler runs in the threadpool,
     # which would start and stop the window on two different workers — kineto
     # segfaults on that. On the event loop they share one thread.
+    deadline: asyncio.TimerHandle | None = None
+
+    async def _end_window() -> ProfileArtifacts:
+        """End the window here, then export off the event loop.
+
+        `TorchProfiler.close` has to run on the thread that started the window,
+        which is this one. Writing the trace can take seconds and is safe
+        anywhere once the window is closed, so it goes to a worker rather than
+        stalling every other request.
+        """
+        profiler = _profiler()
+        profile = profiler.close()
+        return await asyncio.get_running_loop().run_in_executor(
+            None, profiler.write, profile
+        )
+
     @app.post("/start_profile", include_in_schema=False)
-    async def start_profile() -> dict:
+    async def start_profile(req: ProfileRequest | None = None) -> dict:
+        nonlocal deadline
+        seconds = (req or ProfileRequest()).duration_seconds
         try:
             _profiler().start()
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"status": "profiling"}
+
+        async def expire() -> None:
+            try:
+                await _end_window()
+            except RuntimeError:
+                pass  # stopped by hand in the meantime
+            except Exception:
+                logger.exception("profile_autostop_failed")
+
+        deadline = asyncio.get_running_loop().call_later(
+            seconds, lambda: asyncio.ensure_future(expire())
+        )
+        return {"status": "profiling", "duration_seconds": seconds}
 
     @app.post("/stop_profile", include_in_schema=False)
     async def stop_profile() -> dict:
+        nonlocal deadline
+        if deadline is not None:
+            deadline.cancel()
+            deadline = None
         try:
-            artifacts = _profiler().stop()
+            artifacts = await _end_window()
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"status": "stopped", **artifacts.as_dict()}

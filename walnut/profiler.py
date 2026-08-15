@@ -120,11 +120,12 @@ class TorchProfiler:
             self._owner = threading.get_ident()
         logger.info("profile_started", extra={"directory": str(self.directory)})
 
-    def stop(self) -> ProfileArtifacts:
-        """Close the window and write the trace, and the summary if it builds.
+    def close(self) -> torch.profiler.profile:
+        """End the window and return the profile, without writing anything.
 
-        Raises if no window is open, or if the caller is not the thread that
-        opened it.
+        Must run on the thread that called `start`. Split from `write` so a
+        server can end the window on the thread that owns it and export from a
+        worker, which is safe once the window is closed.
         """
         with self._lock:
             profile = self._profile
@@ -142,7 +143,10 @@ class TorchProfiler:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             profile.stop()
+        return profile
 
+    def write(self, profile: torch.profiler.profile) -> ProfileArtifacts:
+        """Export a closed ``profile``. Safe on any thread."""
         self.directory.mkdir(parents=True, exist_ok=True)
         stem = f"walnut-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         # export_chrome_trace gzips when the name ends in .gz.
@@ -162,6 +166,10 @@ class TorchProfiler:
         artifacts = ProfileArtifacts(trace, summary)
         logger.info("profile_stopped", extra=artifacts.as_dict())
         return artifacts
+
+    def stop(self) -> ProfileArtifacts:
+        """Close the window and write it. Must run on the starting thread."""
+        return self.write(self.close())
 
 
 def summarize(profile: torch.profiler.profile, row_limit: int = SUMMARY_ROWS) -> str:
