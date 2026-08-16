@@ -656,8 +656,38 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             device=input_ids.device,
         )
         positions = torch.arange(seq, device=input_ids.device)
-        logits = self(input_ids, positions=positions, cache=cache)
-        next_token = self.sampler(logits[:, -1], params, gen)
+
+        # `_prefill` and `_decode_step` exist to be named. Prefill and decode
+        # are different workloads — prefill runs few large kernels, decode
+        # thousands of microsecond ones — and a profile can only tell them
+        # apart if they are separate frames. Inlining either one back into the
+        # loop makes every per-phase and per-token trace query stop working.
+
+        # Each returns the sampled token twice: as the device tensor the next
+        # step consumes, and as the int this one yields. Reading it back is a
+        # sync — the CPU waiting on the GPU — so it belongs inside the step
+        # that produced the token. Left outside, a decode frame times only the
+        # launches and reads several times faster than the token really took.
+
+        def _prefill() -> tuple[torch.Tensor, int]:
+            """Run the prompt through the model and sample the first token."""
+            logits = self(input_ids, positions=positions, cache=cache)
+            next_token = self.sampler(logits[:, -1], params, gen)
+            return next_token, int(next_token.item())
+
+        def _decode_step(
+            token: torch.Tensor, position: int
+        ) -> tuple[torch.Tensor, int]:
+            """Advance one token: replay or forward, then sample."""
+            if graph is not None:
+                logits = graph.replay(token, position)
+            else:
+                pos = torch.tensor([position], device=input_ids.device)
+                logits = self(token, positions=pos, cache=cache)
+            next_token = self.sampler(logits[:, -1], params, gen)
+            return next_token, int(next_token.item())
+
+        next_token, tok = _prefill()
 
         # Capture after prefill: the decode branch only exists once the caches
         # hold state, and capture records whichever branch it runs.
@@ -666,16 +696,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             graph = DecodeGraph(self, cache, input_ids.device)
 
         for step in range(params.max_new_tokens):
-            tok = int(next_token.item())
             yield tok
             if tok in stop_ids:
                 return
-            if graph is not None:
-                logits = graph.replay(next_token, seq + step)
-            else:
-                pos = torch.tensor([seq + step], device=input_ids.device)
-                logits = self(next_token, positions=pos, cache=cache)
-            next_token = self.sampler(logits[:, -1], params, gen)
+            next_token, tok = _decode_step(next_token, seq + step)
 
     @torch.no_grad()
     def generate(

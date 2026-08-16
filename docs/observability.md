@@ -127,6 +127,40 @@ of throughput (256 down to 185 tok/s) and grows the trace buffer by roughly
 0.5 MB per token, which is only released when the window closes. So it is off
 unless you turn it on, and every window is bounded.
 
+### Phases
+
+`walnut profile` records Python call frames, so the trace names each phase of a
+generation and a run can be read per phase and per token rather than as one
+undifferentiated stretch. Kineto spells a frame `file(line): function`, and
+three functions exist to be found that way:
+
+| Frame ends with | Occurs | Covers |
+| --- | --- | --- |
+| `: _prefill` | once | The prompt forward pass, sampling, and the first token |
+| `: capture` (in `graph.py`) | once, with `--cuda-graph` | Warming up and recording the decode graph |
+| `: _decode_step` | once per generated token | Replay or forward, sampling, and the `.item()` sync |
+
+Match on the name, not the line number — the line moves whenever the file
+above it is edited:
+
+```sql
+select count(*) tokens, avg(dur)/1e6 avg_ms
+from slice
+where category = 'python_function' and name glob '*: _decode_step'
+```
+
+walnut emits no `torch.profiler.record_function` scopes, so there are no
+`user_annotation` slices; the frames carry this instead. That follows vLLM and
+SGLang, both of which record stacks by default and leave their annotation
+scopes off. It also avoids a trap: kineto interleaves `python_function` slices
+with `user_annotation` ones in a way the trace importer rejects, and it
+resolves that by silently dropping the annotations — so a trace with both would
+arrive with the annotations missing and no error.
+
+Each step's `.item()` — the sync where the CPU waits on the GPU — is inside the
+frame that produced the token. Outside it, a decode frame would time only the
+kernel launches and read several times faster than the token really took.
+
 ### One-shot, from the CLI
 
 `walnut profile` loads a model, warms it up, and profiles a single generation:

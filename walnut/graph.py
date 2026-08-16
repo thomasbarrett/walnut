@@ -47,7 +47,16 @@ class DecodeGraph:
     ) -> None:
         self.token = torch.zeros(1, 1, dtype=torch.long, device=device)
         self.position = torch.zeros(1, dtype=torch.long, device=device)
+        self.capture(model, cache, warmup)
 
+    def capture(self, model: Any, cache: list[Cache], warmup: int = 3) -> None:
+        """Warm up and record the decode step into a replayable graph.
+
+        A method rather than constructor body so a profile can name it: with
+        stacks recorded, capture is its own `graph.py(N): capture` frame
+        instead of an anonymous stretch of `__init__`, which is what separates
+        its cost from the prefill it runs after.
+        """
         buffers = _buffers(cache)
         saved = [buffer.clone() for buffer in buffers]
 
