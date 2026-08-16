@@ -14,6 +14,7 @@ from typing import Any, cast
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import record_function
 
 from walnut.graph import DecodeGraph
 from walnut.layers import (
@@ -656,26 +657,35 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             device=input_ids.device,
         )
         positions = torch.arange(seq, device=input_ids.device)
-        logits = self(input_ids, positions=positions, cache=cache)
-        next_token = self.sampler(logits[:, -1], params, gen)
+        # The record_function scopes name the phases in a profiler trace, so a
+        # profile can be read per phase and per token instead of as one
+        # undifferentiated run. Each covers a whole step, sampling and the
+        # `.item()` sync included, since that sync is where the CPU waits on
+        # the GPU and excluding it would understate the step.
+        with record_function("prefill"):
+            logits = self(input_ids, positions=positions, cache=cache)
+            next_token = self.sampler(logits[:, -1], params, gen)
+            tok = int(next_token.item())
 
         # Capture after prefill: the decode branch only exists once the caches
         # hold state, and capture records whichever branch it runs.
         graph = None
         if cuda_graph and input_ids.device.type == "cuda":
-            graph = DecodeGraph(self, cache, input_ids.device)
+            with record_function("cuda_graph_capture"):
+                graph = DecodeGraph(self, cache, input_ids.device)
 
         for step in range(params.max_new_tokens):
-            tok = int(next_token.item())
             yield tok
             if tok in stop_ids:
                 return
-            if graph is not None:
-                logits = graph.replay(next_token, seq + step)
-            else:
-                pos = torch.tensor([seq + step], device=input_ids.device)
-                logits = self(next_token, positions=pos, cache=cache)
-            next_token = self.sampler(logits[:, -1], params, gen)
+            with record_function("decode"):
+                if graph is not None:
+                    logits = graph.replay(next_token, seq + step)
+                else:
+                    pos = torch.tensor([seq + step], device=input_ids.device)
+                    logits = self(next_token, positions=pos, cache=cache)
+                next_token = self.sampler(logits[:, -1], params, gen)
+                tok = int(next_token.item())
 
     @torch.no_grad()
     def generate(

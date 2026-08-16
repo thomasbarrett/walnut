@@ -78,6 +78,17 @@ def test_profile_passes_cuda_graph_through(monkeypatch):
     assert seen["cuda_graph"] is False
 
 
+def test_profile_leaves_stacks_off_by_default():
+    """Stacks cost the phase annotations, so they are opt-in.
+
+    Kineto interleaves `python_function` slices with the `user_annotation`
+    ones in a way the trace importer rejects, and it resolves that by
+    dropping every annotation. Defaulting to stacks would mean every trace
+    arrives without its phases and without an error saying so.
+    """
+    assert _params("profile")["with_stack"].default is False
+
+
 def test_chat_help_lists_options():
     result = runner.invoke(app, ["chat", "--help"])
     assert result.exit_code == 0

@@ -107,6 +107,17 @@ def profile(
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
+    with_stack: Annotated[
+        bool,
+        typer.Option(
+            "--with-stack/--no-with-stack",
+            help=(
+                "Record Python call frames. Costs the phase annotations: "
+                "kineto interleaves the frames with them in a way the trace "
+                "importer rejects, so it drops every 'prefill'/'decode' slice."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 
@@ -133,7 +144,7 @@ def profile(
     engine.generate(messages, GenerationConfig(max_tokens=4))
 
     typer.echo(f"Profiling {max_tokens} tokens on {engine.device}...")
-    profiler = TorchProfiler(output_dir)
+    profiler = TorchProfiler(output_dir, with_stack=with_stack)
     profiler.start()
     try:
         engine.generate(messages, config)

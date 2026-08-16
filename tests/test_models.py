@@ -90,3 +90,26 @@ def test_iter_generate_stops_after_yielding_a_stop_token():
 def test_iter_generate_falls_back_to_eos_as_the_stop_token():
     model = _ScriptedModel([7, 2, 9], eos_token_id=2)
     assert _generate(model, max_new_tokens=3) == [7, 2]
+
+
+def test_iter_generate_annotates_the_phases():
+    """A profiled generation names its phases, one `decode` per token.
+
+    These annotations are what makes a trace readable per phase and per
+    token; without them a profile is one undifferentiated run.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    model = _ScriptedModel([7, 8, 9])
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        assert _generate(model, max_new_tokens=3) == [7, 8, 9]
+
+    phases = [
+        event.name
+        for event in prof.events()
+        if event.name in {"prefill", "decode", "cuda_graph_capture"}
+    ]
+    assert phases.count("prefill") == 1
+    assert phases.count("decode") == 3
+    # Capture is CUDA-only, and this stand-in never runs on a device.
+    assert phases.count("cuda_graph_capture") == 0

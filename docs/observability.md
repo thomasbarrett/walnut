@@ -127,6 +127,31 @@ of throughput (256 down to 185 tok/s) and grows the trace buffer by roughly
 0.5 MB per token, which is only released when the window closes. So it is off
 unless you turn it on, and every window is bounded.
 
+### Phases
+
+Generation annotates itself, so a trace can be read per phase and per token
+rather than as one undifferentiated run. Three names appear, as
+`user_annotation` slices:
+
+| Phase | Covers |
+| --- | --- |
+| `prefill` | The prompt forward pass, sampling, and the first token |
+| `cuda_graph_capture` | Capturing the decode graph, once, when `--cuda-graph` is on |
+| `decode` | One generated token: replay or forward, sampling, and the `.item()` sync |
+
+Each scope covers a whole step, the `.item()` sync included, because that sync
+is where the CPU waits on the GPU — excluding it would understate the step. The
+annotations cost about 3 µs per token when no profiler is running, against a
+decode step of several milliseconds.
+
+!!! warning "`--with-stack` removes the phases"
+
+    Python call frames are off by default. With them on, kineto interleaves
+    `python_function` slices with the annotations in a way that violates strict
+    nesting, and the trace importer resolves it by **dropping every
+    annotation** — silently, leaving a trace with no phases and no error. Turn
+    them on when you want Python source attribution and can do without phases.
+
 ### One-shot, from the CLI
 
 `walnut profile` loads a model, warms it up, and profiles a single generation:
