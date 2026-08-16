@@ -129,10 +129,9 @@ unless you turn it on, and every window is bounded.
 
 ### Phases
 
-`walnut profile` records Python call frames, so the trace names each phase of a
-generation and a run can be read per phase and per token rather than as one
-undifferentiated stretch. Kineto spells a frame `file(line): function`, and
-three functions exist to be found that way:
+`walnut profile` records Python call frames, and kineto spells each one
+`file(line): function`. Three functions exist to be found that way, so a trace
+can be read per phase and per token:
 
 | Frame ends with | Occurs | Covers |
 | --- | --- | --- |
@@ -149,17 +148,14 @@ from slice
 where category = 'python_function' and name glob '*: _decode_step'
 ```
 
-walnut emits no `torch.profiler.record_function` scopes, so there are no
-`user_annotation` slices; the frames carry this instead. That follows vLLM and
-SGLang, both of which record stacks by default and leave their annotation
-scopes off. It also avoids a trap: kineto interleaves `python_function` slices
-with `user_annotation` ones in a way the trace importer rejects, and it
-resolves that by silently dropping the annotations — so a trace with both would
-arrive with the annotations missing and no error.
+Each step's `.item()` — the sync where the CPU waits on the GPU — sits inside
+the frame that produced the token. Outside it, a decode frame times only the
+kernel launches and reads several times faster than the token really took.
 
-Each step's `.item()` — the sync where the CPU waits on the GPU — is inside the
-frame that produced the token. Outside it, a decode frame would time only the
-kernel launches and read several times faster than the token really took.
+There are no `record_function` scopes and so no `user_annotation` slices, as in
+vLLM and SGLang. The two cannot coexist anyway: kineto interleaves
+`python_function` slices with `user_annotation` ones in a way the trace
+importer rejects, and it resolves that by dropping the annotations, silently.
 
 ### One-shot, from the CLI
 

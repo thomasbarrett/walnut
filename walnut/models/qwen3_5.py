@@ -657,17 +657,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         )
         positions = torch.arange(seq, device=input_ids.device)
 
-        # `_prefill` and `_decode_step` exist to be named. Prefill and decode
-        # are different workloads — prefill runs few large kernels, decode
-        # thousands of microsecond ones — and a profile can only tell them
-        # apart if they are separate frames. Inlining either one back into the
-        # loop makes every per-phase and per-token trace query stop working.
-
-        # Each returns the sampled token twice: as the device tensor the next
-        # step consumes, and as the int this one yields. Reading it back is a
-        # sync — the CPU waiting on the GPU — so it belongs inside the step
-        # that produced the token. Left outside, a decode frame times only the
-        # launches and reads several times faster than the token really took.
+        # Separate functions so a profile can name the phases; inlining either
+        # back into the loop leaves a trace that cannot be read per phase.
+        # Both return the token twice, tensor and int: reading it back syncs on
+        # the GPU, and that wait belongs to the step that caused it.
 
         def _prefill() -> tuple[torch.Tensor, int]:
             """Run the prompt through the model and sample the first token."""

@@ -93,13 +93,10 @@ def test_iter_generate_falls_back_to_eos_as_the_stop_token():
 
 
 def test_iter_generate_runs_each_phase_in_a_named_frame():
-    """The phase names are an interface: traces are segmented by them.
+    """Traces are segmented by these names, so they are an interface.
 
-    A profile recorded with stacks names each Python frame
-    `file(line): function`, so `_prefill` and `_decode_step` are what tells
-    prefill from decode and gives one frame per token. Inlining either back
-    into the loop would leave a trace that cannot be read per phase, and
-    nothing else would fail — hence this test.
+    Inlining either function back into the loop would break every per-phase
+    query and fail nothing else.
     """
     from torch.profiler import ProfilerActivity, profile
 
