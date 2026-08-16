@@ -89,7 +89,7 @@ testpaths = ["tests"]
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.15.21",
-    "ty>=0.0.59",
+    "ty>=0.0.71",
     # Reads traces in .claude/skills/analyze-trace; a developer tool, so it
     # stays out of the served image. Downloads trace_processor_shell on first
     # use.
