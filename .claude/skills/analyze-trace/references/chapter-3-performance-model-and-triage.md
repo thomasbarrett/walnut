@@ -157,7 +157,7 @@ Three things follow, one per test:
 - **Test 3.** Its total is measured over `api`, one row per call, so the number
   stays correct — but "API ≫ rest" no longer means launch-bound in the eager
   sense, because a handful of `cudaGraphLaunch` calls now dominate it. Read it
-  with §4.3.2. (The `launch_fanout` division in §6.5 trap 8 applies to
+  with §4.3.2. (The `launch_fanout` division in §6.4 trap 8 applies to
   aggregates over `link`, where `ldur` repeats once per kernel — *not* to this
   query.)
 

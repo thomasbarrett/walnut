@@ -93,9 +93,8 @@ the gemv family). For the bandwidth roofline in §5.2 you need a parameter count
 which carries dims and `torch_dtype` only.
 
 walnut emits no `record_function` scopes, so `prelude.sql` builds `phase` from
-the Python frames instead — `_prefill`, `_decode_step` (one per token), and
-`DecodeGraph.capture`. Match those names, not the line numbers beside them.
-(`prelude.sql` records the consequence; an empty `phase` table is the symptom.)
+the Python frames instead — see its header for the frame names and why an empty
+`phase` table is the symptom of losing them.
 
 ## Report it
 
@@ -113,6 +112,6 @@ A finished analysis states:
 - **Ranked findings**, each with its cost in µs/token or % of the phase, and
   the source file it lives in.
 
-Before reporting, check the traps in §6.5 — at minimum the ones for the branch
+Before reporting, check the traps in §6.4 — at minimum the ones for the branch
 you took. Two apply to almost every walnut trace: drop the warm-up token
 (`WHERE seq > 0`), and do not sum kernel durations across streams.

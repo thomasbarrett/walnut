@@ -1,6 +1,6 @@
 # Chapter 6 — Practice
 
-> An end-to-end diagnosis, tail-latency work, regression testing, and the mistakes that invalidate results.
+> An end-to-end diagnosis, tail-latency work, A/B comparison, and the mistakes that invalidate results.
 
 ## 6.1 Worked case study: 485 → 2457 tok/s
 
@@ -172,42 +172,12 @@ print(delta.sort_values('d_us').tail(15))   # biggest regressions
 
 **Comparison hygiene.** Capture both traces on the same machine, same driver, same clocks (`nvidia-smi -lgc` to lock if you can), with identical warm-up and identical token counts, and always drop `seq = 0`. Compare *distributions*, not single tokens. A 5% delta in mean ITL from a single 32-token capture is noise.
 
-## 6.4 Automation and CI
+If you ever gate on these numbers rather than eyeballing them, `n_aten_ops` is
+the highest-value guard: a single graph break or an accidental `.cpu()` moves
+it by an order of magnitude and it has no measurement noise. `gpu_util_pct` is
+the best single summary. Both are far more stable than wall-clock timing.
 
-### 6.4.1 Ship the prelude as a SQL package
-
-```bash
-mkdir -p sqlpkg/torchinf && cp prelude.sql sqlpkg/torchinf/prelude.sql
-tp query --add-sql-package ./sqlpkg -f check.sql trace.json
-```
-with `check.sql` beginning `INCLUDE PERFETTO MODULE torchinf.prelude;`. This keeps one authoritative copy of the view layer across scripts, notebooks, and CI.
-
-### 6.4.2 A regression gate
-
-```python
-THRESHOLDS = {
-    'gpu_util_pct': ('min', 80.0),     # decode must keep the GPU busy
-    'n_aten_ops':   ('max', 2000),     # graphs/compile must stay engaged
-    'sync_us':      ('max', 200.0),    # no new .item() in the hot loop
-    'mean_itl_us':  ('max', 90.0),     # the SLO itself
-}
-
-m, failures = measure('trace.json'), []
-for k, (kind, bound) in THRESHOLDS.items():
-    v = m[k]
-    if (kind == 'min' and v < bound) or (kind == 'max' and v > bound):
-        failures.append(f"{k}={v:.2f} violates {kind} {bound}")
-if failures:
-    raise SystemExit("PERF REGRESSION:\n" + "\n".join(failures))
-```
-
-`n_aten_ops` is the highest-value guard in practice: a single graph break or an accidental `.cpu()` moves it by an order of magnitude and it has no measurement noise. `gpu_util_pct` is the best single summary. Both are far more stable in CI than wall-clock timing.
-
-### 6.4.3 Continuous capture in production
-
-Capture a short window periodically (`schedule(wait=N, warmup=1, active=2, repeat=1)` around the serving loop), gzip, upload, and run the gate offline. Trace size is the constraint: budget ~15 MB per 3,500 kernels uncompressed, ~1.5 MB gzipped. Keep `with_stack=False` in production for both size and the slice-drop bug.
-
-## 6.5 Twelve traps
+## 6.4 Twelve traps
 
 1. **Forgetting the `args.` prefix.** `extract_arg(id, 'correlation')` returns NULL silently. It is `args.correlation`.
 2. **Assuming microseconds.** JSON is µs; the `slice` table is ns.

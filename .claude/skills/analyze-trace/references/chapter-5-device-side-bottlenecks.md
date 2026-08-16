@@ -57,30 +57,18 @@ The `cpu_launch_us` column is the punchline: for `native_layer_norm`, `copy_`, a
 
 ### 5.1.3 Kernel name normalization
 
-For grouping across shapes and template parameters, strip the parameters:
+Kernel names carry shapes and template parameters. `kfam` — defined in
+[`scripts/prelude.sql`](../scripts/prelude.sql) — strips them down to a
+`family` column (`gemv`, `gemm`, `attention`, `norm`, `elementwise`, `reduce`,
+`collective`, `triton`, `other`), so:
 
 ```sql
-CREATE PERFETTO VIEW kfam AS
-SELECT *,
-  CASE
-    WHEN kname GLOB '*gemv*'                      THEN 'gemv'
-    WHEN kname GLOB '*gemm*' OR kname GLOB '*cutlass*' THEN 'gemm'
-    WHEN kname GLOB '*flash*' OR kname GLOB '*fmha*'   THEN 'attention'
-    WHEN kname GLOB '*layer_norm*' OR kname GLOB '*rms_norm*' THEN 'norm'
-    WHEN kname GLOB '*elementwise*'               THEN 'elementwise'
-    WHEN kname GLOB '*reduce*'                    THEN 'reduce'
-    WHEN kname GLOB '*nccl*' OR kname GLOB '*ncclDevKernel*' THEN 'collective'
-    WHEN kname GLOB '*triton*'                    THEN 'triton'
-    ELSE 'other'
-  END AS family
-FROM link;
-
 SELECT ph, family, COUNT(*) n, SUM(gdur)/1e3 us,
        SUM(gdur)*100.0/SUM(SUM(gdur)) OVER (PARTITION BY ph) AS pct
 FROM kfam GROUP BY 1,2 ORDER BY ph, us DESC;
 ```
 
-(This view is already defined in the prelude, [`scripts/prelude.sql`](../scripts/prelude.sql); it is repeated here for reference.) This is the view to put in a dashboard: it is stable across PyTorch versions and immediately shows a shift in the compute mix (e.g. `gemm` → `triton` after enabling `torch.compile`).
+This is the rollup to put in a dashboard: it is stable across PyTorch versions and immediately shows a shift in the compute mix (e.g. `gemm` → `triton` after enabling `torch.compile`).
 
 ### 5.1.4 The tiny-kernel census
 

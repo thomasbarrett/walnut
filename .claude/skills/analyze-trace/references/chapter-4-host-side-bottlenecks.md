@@ -174,16 +174,8 @@ This is why `launch_fanout` is in the prelude. **Any aggregate over launch durat
 
 ### 4.3.3 Measuring the win
 
-```
-                          eager      graphed     delta
-decode e2e                65.92 ms   13.02 ms    5.06x
-throughput               485 tok/s  2457 tok/s   5.06x
-GPU busy                  12.53 ms   12.51 ms    1.00x   <- unchanged, as expected
-GPU utilization           19.0 %     96.1 %      5.06x
-mean ITL                2053.2 µs    74.1 µs    27.7x    <- host-side issue cost
-host launch cost           9.34 ms    1.75 ms    5.34x
-ATen ops (whole trace)      26338        927    28.4x
-```
+The before/after table for the running example is in §6.1 step 8. Two readings
+of it belong here.
 
 The GPU did *identical* work in both runs — 12.5 ms of kernels, the same 109 per token. Everything gained came from deleting host time. This is the canonical shape of an inference win, and the reason the first *measurement* in §3.3 is always "what is the GPU utilization", never "which kernel is slowest".
 

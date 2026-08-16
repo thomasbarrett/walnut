@@ -75,14 +75,13 @@ occupancy and wave quantization.
 ## [Chapter 6 — Practice](chapter-6-practice.md)
 
 Putting it together: a diagnosis carried end to end, inter-token latency
-percentiles and what explains the outliers, comparing two traces, wiring the
-queries into CI, and the twelve mistakes in §6.5 that invalidate a result.
+percentiles and what explains the outliers, comparing two traces, and the
+twelve mistakes in §6.4 that invalidate a result.
 
 - 6.1 Worked case study: 485 → 2457 tok/s
 - 6.2 Tail latency and outlier tokens
 - 6.3 A/B trace comparison
-- 6.4 Automation and CI
-- 6.5 Twelve traps
+- 6.4 Twelve traps
 
 ## Sources
 
