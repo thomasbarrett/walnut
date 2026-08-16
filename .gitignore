@@ -14,3 +14,8 @@ site/
 
 # Profiler output
 profiles/
+
+# Claude Code scratch state. The shared config — .mcp.json, .claude/skills —
+# is checked in; only per-machine working state is ignored.
+.claude/worktrees/
+.claude/settings.local.json
