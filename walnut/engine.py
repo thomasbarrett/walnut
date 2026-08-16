@@ -219,9 +219,11 @@ class TorchEngine(Engine):
         device: str | torch.device | None = None,
         dtype: str | torch.dtype | None = None,
         cuda_graph: bool = True,
+        compile: bool = True,
     ) -> None:
         self.model_id = model_id
         self.cuda_graph = cuda_graph
+        self.compile = compile
         config = AutoConfig.from_pretrained(model_id)
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype, config, self.device)
@@ -253,7 +255,10 @@ class TorchEngine(Engine):
         input_ids = self._encode(messages)
         ids = list(
             self.model.iter_generate(
-                input_ids, self._params(config), cuda_graph=self.cuda_graph
+                input_ids,
+                self._params(config),
+                cuda_graph=self.cuda_graph,
+                compile=self.compile,
             )
         )
         text = self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -267,7 +272,10 @@ class TorchEngine(Engine):
         ids: list[int] = []
         emitted = ""
         for tok in self.model.iter_generate(
-            input_ids, self._params(config), cuda_graph=self.cuda_graph
+            input_ids,
+            self._params(config),
+            cuda_graph=self.cuda_graph,
+            compile=self.compile,
         ):
             ids.append(tok)
             text = self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -289,13 +297,19 @@ def load_model(
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
     cuda_graph: bool = True,
+    compile: bool = True,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
     ``device`` and ``dtype`` default to auto-selection; see `resolve_device`
     and `resolve_dtype`. ``cuda_graph`` replays decode from a captured graph
-    and has no effect off CUDA.
+    and has no effect off CUDA. ``compile`` runs the decode step through
+    `torch.compile`, paying a one-off compile for fused kernels.
     """
     return TorchEngine(
-        model_id=model, device=device, dtype=dtype, cuda_graph=cuda_graph
+        model_id=model,
+        device=device,
+        dtype=dtype,
+        cuda_graph=cuda_graph,
+        compile=compile,
     )

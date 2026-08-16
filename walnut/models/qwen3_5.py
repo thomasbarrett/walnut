@@ -630,6 +630,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         params: SamplingParams | None = None,
         cuda_graph: bool = True,
+        compile: bool = True,
     ) -> Iterator[int]:
         """Yield generated token ids (text-only, batch 1), one per step.
 
@@ -639,6 +640,12 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         ``cuda_graph`` captures the decode step and replays it, trading a
         one-off capture for the per-step kernel launch cost (see `DecodeGraph`).
         It has no effect off CUDA.
+
+        ``compile`` runs the decode step through `torch.compile`, which fuses
+        the elementwise chains the norms and the delta-rule recurrence would
+        otherwise spend a kernel apiece on. Prefill stays eager on purpose: its
+        shapes follow the prompt, so compiling it recompiles per prompt length,
+        while decode's are fixed and one compile serves every request.
         """
         params = params or SamplingParams()
         stop_ids = set(params.stop_token_ids)
@@ -676,17 +683,22 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
                 logits = graph.replay(token, position)
             else:
                 pos = torch.tensor([position], device=input_ids.device)
-                logits = self(token, positions=pos, cache=cache)
+                logits = decode_forward(token, positions=pos, cache=cache)
             next_token = self.sampler(logits[:, -1], params, gen)
             return next_token, int(next_token.item())
 
         next_token, tok = _prefill()
 
+        # Compile after prefill, so the trace dynamo records is the decode
+        # branch. Rebuilding the wrapper per request is a few milliseconds:
+        # dynamo's own cache keys on the code object, not on this object.
+        decode_forward: Any = torch.compile(self) if compile else self
+
         # Capture after prefill: the decode branch only exists once the caches
         # hold state, and capture records whichever branch it runs.
         graph = None
         if cuda_graph and input_ids.device.type == "cuda":
-            graph = DecodeGraph(self, cache, input_ids.device)
+            graph = DecodeGraph(decode_forward, cache, input_ids.device)
 
         for step in range(params.max_new_tokens):
             yield tok

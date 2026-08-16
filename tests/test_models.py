@@ -70,11 +70,19 @@ class _ScriptedModel:
         return torch.tensor([[self.tokens.pop(0) if self.tokens else 0]])
 
 
-def _generate(model: _ScriptedModel, max_new_tokens: int, **kwargs) -> list[int]:
+def _generate(
+    model: _ScriptedModel, max_new_tokens: int, compile: bool = False, **kwargs
+) -> list[int]:
     params = SamplingParams(max_new_tokens=max_new_tokens, **kwargs)
     ids = torch.zeros(1, 3, dtype=torch.long)
     stand_in = cast(Qwen3_5ForConditionalGeneration, model)
-    return list(Qwen3_5ForConditionalGeneration.iter_generate(stand_in, ids, params))
+    # Compilation is off unless a test is about it: these exercise the decode
+    # loop, and tracing the stand-in would test dynamo instead.
+    return list(
+        Qwen3_5ForConditionalGeneration.iter_generate(
+            stand_in, ids, params, compile=compile
+        )
+    )
 
 
 def test_iter_generate_yields_sampled_tokens_in_order():
@@ -90,6 +98,26 @@ def test_iter_generate_stops_after_yielding_a_stop_token():
 def test_iter_generate_falls_back_to_eos_as_the_stop_token():
     model = _ScriptedModel([7, 2, 9], eos_token_id=2)
     assert _generate(model, max_new_tokens=3) == [7, 2]
+
+
+def test_iter_generate_compiles_the_decode_step_but_not_the_prefill(monkeypatch):
+    """Prefill's shapes follow the prompt; compiling it recompiles per length."""
+    compiled: list[tuple[object, int]] = []
+
+    def fake_compile(target):
+        # The forward count at compile time says which phases it can cover.
+        compiled.append((target, target.forwards))
+        return target
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    model = _ScriptedModel([7, 8, 9])
+    assert _generate(model, max_new_tokens=3, compile=True) == [7, 8, 9]
+    assert compiled == [(model, 1)]  # compiled once, after the prefill forward
+    assert model.forwards == 4  # one prefill, three decode steps
+
+    assert _generate(_ScriptedModel([7, 8, 9]), max_new_tokens=3) == [7, 8, 9]
+    assert len(compiled) == 1  # compile=False does not compile
 
 
 def test_iter_generate_runs_each_phase_in_a_named_frame():

@@ -173,9 +173,10 @@ trace:   profiles/walnut-20260815-182128-392836.trace.json.gz
 summary: profiles/walnut-20260815-182128-392836.summary.txt
 ```
 
-CUDA graphs are on by default here, as everywhere else: replaying decode from a
-captured graph drops the per-token launch cost, so that is the configuration
-worth measuring. `--no-cuda-graph` turns it off.
+CUDA graphs and `torch.compile` are on by default here, as everywhere else:
+replaying a compiled decode step from a captured graph is the configuration
+worth measuring. `--no-cuda-graph` and `--no-compile` turn them off. The warm-up
+pass absorbs the compile, so it does not land inside the profiled window.
 
 ### On a running server
 
