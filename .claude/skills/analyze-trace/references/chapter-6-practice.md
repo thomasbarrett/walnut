@@ -78,7 +78,7 @@ host launch cost   9.34 ms    1.75 ms    5.34x
 
 Achieved 2457 tok/s against a predicted ceiling of 2554 — within 4%. The model is now GPU-bound at 96% utilization (`queue_ns` flipped from 3.3 µs to 5.2 ms), and the next lever is a device-side one: fuse the norms and elementwise ops, or quantize the weights to cut the gemv bandwidth that is 60% of remaining device time.
 
-**The general lesson.** Six queries, none of which looked at a kernel, produced the diagnosis. The kernel inventory in §5.1 was only useful *after* the host problem was fixed — and it immediately named the next target. Order matters: **utilization → queue → host split → localize → fix → re-measure.**
+**The general lesson.** Six queries, none of which looked at a kernel, produced the diagnosis. The kernel inventory in §5.1 was only useful *after* the host problem was fixed — and it immediately named the next target. Order matters: **graph check → utilization → queue → host split → localize → fix → re-measure.**
 
 ## 6.2 Tail latency and outlier tokens
 

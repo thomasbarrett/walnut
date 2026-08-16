@@ -62,7 +62,7 @@ If you need per-token metadata (sequence length, batch size), emit it as a separ
 > "slice_drop_overlapping_complete_event",9
 > ```
 >
-> Your `phase` table comes back empty and every per-token query returns zero rows. **Always run the preflight in §2.3.** Workarounds: profile without `with_stack`, or fall back to the GPU-side `gpu_user_annotation` slices (§3.2.3), which live on a different track and survive.
+> Your `phase` table comes back empty and every per-token query returns zero rows. **Always run the preflight in §2.3.** Workarounds: profile without `with_stack`, or fall back to the GPU-side `gpu_user_annotation` slices (§3.2.4), which live on a different track and survive.
 
 ### 2.1.4 Capturing from a serving stack
 
@@ -112,7 +112,7 @@ Typical ratio is 8–12×. Do this by default for anything you will move between
 
 ## 2.2 The view layer
 
-Almost every question in this book is asked against five relations. Define them once; everything downstream is a two-line query. The complete file, with the phase override walnut needs, is
+Almost every question in this book is asked against seven relations. Define them once; everything downstream is a two-line query. The complete file, with the phase override walnut needs, is
 [`scripts/prelude.sql`](../scripts/prelude.sql).
 
 ```sql
