@@ -127,20 +127,40 @@ The `M = 1` rows are the entire decode story. At `M = 1` there is no data reuse 
 
 Neither input is in the trace, so fetch them before quoting the bound:
 
-- `model_bytes` — parameter count × bytes per element for the serving dtype
-  (2 for fp16/bf16, 1 for fp8/int8). Get the parameter count from the model's
-  `config.json` or `sum(p.numel() for p in model.parameters())`; count the
-  weights that are actually read per token, so exclude an untied `lm_head` only
-  if decode does not run it.
+- `model_bytes` — the weights **actually read to produce one token**, times
+  bytes per element for the serving dtype (2 for fp16/bf16, 1 for fp8/int8).
+  That is every transformer-block weight plus `lm_head`. **Exclude the input
+  embedding table**: decode reads a single row of it, not the matrix. On a
+  small model that matters — a 0.8B with vocab 150k × hidden 1024 carries ~19%
+  of its parameters in embeddings, so a naive `total_params × dtype_bytes`
+  overstates `model_bytes` and understates the ceiling by the same fraction.
+  When embeddings are *tied*, `lm_head` is that same matrix and is read in
+  full: count it once. Get the count from `model.safetensors.index.json`, the
+  model card, or `sum(p.numel() for p in model.parameters())` — not from
+  `config.json`, which carries architecture dims and `torch_dtype`, never a
+  parameter count.
 - `HBM_bandwidth` — `nvidia-smi --query-gpu=name --format=csv` and then the
   card's spec sheet. Use ~80% of the theoretical peak as the achievable figure;
   a well-written gemv reaches roughly that.
 
-The ceiling is `HBM_bandwidth / model_bytes` tokens/s at batch 1. Quote it next
-to the measured rate — the ratio between them is the headroom, and it is the
-number worth arguing over. If the measured gemv bandwidth (`§5.1`) is already
-near peak while the ratio is poor, the loss is not in the weight reads and no
-amount of kernel tuning on the GEMMs will recover it.
+The ceiling is `HBM_bandwidth / model_bytes` tokens/s at batch 1 **and short
+context**. Once the context is long enough to matter, per-token traffic is
+`model_bytes + 2 × n_layers × n_kv_heads × head_dim × seq_len × dtype_bytes`
+for the KV read (§5.3).
+
+Quote the ceiling next to the measured rate — the ratio is the headroom, and it
+is the number worth arguing over. Then check whether the weight reads are
+actually the problem: the gemv family's achieved bandwidth is
+`model_bytes / SUM(gdur)` over one steady-state token,
+
+```sql
+SELECT SUM(gdur)/1e3 AS gemv_us_per_token
+FROM kfam WHERE family = 'gemv' AND ph = 'decode' AND seq = 1;
+```
+
+If that comes out near peak while the overall ratio is poor, the loss is not in
+the weight reads, and no amount of kernel tuning on the GEMMs will recover it —
+look at what surrounds them (§5.1.1) and at the host (Chapter 4).
 
 Confirm the batch-size transition empirically:
 

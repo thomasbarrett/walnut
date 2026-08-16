@@ -1,6 +1,6 @@
 # Chapter 3 — The Performance Model and Bottleneck Triage
 
-> The prefill/decode model, per-token accounting, and a three-test procedure that identifies which bottleneck you have before you try to fix one.
+> The prefill/decode model, per-token accounting, and a graph check plus three-test procedure that identifies which bottleneck you have before you try to fix one.
 
 ## 3.1 The inference performance model
 
@@ -25,7 +25,7 @@ prefill    116    0.998   8.602    63.8
 
 Decode issues **30× more kernels** than prefill to do a fraction of the work, and 69% of them run for under 5 µs. A kernel that runs for 3.6 µs cannot amortize a 2.7 µs launch, let alone the ~15 µs of host work that produced the launch. **This is the structural reason decode is host-bound in eager PyTorch, and it is why CUDA graphs (§4.3) are not an optimization but a requirement.**
 
-### 3.1.1 The five bottleneck classes
+### 3.1.1 The bottleneck classes
 
 | Class | Signature in the trace | Fix |
 |---|---|---|
@@ -34,6 +34,7 @@ Decode issues **30× more kernels** than prefill to do a fraction of the work, a
 | **GPU-bound** | GPU idle ≈ 0; `queue_ns` large and growing | Better kernels, quantization, more/larger batch, better parallelism |
 | **Sync-bound** | Large `cudaStreamSynchronize`/`cudaMemcpyAsync DtoH` slices at a fixed point per token | Defer `.item()`, sample on device, async stopping criteria |
 | **Transfer-bound** | `gpu_memcpy` a significant share of device time; low `memory bandwidth (GB/s)` | Pin memory, use `non_blocking=True`, keep tensors resident, overlap on a copy stream |
+| **Mixed** | GPU idle is real but not dominant (utilization 60–85%); no single class above accounts for most of the token | Attribute the idle (§3.4.2), then fix whichever of the above the attribution names — usually device *and* host in sequence |
 
 ## 3.2 Phase segmentation and the per-token budget
 
@@ -126,28 +127,39 @@ In eager mode the GPU-side decode span (2019 µs) nearly equals the host-side sp
 
 ## 3.3 Bottleneck triage: the decision procedure
 
-Run these three measurements in order. They partition the space.
+Establish graph state (§3.3.0), then run the three measurements in order. They
+partition the space.
 
-### 3.3.0 Step 0 — Is a graph replaying?
+### 3.3.0 Before the tests — is a graph replaying?
 
-Establish this *before* interpreting any of the three tests, because CUDA graphs
-change what all of them mean.
+CUDA graphs change what all three tests mean, so answer this first.
 
 ```sql
-SELECT ph, AVG(launch_fanout) AS avg_fanout, COUNT(DISTINCT graph_id) AS graphs
-FROM link GROUP BY 1;
+SELECT ph, AVG(launch_fanout) AS avg_fanout, MAX(launch_fanout) AS graph_size,
+       COUNT(DISTINCT CASE WHEN graph_id > 0 THEN graph_id END) AS graphs
+FROM link WHERE ph IS NOT NULL GROUP BY 1;
 ```
 
-`avg_fanout ≈ 1` is eager: one launch, one kernel. `avg_fanout ≫ 1` means one
-`cudaGraphLaunch` is submitting that many kernels, and three things follow:
+`graph_id` is `0`, not NULL, for kernels outside any graph (§4.3.1) — hence the
+`CASE`, without which every eager phase reports one phantom graph. `graphs = 0`
+and `avg_fanout ≈ 1` is eager: one launch, one kernel. `avg_fanout ≫ 1` means a
+single `cudaGraphLaunch` is submitting that many kernels. The average is
+*kernel*-weighted, so a phase that mixes graph and eager launches reports less
+than the true graph size; `graph_size` is that number.
 
-- Test 2's per-kernel `queue_ns` is no longer meaningful — see the caveat in
+Three things follow, one per test:
+
+- **Test 1.** Utilization is usually high *within* a replay, so a mediocre
+  number points at the gaps *between* replays — submission cost and syncs — not
+  at the kernels. Go to §3.4.2.
+- **Test 2.** Per-kernel `queue_ns` is no longer meaningful — see the caveat in
   §3.3.2 and read it at replay granularity.
-- Test 3's CUDA API time must be divided by `launch_fanout`, or you will report
-  a launch cost two orders of magnitude too large (§6.5, trap 8).
-- Utilization in test 1 is usually high *within* a replay, so a mediocre number
-  points at the gaps *between* replays — submission cost and syncs — not at the
-  kernels. Go to §3.4.2.
+- **Test 3.** Its total is measured over `api`, one row per call, so the number
+  stays correct — but "API ≫ rest" no longer means launch-bound in the eager
+  sense, because a handful of `cudaGraphLaunch` calls now dominate it. Read it
+  with §4.3.2. (The `launch_fanout` division in §6.5 trap 8 applies to
+  aggregates over `link`, where `ldur` repeats once per kernel — *not* to this
+  query.)
 
 The same reasoning applies to `torch.compile(mode="reduce-overhead")`, which
 captures graphs underneath.
@@ -171,12 +183,13 @@ cudagraph:  e2e_ms=13.02   gpu_busy_ms=12.512   gpu_util_pct=96.1
 Note the window is measured to the **last device op**, not the last annotation — under CUDA graphs the host finishes issuing long before the GPU finishes executing, and measuring to the annotation would report a nonsensical 2.5 ms.
 
 - **Utilization > 85%** → GPU-bound. Go to §5.1, §5.2, §5.5.
-- **Utilization 60–85%** → mixed, and the most common result on a partly
-  optimized stack. It is not a tie-breaker and it does not mean "nearly
-  GPU-bound": run tests 2 and 3 anyway, then attribute the idle with §3.4.2.
-  Report the device cost and the host cost side by side — in this band both are
-  usually worth fixing, and the gap attribution tells you which one to fix
-  first.
+- **Utilization 60–85%** → **mixed**. Typical of a stack that has already had
+  its worst host problem fixed — the two traces above sit at 19% and 96%
+  precisely because each has one dominant cause, and a partly optimized one
+  lands between. It is not a tie-breaker and does not mean "nearly GPU-bound":
+  run tests 2 and 3 anyway, then attribute the idle with §3.4.2. Report the
+  device cost and the host cost side by side; both are usually worth fixing,
+  and the gap attribution tells you which comes first.
 - **Utilization < 60%** → the GPU is starving. Continue to test 2.
 
 ### 3.3.2 Test 2 — queue latency
@@ -206,7 +219,7 @@ Our traces: eager decode `avg_queue = 3.3 µs` with 87% under 5 µs — the queu
 
 ### 3.3.3 Test 3 — host time decomposition
 
-If tests 1 and 2 say host-bound, split the host time:
+If test 1 came in under 85% — host-bound or mixed — split the host time:
 
 ```sql
 WITH p AS (SELECT ts, te, dur FROM phase WHERE name='decode' AND seq BETWEEN 1 AND 10)
@@ -224,7 +237,7 @@ FROM p;
 ### 3.3.4 Triage summary
 
 ```
-step 0: avg_fanout > 1 ? ──► graphs are replaying; reinterpret tests 2 and 3 (§3.3.0)
+first: avg_fanout > 1 ? ───► graphs are replaying; reinterpret all three tests (§3.3.0)
 
 util > 85% ────────────────────────────────► GPU-bound      → §5.1 §5.2 §5.5
 util 60-85% ───────────────────────────────► mixed; run tests 2+3, then §3.4.2

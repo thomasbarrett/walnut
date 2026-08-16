@@ -43,7 +43,9 @@ curl -X POST localhost:8000/stop_profile
 
 Kineto records `aten::` ops only on the thread that opened the window, and
 walnut serves on worker threads, so a server trace has the CUDA timeline but no
-operator names. Prefer `walnut profile` unless the question is about serving.
+operator names. It also has no Python frames, so `phase` comes back empty and
+every per-token query in Chapters 3 and 6 returns nothing. Prefer
+`walnut profile` unless the question is about serving.
 
 ## Query it
 
@@ -78,28 +80,34 @@ to back:
 
 1. **Preflight** — run the five checks in §2.3 before trusting any number.
    Skipping it is how a truncated trace becomes a confident, wrong answer.
-2. **Triage** — work through §3.3 in order, starting at step 0 (is a graph
+2. **Triage** — work through §3.3 in order, starting with §3.3.0 (is a graph
    replaying?). On the verdict, branch to Chapter 4 (host-bound) or Chapter 5
    (device-bound). §3.3.4 is the whole procedure on one screen.
-3. Chapters 1–2 are lookups for when a query fails or a table comes back empty.
+3. Chapter 1 and §2.1–2.2 are lookups for when a query fails or a table comes
+   back empty.
 
-Kernel families map back to source in `walnut/layers/`. For the bandwidth
-roofline in §5.2 you need the model's parameter count and dtype from its
-`config.json`.
+Kernel families map back to source in `walnut/layers/` (norms, attention, the
+delta-rule recurrence) and `walnut/models/` (the `nn.Linear` projections behind
+the gemv family). For the bandwidth roofline in §5.2 you need a parameter count
+— from `model.safetensors.index.json` or the model card, not `config.json`,
+which carries dims and `torch_dtype` only.
 
 walnut emits no `record_function` scopes, so `prelude.sql` builds `phase` from
 the Python frames instead — `_prefill`, `_decode_step` (one per token), and
 `DecodeGraph.capture`. Match those names, not the line numbers beside them.
-(`prelude.sql` explains why; an empty `phase` table is the symptom.)
+(`prelude.sql` records the consequence; an empty `phase` table is the symptom.)
 
 ## Report it
 
 A finished analysis states:
 
 - **Where the token goes**, as an accounting identity that closes:
-  `wall = GPU busy + idle`, with the idle attributed (§3.2.1, §3.4.2). If it
-  does not close, you have miscounted — find out why before writing anything
-  down.
+  `wall = GPU busy + idle`, measuring busy as the union of device intervals
+  (§3.3.1) and idle as the gap total (§3.4.1), with the largest gaps attributed
+  (§3.4.2). If it does not close, you have miscounted — find out why before
+  writing anything down. Note §3.2.1's host-side split is a *different*
+  decomposition whose terms overlap and whose residual closes by construction;
+  it localizes cost, it does not verify it.
 - **The ceiling and the headroom** — current tok/s against the GPU-side floor
   (§3.2.2) or the bandwidth roofline (§5.2), as a ratio.
 - **Ranked findings**, each with its cost in µs/token or % of the phase, and

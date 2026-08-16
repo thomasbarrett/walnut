@@ -185,7 +185,7 @@ host launch cost           9.34 ms    1.75 ms    5.34x
 ATen ops (whole trace)      26338        927    28.4x
 ```
 
-The GPU did *identical* work in both runs — 12.5 ms of kernels, the same 109 per token. Everything gained came from deleting host time. This is the canonical shape of an inference win, and the reason the first question in §3.3 is always "what is the GPU utilization", never "which kernel is slowest".
+The GPU did *identical* work in both runs — 12.5 ms of kernels, the same 109 per token. Everything gained came from deleting host time. This is the canonical shape of an inference win, and the reason the first *measurement* in §3.3 is always "what is the GPU utilization", never "which kernel is slowest".
 
 Note also that mean ITL (74 µs) is now *shorter* than per-token GPU time (391 µs): the host runs ahead and the GPU becomes the constraint. The `queue_ns` diagnostic flips from 3.3 µs to 5.2 ms, and utilization reaches 96%. The workload has moved from host-bound to GPU-bound — which means the next optimization is a kernel or quantization change, not another host fix.
 
