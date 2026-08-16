@@ -155,10 +155,17 @@ class GatedDeltaNet(nn.Module):
         self.norm = _RMSNormGated(value_head_dim, eps)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
-        self.in_proj_qkv = nn.Linear(hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(hidden_size, num_value_heads, bias=False)
-        self.in_proj_a = nn.Linear(hidden_size, num_value_heads, bias=False)
+        # All four in-projections read the same hidden state, so they are held
+        # as one gemv and split after. ``in_proj_b``/``in_proj_a`` produce 16
+        # values each: as their own kernels they cost the launch floor rather
+        # than the 32 KB they read.
+        self.in_proj_splits = [
+            self.conv_dim,
+            self.value_dim,
+            num_value_heads,
+            num_value_heads,
+        ]
+        self.in_proj = nn.Linear(hidden_size, sum(self.in_proj_splits), bias=False)
 
     def make_cache(
         self,
@@ -186,10 +193,11 @@ class GatedDeltaNet(nn.Module):
         batch, seq, _ = hidden_states.shape
         pad = self.conv_kernel_size - 1
 
-        qkv_pre = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch, seq, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        qkv_pre, z, b, a = self.in_proj(hidden_states).split(
+            self.in_proj_splits, dim=-1
+        )
+        qkv_pre = qkv_pre.transpose(1, 2)
+        z = z.reshape(batch, seq, -1, self.head_v_dim)
 
         decoding = cache is not None and not cache.empty
         if decoding:
