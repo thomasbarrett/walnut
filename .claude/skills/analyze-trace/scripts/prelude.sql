@@ -93,8 +93,11 @@ CREATE PERFETTO VIEW kfam AS
 SELECT *,
   CASE
     WHEN kname GLOB '*gemv*'                                   THEN 'gemv'
-    WHEN kname GLOB '*gemm*' OR kname GLOB '*cutlass*'         THEN 'gemm'
+    -- Attention before gemm: the memory-efficient kernel is named
+    -- `fmha_cutlassF_*`, so a '*cutlass*' arm above this one would swallow it
+    -- and leave `attention` empty on every trace.
     WHEN kname GLOB '*flash*' OR kname GLOB '*fmha*'           THEN 'attention'
+    WHEN kname GLOB '*gemm*' OR kname GLOB '*cutlass*'         THEN 'gemm'
     WHEN kname GLOB '*layer_norm*' OR kname GLOB '*rms_norm*'  THEN 'norm'
     WHEN kname GLOB '*elementwise*'                            THEN 'elementwise'
     WHEN kname GLOB '*reduce*'                                 THEN 'reduce'
@@ -105,11 +108,19 @@ SELECT *,
 FROM link;
 
 -- Reusable gap table over a phase's device ops.
+--
+-- The running maximum is PARTITIONed by phase. Without it the first gap of each
+-- phase is measured from the previous phase's last kernel and charged to this
+-- one, which inflates decode idle by the capture-to-decode handover and stops
+-- `wall = busy + idle` from closing (~1.4% on a 32-token walnut trace).
+-- `seq` rides along so idle can be filtered exactly like busy: summing gaps
+-- over all tokens against a `WHERE seq > 0` busy total silently charges the
+-- warm-up token's idle to the steady state.
 CREATE PERFETTO TABLE gap AS
-WITH g AS (SELECT gts, gte, ph FROM link),
-     m AS (SELECT gts, gte, ph,
-                  MAX(gte) OVER (ORDER BY gts
+WITH g AS (SELECT gts, gte, ph, seq FROM link WHERE ph IS NOT NULL),
+     m AS (SELECT gts, gte, ph, seq,
+                  MAX(gte) OVER (PARTITION BY ph, seq ORDER BY gts
                                  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS pm
            FROM g)
-SELECT ph, pm AS gap_start, gts AS gap_end, gts - pm AS gap_ns
+SELECT ph, seq, pm AS gap_start, gts AS gap_end, gts - pm AS gap_ns
 FROM m WHERE pm IS NOT NULL AND gts > pm;

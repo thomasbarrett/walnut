@@ -2,6 +2,14 @@
 
 > Dispatch overhead, synchronization stalls, and the two interventions that remove them: CUDA graphs and torch.compile.
 
+## Contents
+
+- 4.1 Host-side cost: dispatch and Python
+- 4.2 The synchronization audit
+- 4.3 CUDA graphs
+- 4.4 torch.compile and Inductor kernels
+
+
 ## 4.1 Host-side cost: dispatch and Python
 
 When §3.3.3 says dispatch-bound, this section finds the ops responsible.
@@ -198,6 +206,14 @@ Sampling stayed outside the graph. Whether to pull it in is a design decision (i
 ## 4.4 torch.compile and Inductor kernels
 
 Compiled regions change what you see in the trace in three ways, all of which you should verify rather than assume.
+
+Inductor names encode the fused ops: `triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_0`
+is one kernel doing a `to_copy`/`add`/`mean`/`mul`/`pow`/`rsqrt` chain — an RMS
+norm. That name is the only attribution you get, since the ATen ops it replaced
+no longer appear, so read it as the op list it is. For the generated source, set
+`TORCH_LOGS=output_code` on the profiled run and match the kernel name in the
+dump. `kfam` buckets all of these as `triton`, which on a compiled walnut trace
+is the second-largest family — do not mistake that bucket for "unclassified".
 
 **1. Kernel names become Triton kernels.**
 ```sql

@@ -2,6 +2,14 @@
 
 > The prefill/decode model, per-token accounting, and a graph check plus three-test procedure that identifies which bottleneck you have before you try to fix one.
 
+## Contents
+
+- 3.1 The inference performance model
+- 3.2 Phase segmentation and the per-token budget
+- 3.3 Bottleneck triage: the decision procedure
+- 3.4 Gap analysis with blame attribution
+
+
 ## 3.1 The inference performance model
 
 Inference has two regimes with opposite bottlenecks. Every analysis begins by establishing which one you are in.
@@ -182,6 +190,15 @@ cudagraph:  e2e_ms=13.02   gpu_busy_ms=12.512   gpu_util_pct=96.1
 
 Note the window is measured to the **last device op**, not the last annotation — under CUDA graphs the host finishes issuing long before the GPU finishes executing, and measuring to the annotation would report a nonsensical 2.5 ms.
 
+> **Correct for profiling overhead before reading this number.** `with_stack`
+> costs the host far more than the device: kernel durations are untouched, but
+> the gaps between them stretch. On a walnut decode trace the profiled ITL is
+> ~2210 µs against a real 1826 µs (`benchmark` skill), so measured idle is
+> inflated roughly 10× and utilization is understated by 15–20 points. Divide
+> GPU busy by the *benchmarked* ITL, not the profiled one: 1780 / 1826 = 97%,
+> not the 80% the trace reports. Reading the raw number sends a GPU-bound
+> workload down the host-bound branch.
+
 - **Utilization > 85%** → GPU-bound. Go to §5.1, §5.2, §5.5.
 - **Utilization 60–85%** → **mixed**. Typical of a stack that has already had
   its worst host problem fixed — the two traces above sit at 19% and 96%
@@ -232,7 +249,13 @@ FROM p;
 
 - **CUDA API ≫ the rest** → *launch-bound*. Reduce the number of launches: fusion, graphs.
 - **CUDA API is a small fraction** (our case: 325 of 2103 µs) → *dispatch-bound*. The time is in Python and the ATen dispatcher. §4.1.
-- **Sync dominates** → *sync-bound*. §4.2.
+- **Sync dominates** → *sync-bound*. §4.2. **But under a replaying graph this
+  verdict is usually wrong.** One `cudaGraphLaunch` submits the whole step and
+  the host then blocks in `cudaStreamSynchronize` — or in the `.item()` behind
+  it — while the GPU does the work. That is the host correctly waiting on the
+  device, not a stall to remove, and it will read as 70%+ of wall. Before
+  believing it, check whether the sync overlaps GPU-busy time (it is a real
+  stall only if the device is idle during it).
 
 ### 3.3.4 Triage summary
 

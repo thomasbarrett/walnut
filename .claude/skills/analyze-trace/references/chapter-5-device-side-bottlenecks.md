@@ -2,6 +2,15 @@
 
 > What to do once the GPU is actually the constraint: kernels, shapes, memory traffic, concurrency, and occupancy.
 
+## Contents
+
+- 5.1 Kernel inventory
+- 5.2 Shapes, dtypes, and the gemv trap
+- 5.3 Memory traffic and the KV cache
+- 5.4 Streams, overlap, and collectives
+- 5.5 Occupancy and wave quantization
+
+
 ## 5.1 Kernel inventory
 
 Once §3.3 says GPU-bound (or after you have fixed the host), work the kernels.
@@ -88,6 +97,77 @@ Any bucket where `avg_launch_us` approaches the kernel duration is being paid fo
 ## 5.2 Shapes, dtypes, and the gemv trap
 
 With `record_shapes=True`, `Input Dims` on `cpu_op` lets you tie kernel selection to tensor geometry — the mechanism behind most inference performance cliffs.
+
+> **Under a replayed CUDA graph, this section does not work — read §5.2.0 first.**
+> `Input Dims` lives on `cpu_op` slices, and a replay executes no ATen ops, so
+> there are no `cpu_op` slices to carry them. Every kernel's `op` is
+> `<built-in method replay>` and the whole decode phase collapses to one
+> undifferentiated row. §5.2.0 is how to get the shapes back.
+
+### 5.2.0 Recovering shapes from the capture phase
+
+Capture runs the step **eagerly** — that is how the graph is recorded — so the
+`cuda_graph_capture` phase contains the same operators, with shapes attached,
+that the replay later executes opaquely. Read the shapes there and apply them to
+the replay's kernels.
+
+```sql
+WITH cap AS (SELECT ts, te FROM phase WHERE name = 'cuda_graph_capture'),
+     mm AS (
+  SELECT s.id,
+         extract_arg(s.arg_set_id,'args.Input Dims[0][0]') AS m,
+         extract_arg(s.arg_set_id,'args.Input Dims[0][1]') AS k,
+         extract_arg(s.arg_set_id,'args.Input Dims[1][1]') AS n
+  FROM slice s, cap
+  WHERE s.name IN ('aten::mm','aten::addmm','aten::linear','aten::matmul')
+    AND s.ts >= cap.ts AND s.ts < cap.te)
+SELECT m || 'x' || k || 'x' || n AS shape,
+       COUNT(*) / (SELECT COUNT(*) FROM phase WHERE name='cuda_graph_capture')
+         AS per_capture_iter,
+       ROUND(2.0 * k * n / 1e6, 2) AS weight_mb_bf16
+FROM mm GROUP BY 1 ORDER BY weight_mb_bf16 * COUNT(*) DESC;
+```
+
+Capture runs the body **`warmup + 1`** times — 3 warm-up passes plus the
+recording pass, so 4 by default (`walnut/graph.py`). Divide the counts by that.
+Confirm it rather than assuming: capture-phase kernels ÷ kernels per replay
+gives the true divisor, and a mismatch means the warm-up count changed.
+
+```
+shape          raw_count   ÷4   weight MB
+1x1024x248320  4           1    508.6      <- lm_head
+1x1024x3584    192         48   7.3        <- gate_proj + up_proj, 24 layers
+1x1024x6144    72          18   12.6       <- in_proj_qkv, 18 GDN layers
+1x3584x1024    96          24   7.3        <- down_proj
+```
+
+Join those shapes back to per-kernel timings from the replay by matching the
+gemv kernels in launch order, or simply by shape frequency: 18 layers × 2
+projections is unmistakable once you have the shape table. Without this step the
+best you can say is "gemv is 73% of decode", which names no file and suggests no
+fix.
+
+### 5.2.1 Roofline every candidate, not just the aggregate
+
+An aggregate ceiling ("2.2× headroom") says nothing about *which* kernel has the
+headroom. Compute effective bandwidth per shape — `weight_bytes / duration` —
+before choosing a target:
+
+| shape | per token | µs each | weight MB | eff GB/s | verdict |
+|---|---|---|---|---|---|
+| 1×1024×248320 (lm_head) | 1 | 312.4 | 508.6 | 1628 | **91% of peak — leave it alone** |
+| 1×1024×3584 (gate, up) | 48 | 6.34 | 7.34 | 1158 | fusable pair |
+| 1×1024×16 (in_proj_a/b) | 36 | 1.91 | 0.033 | **17** | at the kernel-duration floor |
+
+The biggest line in a ranked table is routinely the *least* promising: `lm_head`
+is 18% of the token and already at 91% of an RTX 5090's 1.79 TB/s. The winnable
+kernels are the ones whose effective bandwidth is absurd — they are not
+bandwidth-limited at all, they are pinned at the ~1.9 µs floor a CUDA kernel
+occupies regardless of how little work it does. Fusing two of those into one
+removes a kernel; making one of them "faster" is impossible.
+
+A CUDA graph does not help here. It removes *launch* cost, not the floor on
+kernel duration, and the kernels still serialize on one stream.
 
 ```sql
 SELECT extract_arg(arg_set_id,'args.Input Dims[0][0]') || 'x' ||

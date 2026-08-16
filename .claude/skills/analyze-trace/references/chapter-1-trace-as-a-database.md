@@ -2,6 +2,14 @@
 
 > What a Kineto trace contains, how Perfetto's trace processor turns it into tables, and the tools that query them.
 
+## Contents
+
+- 1.1 Why SQL
+- 1.2 The Kineto trace format
+- 1.3 Ingestion semantics: JSON → relational
+- 1.4 Tooling
+
+
 ## 1.1 Why SQL
 
 A decode step of a small transformer issues ~110 kernels. A 32-token generation issues ~3,500. A 70B model under continuous batching issues millions of events per minute across eight ranks. The three conventional tools all fail at this scale in the same way:

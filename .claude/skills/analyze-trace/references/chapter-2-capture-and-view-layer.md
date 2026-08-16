@@ -2,6 +2,13 @@
 
 > Producing a trace you can trust, and the reusable SQL view layer that every later query is written against.
 
+## Contents
+
+- 2.1 Capturing an inference trace
+- 2.2 The view layer
+- 2.3 Preflight: validate before you conclude
+
+
 ## 2.1 Capturing an inference trace
 
 ### 2.1.1 Minimum viable capture
@@ -141,6 +148,17 @@ SELECT name, value FROM stats WHERE value > 0 AND severity != 'info';
 ```
 Empty is what you want. `slice_drop_overlapping_complete_event > 0` means your annotations may be gone (§2.1.3).
 
+> **Walnut traces always trip this**, typically ~2000 dropped slices. `phase` is
+> built from Python frames, so `walnut profile` must pass `with_stack=True`, and
+> the deep frame nesting is what the ingester drops. The documented remedy —
+> profile without `with_stack`, or fall back to `gpu_user_annotation` — does not
+> apply here: without the frames there is no `phase` table at all, and walnut
+> emits no `record_function` scopes for Kineto to mirror.
+>
+> So do not treat a non-zero count as fatal. **Check 4 is the real gate**: if
+> `phase` returns one `prefill`, one `cuda_graph_capture` and a `decode` count
+> matching `--max-tokens`, the annotations survived. If it doesn't, stop.
+
 ```sql
 -- 2. Is device activity present at all?
 SELECT cat, COUNT(*) n, SUM(dur)/1e6 ms FROM ev GROUP BY 1 ORDER BY n DESC;
@@ -152,7 +170,10 @@ Zero `kernel` rows → CUPTI failed to attach (missing `ProfilerActivity.CUDA`, 
 SELECT (SELECT COUNT(*) FROM dev_op) AS device_ops,
        (SELECT COUNT(*) FROM link)   AS linked;
 ```
-A large shortfall means missing flow events. Fall back to `JOIN ... USING (corr)` and note the caveat in §1.2.4.
+These should be within a percent of each other; `link` can slightly exceed
+`dev_op` when one launch fans out to several kernels. Below ~99% linked, stop —
+flow events are missing. Fall back to `JOIN ... USING (corr)` and note the
+caveat in §1.2.4.
 
 ```sql
 -- 4. Are the phase annotations intact and plausible?

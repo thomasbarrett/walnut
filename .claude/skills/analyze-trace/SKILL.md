@@ -13,20 +13,26 @@ description: >-
 
 ## Get a trace
 
-Look for one first: `ls -t profiles/*.trace.json.gz | head`. Before analyzing an
-existing trace, read the `.summary.txt` beside it and establish which model and
-flags produced it — every conclusion is conditional on them, and a comparison
-question like "did `--cuda-graph` help" is unanswerable without them. If you
-cannot establish them, capture a fresh trace rather than guessing:
+Every conclusion is conditional on the model and flags that produced the trace,
+and **nothing in the trace or the `.summary.txt` records them** — the summary is
+torch's `key_averages()` table, nothing more. So an existing file in `profiles/`
+is only usable if you know how it was made. When in doubt, capture your own:
 
 ```bash
 uv run walnut profile Qwen/Qwen3.5-0.8B --max-tokens 32
 ```
 
 It prints the two paths it wrote: `profiles/walnut-<ts>-<pid>.trace.json.gz`
-and a `.summary.txt` beside it, which is torch's own `key_averages()` table.
-Flags: `--prompt`, `--max-tokens`, `--device`, `--dtype`, `--output-dir` (or
-`$WALNUT_TORCH_PROFILER_DIR`), and `--cuda-graph` / `--no-cuda-graph`.
+and a `.summary.txt` beside it. Flags: `--prompt`, `--max-tokens`,
+`--temperature`, `--device`, `--dtype`, `--output-dir` (or
+`$WALNUT_TORCH_PROFILER_DIR`), `--cuda-graph` / `--no-cuda-graph`, and
+`--compile` / `--no-compile`.
+
+**Match the workload you are reasoning about.** `--temperature` defaults to 0
+(greedy), matching the `benchmark` skill; at `--temperature 1.0` the sampler's
+softmax over a 248k vocabulary becomes the largest non-graph kernel in the
+trace, and a greedy run never executes it. Likewise `--max-tokens` sets the KV
+cache size, so it changes attention's cost: profile the length you benchmarked.
 
 The command warms up before opening the profiling window and synchronizes
 before closing it, so the trace is neither distorted by a cold start nor
@@ -76,7 +82,16 @@ anything.
 
 The chapters under [references/](references/README.md) are a textbook on
 finding bottlenecks in PyTorch inference traces. Read them on demand, not front
-to back:
+to back — each is one file, linked here directly:
+
+- [Ch. 1 — the trace as a database](references/chapter-1-trace-as-a-database.md): event format, ingestion, tooling.
+- [Ch. 2 — capture and the view layer](references/chapter-2-capture-and-view-layer.md): capture flags, the seven views, **§2.3 preflight**.
+- [Ch. 3 — performance model and triage](references/chapter-3-performance-model-and-triage.md): prefill vs decode, per-token budget, **§3.3 triage**, §3.4 gap attribution.
+- [Ch. 4 — host-side bottlenecks](references/chapter-4-host-side-bottlenecks.md): dispatch cost, syncs, CUDA graphs, `torch.compile`.
+- [Ch. 5 — device-side bottlenecks](references/chapter-5-device-side-bottlenecks.md): kernel inventory, **§5.2 shapes and the gemv trap**, bandwidth, occupancy.
+- [Ch. 6 — practice](references/chapter-6-practice.md): worked case study, tail latency, A/B comparison, **§6.4 twelve traps**.
+
+The procedure:
 
 1. **Preflight** — run the five checks in §2.3 before trusting any number.
    Skipping it is how a truncated trace becomes a confident, wrong answer.
@@ -86,11 +101,26 @@ to back:
 3. Chapter 1 and §2.1–2.2 are lookups for when a query fails or a table comes
    back empty.
 
-Kernel families map back to source in `walnut/layers/` (norms, attention, the
-delta-rule recurrence) and `walnut/models/` (the `nn.Linear` projections behind
-the gemv family). For the bandwidth roofline in §5.2 you need a parameter count
-— from `model.safetensors.index.json` or the model card, not `config.json`,
-which carries dims and `torch_dtype` only.
+Getting from a kernel to a `file:line` takes source reading, and two defaults
+make it harder than the chapters assume:
+
+- **Under a replayed CUDA graph there are no ATen ops**, so every kernel's `op`
+  is `<built-in method replay>` and the decode phase is one opaque row.
+  §5.2.0 recovers the shapes from the `cuda_graph_capture` phase, which runs
+  eagerly. Without it you cannot get past "gemv is 73% of decode".
+- **Under `torch.compile`, fused kernels are named for the ops they replaced**
+  (`triton_per_fused__to_copy_add_mean_mul_pow_rsqrt_0` is an RMS norm). §4.4.
+
+With shapes in hand, the projections live in `walnut/models/qwen3_5.py` and
+`walnut/layers/linear_attention.py`; norms, attention and the delta-rule
+recurrence are in `walnut/layers/`.
+
+For the bandwidth roofline in §5.2 you need the bytes the *decode path* reads —
+from `model.safetensors.index.json` or the safetensors header, not
+`config.json`, which carries dims and `torch_dtype` only. Exclude weights decode
+never touches: on Qwen3.5-0.8B the vision tower (~201 MB) and the MTP head
+(~41 MB) are 16% of the checkpoint, and counting them inflates the ceiling
+enough to make a kernel already at 91% of peak look like it has headroom.
 
 walnut emits no `record_function` scopes, so `prelude.sql` builds `phase` from
 the Python frames instead — see its header for the frame names and why an empty
@@ -103,8 +133,11 @@ A finished analysis states:
 - **Where the token goes**, as an accounting identity that closes:
   `wall = GPU busy + idle`, measuring busy as the union of device intervals
   (§3.3.1) and idle as the gap total (§3.4.1), with the largest gaps attributed
-  (§3.4.2). If it does not close, you have miscounted — find out why before
-  writing anything down. Note §3.2.1's host-side split is a *different*
+  (§3.4.2). Filter both sides the same way — `gap` carries `seq` for exactly
+  this. Expect the sum to fall ~1% *short* of wall: each phase begins and ends
+  with host work that is neither busy nor an inter-kernel gap. A gap larger than
+  a few percent, or a sum that *exceeds* wall, means you have miscounted —
+  usually by summing kernels across streams. Note §3.2.1's host-side split is a *different*
   decomposition whose terms overlap and whose residual closes by construction;
   it localizes cost, it does not verify it.
 - **The ceiling and the headroom** — current tok/s against the GPU-side floor

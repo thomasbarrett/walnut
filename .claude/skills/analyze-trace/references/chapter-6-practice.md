@@ -2,6 +2,14 @@
 
 > An end-to-end diagnosis, tail-latency work, A/B comparison, and the mistakes that invalidate results.
 
+## Contents
+
+- 6.1 Worked case study: 485 → 2457 tok/s
+- 6.2 Tail latency and outlier tokens
+- 6.3 A/B trace comparison
+- 6.4 Twelve traps
+
+
 ## 6.1 Worked case study: 485 → 2457 tok/s
 
 The complete diagnostic path on the running example, from a trace to a fix, using nothing but the queries above.
