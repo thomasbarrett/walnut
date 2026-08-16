@@ -49,6 +49,15 @@ CudaGraph = Annotated[
         "per-token launch cost. Ignored off CUDA.",
     ),
 ]
+Compile = Annotated[
+    bool,
+    typer.Option(
+        "--compile/--no-compile",
+        envvar="WALNUT_COMPILE",
+        help="Run the decode step through torch.compile, fusing its "
+        "elementwise kernels. Costs a few seconds on the first request.",
+    ),
+]
 
 
 @app.command()
@@ -66,6 +75,7 @@ def serve(
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
+    compile: Compile = True,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -80,7 +90,13 @@ def serve(
         raise typer.BadParameter(str(exc)) from exc
 
     typer.echo(f"Loading '{model}'...")
-    engine = load_model(model, device=target, dtype=precision, cuda_graph=cuda_graph)
+    engine = load_model(
+        model,
+        device=target,
+        dtype=precision,
+        cuda_graph=cuda_graph,
+        compile=compile,
+    )
     typer.echo(
         f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
         f"({engine.device}, {str(engine.dtype).removeprefix('torch.')})"
@@ -107,6 +123,7 @@ def profile(
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
+    compile: Compile = True,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 
@@ -124,7 +141,13 @@ def profile(
         raise typer.BadParameter(str(exc)) from exc
 
     typer.echo(f"Loading '{model}'...")
-    engine = load_model(model, device=target, dtype=precision, cuda_graph=cuda_graph)
+    engine = load_model(
+        model,
+        device=target,
+        dtype=precision,
+        cuda_graph=cuda_graph,
+        compile=compile,
+    )
     config = GenerationConfig(max_tokens=max_tokens)
     messages = [Message(role="user", content=prompt)]
 

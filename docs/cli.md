@@ -37,6 +37,22 @@ profile measures what a server runs.
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-cuda-graph
 ```
 
+## Compilation
+
+The decode step also runs through `torch.compile` by default, which fuses the
+elementwise chains the norms and the delta-rule recurrence would otherwise
+spend a kernel apiece on. Prefill stays eager: its shapes follow the prompt, so
+compiling it would recompile per prompt length, while decode's are fixed and
+one compile serves every request.
+
+That compile costs a few seconds, paid once on the first request; `--no-compile`
+turns it off. Like `--cuda-graph`, `walnut profile` takes the flag with the same
+default.
+
+```console
+$ uv run walnut serve Qwen/Qwen3.5-0.8B --no-compile
+```
+
 ## Environment variables
 
 - `WALNUT_HOST` — default host for `walnut serve` (overridden by `--host`).
@@ -46,3 +62,4 @@ $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-cuda-graph
 - `WALNUT_DTYPE` — default dtype for `walnut serve` and `walnut profile`
   (overridden by `--dtype`).
 - `WALNUT_CUDA_GRAPH` — set to `0` to disable CUDA graph decode by default.
+- `WALNUT_COMPILE` — set to `0` to disable `torch.compile` on decode by default.

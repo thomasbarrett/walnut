@@ -20,7 +20,7 @@ def test_serve_help_lists_arguments():
         assert opt in out
 
 
-def test_serve_passes_cuda_graph_through(monkeypatch):
+def test_serve_passes_the_speed_flags_through(monkeypatch):
     seen: dict[str, bool] = {}
 
     class _Engine:
@@ -28,18 +28,19 @@ def test_serve_passes_cuda_graph_through(monkeypatch):
         device = "cpu"
         dtype = "float32"
 
-    def fake_load_model(model, device=None, dtype=None, cuda_graph=True):
-        seen["cuda_graph"] = cuda_graph
+    def fake_load_model(model, device=None, dtype=None, cuda_graph=True, compile=True):
+        seen.update(cuda_graph=cuda_graph, compile=compile)
         return _Engine()
 
     monkeypatch.setattr("walnut.engine.load_model", fake_load_model)
     monkeypatch.setattr("walnut.server.serve", lambda *args, **kwargs: None)
 
     assert runner.invoke(app, ["serve", "m"]).exit_code == 0
-    assert seen["cuda_graph"] is True
+    assert seen == {"cuda_graph": True, "compile": True}
 
-    assert runner.invoke(app, ["serve", "m", "--no-cuda-graph"]).exit_code == 0
-    assert seen["cuda_graph"] is False
+    invoked = runner.invoke(app, ["serve", "m", "--no-cuda-graph", "--no-compile"])
+    assert invoked.exit_code == 0
+    assert seen == {"cuda_graph": False, "compile": False}
 
 
 def _params(command: str) -> dict[str, click.Parameter]:
@@ -54,7 +55,7 @@ def test_model_loading_options_match_between_serve_and_profile():
     serve_params = _params("serve")
     profile_params = _params("profile")
 
-    for name in ("model", "device", "dtype", "cuda_graph"):
+    for name in ("model", "device", "dtype", "cuda_graph", "compile"):
         mine, theirs = serve_params[name], profile_params[name]
         assert mine.opts == theirs.opts, name
         assert mine.default == theirs.default, name
@@ -62,20 +63,20 @@ def test_model_loading_options_match_between_serve_and_profile():
         assert getattr(mine, "help", None) == getattr(theirs, "help", None), name
 
 
-def test_profile_passes_cuda_graph_through(monkeypatch):
+def test_profile_passes_the_speed_flags_through(monkeypatch):
     seen: dict[str, bool] = {}
 
-    def fake_load_model(model, device=None, dtype=None, cuda_graph=True):
-        seen["cuda_graph"] = cuda_graph
+    def fake_load_model(model, device=None, dtype=None, cuda_graph=True, compile=True):
+        seen.update(cuda_graph=cuda_graph, compile=compile)
         raise RuntimeError("stop before the profiled run")
 
     monkeypatch.setattr("walnut.engine.load_model", fake_load_model)
 
     runner.invoke(app, ["profile", "m"])
-    assert seen["cuda_graph"] is True
+    assert seen == {"cuda_graph": True, "compile": True}
 
-    runner.invoke(app, ["profile", "m", "--no-cuda-graph"])
-    assert seen["cuda_graph"] is False
+    runner.invoke(app, ["profile", "m", "--no-cuda-graph", "--no-compile"])
+    assert seen == {"cuda_graph": False, "compile": False}
 
 
 def test_chat_help_lists_options():

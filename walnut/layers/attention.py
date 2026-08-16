@@ -36,6 +36,29 @@ class KVCache(Cache):
         return self.k, self.v
 
 
+@torch._dynamo.disable
+def _sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: torch.Tensor | None,
+    causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """`F.scaled_dot_product_attention`, kept out of the compiled region.
+
+    A decode query is (B, heads, 1, head_dim). Inductor is free to give that
+    one-row dimension a stride of 1, and the memory-efficient kernel rejects
+    the result — "query is not correctly aligned (strideM)" — even though the
+    stride cannot matter for a single row. Running the call eager keeps the
+    layout PyTorch itself produces; the graph break costs one launch per
+    full-attention layer.
+    """
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, is_causal=causal, scale=scale
+    )
+
+
 class Attention(nn.Module):
     """Causal GQA attention over (B, S, heads, head_dim) q/k/v; optional KV cache."""
 
@@ -85,7 +108,5 @@ class Attention(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=causal, scale=self.scaling
-        )
+        out = _sdpa(q, k, v, mask, causal, self.scaling)
         return out.transpose(1, 2).contiguous()
