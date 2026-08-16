@@ -656,8 +656,31 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             device=input_ids.device,
         )
         positions = torch.arange(seq, device=input_ids.device)
-        logits = self(input_ids, positions=positions, cache=cache)
-        next_token = self.sampler(logits[:, -1], params, gen)
+
+        # Separate functions so a profile can name the phases; inlining either
+        # back into the loop leaves a trace that cannot be read per phase.
+        # Both return the token twice, tensor and int: reading it back syncs on
+        # the GPU, and that wait belongs to the step that caused it.
+
+        def _prefill() -> tuple[torch.Tensor, int]:
+            """Run the prompt through the model and sample the first token."""
+            logits = self(input_ids, positions=positions, cache=cache)
+            next_token = self.sampler(logits[:, -1], params, gen)
+            return next_token, int(next_token.item())
+
+        def _decode_step(
+            token: torch.Tensor, position: int
+        ) -> tuple[torch.Tensor, int]:
+            """Advance one token: replay or forward, then sample."""
+            if graph is not None:
+                logits = graph.replay(token, position)
+            else:
+                pos = torch.tensor([position], device=input_ids.device)
+                logits = self(token, positions=pos, cache=cache)
+            next_token = self.sampler(logits[:, -1], params, gen)
+            return next_token, int(next_token.item())
+
+        next_token, tok = _prefill()
 
         # Capture after prefill: the decode branch only exists once the caches
         # hold state, and capture records whichever branch it runs.
@@ -666,16 +689,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             graph = DecodeGraph(self, cache, input_ids.device)
 
         for step in range(params.max_new_tokens):
-            tok = int(next_token.item())
             yield tok
             if tok in stop_ids:
                 return
-            if graph is not None:
-                logits = graph.replay(next_token, seq + step)
-            else:
-                pos = torch.tensor([seq + step], device=input_ids.device)
-                logits = self(next_token, positions=pos, cache=cache)
-            next_token = self.sampler(logits[:, -1], params, gen)
+            next_token, tok = _decode_step(next_token, seq + step)
 
     @torch.no_grad()
     def generate(

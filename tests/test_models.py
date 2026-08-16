@@ -90,3 +90,20 @@ def test_iter_generate_stops_after_yielding_a_stop_token():
 def test_iter_generate_falls_back_to_eos_as_the_stop_token():
     model = _ScriptedModel([7, 2, 9], eos_token_id=2)
     assert _generate(model, max_new_tokens=3) == [7, 2]
+
+
+def test_iter_generate_runs_each_phase_in_a_named_frame():
+    """Traces are segmented by these names, so they are an interface.
+
+    Inlining either function back into the loop would break every per-phase
+    query and fail nothing else.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    model = _ScriptedModel([7, 8, 9])
+    with profile(activities=[ProfilerActivity.CPU], with_stack=True) as prof:
+        assert _generate(model, max_new_tokens=3) == [7, 8, 9]
+
+    frames = [event.name for event in prof.events()]
+    assert sum(name.endswith(": _prefill") for name in frames) == 1
+    assert sum(name.endswith(": _decode_step") for name in frames) == 3

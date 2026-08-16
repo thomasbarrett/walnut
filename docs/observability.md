@@ -127,6 +127,36 @@ of throughput (256 down to 185 tok/s) and grows the trace buffer by roughly
 0.5 MB per token, which is only released when the window closes. So it is off
 unless you turn it on, and every window is bounded.
 
+### Phases
+
+`walnut profile` records Python call frames, and kineto spells each one
+`file(line): function`. Three functions exist to be found that way, so a trace
+can be read per phase and per token:
+
+| Frame ends with | Occurs | Covers |
+| --- | --- | --- |
+| `: _prefill` | once | The prompt forward pass, sampling, and the first token |
+| `: capture` (in `graph.py`) | once, with `--cuda-graph` | Warming up and recording the decode graph |
+| `: _decode_step` | once per generated token | Replay or forward, sampling, and the `.item()` sync |
+
+Match on the name, not the line number — the line moves whenever the file
+above it is edited:
+
+```sql
+select count(*) tokens, avg(dur)/1e6 avg_ms
+from slice
+where category = 'python_function' and name glob '*: _decode_step'
+```
+
+Each step's `.item()` — the sync where the CPU waits on the GPU — sits inside
+the frame that produced the token. Outside it, a decode frame times only the
+kernel launches and reads several times faster than the token really took.
+
+There are no `record_function` scopes and so no `user_annotation` slices, as in
+vLLM and SGLang. The two cannot coexist anyway: kineto interleaves
+`python_function` slices with `user_annotation` ones in a way the trace
+importer rejects, and it resolves that by dropping the annotations, silently.
+
 ### One-shot, from the CLI
 
 `walnut profile` loads a model, warms it up, and profiles a single generation:
