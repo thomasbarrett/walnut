@@ -144,13 +144,20 @@ is where the CPU waits on the GPU — excluding it would understate the step. Th
 annotations cost about 3 µs per token when no profiler is running, against a
 decode step of several milliseconds.
 
-!!! warning "`--with-stack` removes the phases"
+!!! warning "`--with-stack` costs the host-side phases"
 
     Python call frames are off by default. With them on, kineto interleaves
     `python_function` slices with the annotations in a way that violates strict
-    nesting, and the trace importer resolves it by **dropping every
-    annotation** — silently, leaving a trace with no phases and no error. Turn
-    them on when you want Python source attribution and can do without phases.
+    nesting, and the trace importer resolves it by **dropping the
+    annotations** — silently, with no error to say so.
+
+    The device-side copies (`gpu_user_annotation`) survive, since they sit on a
+    different track, so per-phase GPU time is still available. What you lose is
+    the host-side span: wall time per token, and anything that groups host work
+    by phase.
+
+    Turn stacks on when the question is which Python line is burning host time,
+    which is what they answer and the annotations do not.
 
 ### One-shot, from the CLI
 

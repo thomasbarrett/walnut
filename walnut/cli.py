@@ -112,9 +112,11 @@ def profile(
         typer.Option(
             "--with-stack/--no-with-stack",
             help=(
-                "Record Python call frames. Costs the phase annotations: "
-                "kineto interleaves the frames with them in a way the trace "
-                "importer rejects, so it drops every 'prefill'/'decode' slice."
+                "Record Python call frames, for attributing host time to "
+                "source lines. Costs the host-side phase annotations: kineto "
+                "interleaves the frames with them in a way the trace importer "
+                "rejects, and it resolves that by dropping them. The "
+                "device-side copies survive, so per-phase GPU time does too."
             ),
         ),
     ] = False,
