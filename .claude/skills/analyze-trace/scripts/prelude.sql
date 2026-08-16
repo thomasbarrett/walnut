@@ -1,8 +1,8 @@
 -- ===========================================================================
 -- PerfettoSQL prelude for walnut traces.
 --
--- The first half is Appendix B of references/ verbatim: ev, dev_op, api,
--- phase, link, kfam, gap.
+-- The authoritative definition of the seven relations every query in
+-- references/ is written against: ev, dev_op, api, phase, link, kfam, gap.
 --
 -- `phase` is the one departure. walnut emits no record_function scopes, so
 -- `user_annotation` is empty and the book's definition would return no rows,

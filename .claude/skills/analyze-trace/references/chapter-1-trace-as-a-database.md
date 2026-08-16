@@ -201,38 +201,14 @@ Persistence: `CREATE PERFETTO TABLE` (materialized, use for anything joined repe
 
 ## 1.4 Tooling
 
-### 1.4.1 CLI
+Queries in this book are run through
+[`scripts/analyze_trace.py`](../scripts/analyze_trace.py), which wraps
+`perfetto.trace_processor.TraceProcessor` — the same session, so the prelude
+runs once and every later statement sees its views. The `tp` CLI and
+`ui.perfetto.dev` speak the same PerfettoSQL if you want a shell or a flame
+chart, but nothing here requires them.
 
-Download `trace_processor_shell` from perfetto.dev (the Python package caches one under `~/.local/share/perfetto/prebuilts/`).
-
-```bash
-tp infer.json                                    # interactive SQL shell
-tp query infer.json "SELECT count(*) FROM slice" # one-shot, CSV to stdout
-tp query -f analysis.sql infer.json              # run a script
-tp query -f analysis.sql -i infer.json           # script, then drop into the shell
-tp server http                                   # RPC server; ui.perfetto.dev can attach
-```
-
-CSV output pipes straight into `column -t -s,`, `csvlook`, or pandas. `-f` accepts multiple semicolon-separated statements, which is how you ship a prelude plus a query in one invocation.
-
-### 1.4.2 Python
-
-```python
-from perfetto.trace_processor import TraceProcessor
-
-tp = TraceProcessor(trace='infer.json')
-df = tp.query("SELECT name, dur FROM slice WHERE category='kernel'").as_pandas_dataframe()
-```
-
-Session state persists across `query()` calls, so run your prelude once and then issue queries interactively. This is the right harness for anything iterative or plotted.
-
-### 1.4.3 UI
-
-`ui.perfetto.dev` → *Open trace file*. Nothing is uploaded; the WASM build of trace processor runs in your browser. Use the UI to **form** hypotheses (the shape of a decode step is immediately legible) and SQL to **test** them. The UI's own query page runs the same PerfettoSQL, so you can prototype there and paste into a script.
-
-For traces over a few hundred MB, run `tp server http` locally and point the UI at it — the native binary is far faster than WASM and is not memory-capped by the tab.
-
-### 1.4.4 Recommended workflow
+### 1.4.1 Recommended workflow
 
 ```
 capture (§2.1) → preflight (§2.3) → prelude (§2.2) → triage (§3.3) → targeted recipe (Ch. 4–5) → fix → A/B (§6.3)
