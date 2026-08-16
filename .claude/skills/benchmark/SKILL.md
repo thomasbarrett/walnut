@@ -74,18 +74,20 @@ uv run python $BENCH compare /tmp/before.json /tmp/before2.json
 ```
 
 ```
-                           before      after     change   spread
-TTFT (ms)                   51.89      52.84      +1.8%   [50.78–53.22] [50.96–53.66]
-TPOT (ms/token)              1.81       1.81      +0.1%   [1.81–1.81] [1.81–1.81]
-output tok/s               552.89     552.41      -0.1%
-ITL p99 (ms)                 1.82       1.83      +0.4%
-e2e (ms)                   281.46     282.59      +0.4%   [280.54–282.92] [280.86–283.57]
-first request (ms)        2660.25    2649.03      -0.4%
+                                before           after    change
+TTFT (ms)                  51.89 ±2.6%     52.84 ±3.6%     +1.8%
+TPOT (ms/token)             1.81 ±0.1%      1.81 ±0.2%     +0.1%
+output tok/s                    552.89          552.41     -0.1%
+ITL p99 (ms)                      1.82            1.83     +0.4%
+e2e (ms)                  281.46 ±0.5%    282.59 ±0.6%     +0.4%
+first request (ms)             2660.25         2649.03     -0.4%
 ```
 
-On a quiet RTX 5090: TPOT ~0.1%, e2e ~0.4%, **TTFT ~1.8%**, first request ~0.4%.
-The per-request metrics are the noisy ones — a 1.5% TTFT "win" is nothing. On an
-unmeasured machine, treat anything under ~5% as unproven.
+`±` is the widest deviation from the median across repeats, carried next to the
+value so neither is read without the other: TTFT moving +1.8% against ±2.6%
+dispersion is nothing, while TPOT's ±0.1% means a 1% TPOT change is real. On a quiet RTX 5090 the per-token
+metrics are stable to a tenth of a percent and the per-request ones to a few
+percent. On an unmeasured machine, treat anything under ~5% as unproven.
 
 ## Compare
 

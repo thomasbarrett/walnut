@@ -230,10 +230,23 @@ def _change(before: float, after: float) -> str:
 
 
 def _spread(values: list[float] | None) -> str:
-    """Min-max across repeats, so a delta can be read against the dispersion."""
+    """Widest deviation from the median, as a percentage of it.
+
+    Reads directly against the `change` column: a +1.8% move next to ±2.4%
+    dispersion is not a result.
+    """
     if not values or len(values) < 2:
         return ""
-    return f"[{min(values):.2f}–{max(values):.2f}]"
+    mid = statistics.median(values)
+    if not mid:
+        return ""
+    return f"±{max(abs(v - mid) for v in values) / mid * 100:.1f}%"
+
+
+def _cell(value: float, values: list[float] | None) -> str:
+    """A metric and its dispersion together, so neither is read without the other."""
+    spread = _spread(values)
+    return f"{value:.2f} {spread}" if spread else f"{value:.2f}"
 
 
 ROWS = [
@@ -285,17 +298,14 @@ def compare(args: argparse.Namespace) -> int:
         mark = "+dirty" if dirty else ""
         print(f"  {name}: {(sha or 'unknown')[:12]}{mark}")
 
-    print(f"\n{'':22} {'before':>10} {'after':>10} {'change':>10}   spread")
+    print(f"\n{'':22} {'before':>15} {'after':>15} {'change':>9}")
     for label, key, spread_key in ROWS:
         b, a = before.get(key), after.get(key)
         if b is None or a is None:
             continue
-        spread = ""
-        if spread_key:
-            spread = (
-                f"{_spread(before.get(spread_key))} {_spread(after.get(spread_key))}"
-            )
-        print(f"{label:22} {b:10.2f} {a:10.2f} {_change(b, a):>10}   {spread}")
+        lo = _cell(b, before.get(spread_key) if spread_key else None)
+        hi = _cell(a, after.get(spread_key) if spread_key else None)
+        print(f"{label:22} {lo:>15} {hi:>15} {_change(b, a):>9}")
 
     print()
     ok = True
