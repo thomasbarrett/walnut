@@ -53,6 +53,21 @@ default.
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-compile
 ```
 
+## Sampling while profiling
+
+`walnut profile` decodes greedily by default (`--temperature 0`), which is what
+the benchmark under `.claude/skills/benchmark/` measures. Matching matters: at
+`--temperature 1.0` the sampler's softmax over a 248k vocabulary is the largest
+non-graph kernel in the trace, and a greedy run never executes it — so a trace
+taken at a different temperature describes a different workload than the numbers
+beside it.
+
+Raise it when the sampler is what you are profiling.
+
+```console
+$ uv run walnut profile Qwen/Qwen3.5-0.8B --temperature 1.0
+```
+
 ## Environment variables
 
 - `WALNUT_HOST` — default host for `walnut serve` (overridden by `--host`).

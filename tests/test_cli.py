@@ -63,6 +63,13 @@ def test_model_loading_options_match_between_serve_and_profile():
         assert getattr(mine, "help", None) == getattr(theirs, "help", None), name
 
 
+def test_profile_defaults_to_greedy_so_it_matches_the_benchmark():
+    """The benchmark samples greedily; a profile at another temperature would
+    trace the sampler's softmax, which the benchmarked path never runs."""
+    temperature = _params("profile")["temperature"]
+    assert temperature.default == 0.0
+
+
 def test_profile_passes_the_speed_flags_through(monkeypatch):
     seen: dict[str, bool] = {}
 

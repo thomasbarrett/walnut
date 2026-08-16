@@ -120,6 +120,14 @@ def profile(
             help="Directory to write the trace and summary to.",
         ),
     ] = "./profiles",
+    temperature: Annotated[
+        float,
+        typer.Option(
+            help="Sampling temperature for the profiled generation. Defaults to "
+            "greedy, matching the benchmark; raise it to see the sampler's own "
+            "kernels, which greedy decoding never runs.",
+        ),
+    ] = 0.0,
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
@@ -148,12 +156,12 @@ def profile(
         cuda_graph=cuda_graph,
         compile=compile,
     )
-    config = GenerationConfig(max_tokens=max_tokens)
+    config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
     messages = [Message(role="user", content=prompt)]
 
     # A cold pass pays for autotuning and lazy init, swamping the real numbers.
     typer.echo("Warming up...")
-    engine.generate(messages, GenerationConfig(max_tokens=4))
+    engine.generate(messages, GenerationConfig(max_tokens=4, temperature=temperature))
 
     typer.echo(f"Profiling {max_tokens} tokens on {engine.device}...")
     profiler = TorchProfiler(output_dir)
