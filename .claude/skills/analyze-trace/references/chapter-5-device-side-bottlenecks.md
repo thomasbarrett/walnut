@@ -123,7 +123,26 @@ lhs        rhs           n
 
 The `M = 1` rows are the entire decode story. At `M = 1` there is no data reuse across rows: every weight element is read once and used once, arithmetic intensity is ~1 FLOP/byte, and no tensor core can help. cuBLAS dispatches `gemvx` rather than a tensor-op GEMM, which is why the prefill kernels are `cutlass_80_tensorop_f16_s16816gemm` and the decode kernels are not.
 
-**The actionable consequence:** decode throughput is bounded by `model_bytes / HBM_bandwidth`, and the only lever that changes the *shape* is batch size. Confirm the transition empirically:
+**The actionable consequence:** decode throughput is bounded by `model_bytes / HBM_bandwidth`, and the only lever that changes the *shape* is batch size.
+
+Neither input is in the trace, so fetch them before quoting the bound:
+
+- `model_bytes` — parameter count × bytes per element for the serving dtype
+  (2 for fp16/bf16, 1 for fp8/int8). Get the parameter count from the model's
+  `config.json` or `sum(p.numel() for p in model.parameters())`; count the
+  weights that are actually read per token, so exclude an untied `lm_head` only
+  if decode does not run it.
+- `HBM_bandwidth` — `nvidia-smi --query-gpu=name --format=csv` and then the
+  card's spec sheet. Use ~80% of the theoretical peak as the achievable figure;
+  a well-written gemv reaches roughly that.
+
+The ceiling is `HBM_bandwidth / model_bytes` tokens/s at batch 1. Quote it next
+to the measured rate — the ratio between them is the headroom, and it is the
+number worth arguing over. If the measured gemv bandwidth (`§5.1`) is already
+near peak while the ratio is poor, the loss is not in the weight reads and no
+amount of kernel tuning on the GEMMs will recover it.
+
+Confirm the batch-size transition empirically:
 
 ```sql
 -- Correlate M with the kernel family actually chosen.

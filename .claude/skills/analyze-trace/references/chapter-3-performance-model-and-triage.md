@@ -128,6 +128,30 @@ In eager mode the GPU-side decode span (2019 µs) nearly equals the host-side sp
 
 Run these three measurements in order. They partition the space.
 
+### 3.3.0 Step 0 — Is a graph replaying?
+
+Establish this *before* interpreting any of the three tests, because CUDA graphs
+change what all of them mean.
+
+```sql
+SELECT ph, AVG(launch_fanout) AS avg_fanout, COUNT(DISTINCT graph_id) AS graphs
+FROM link GROUP BY 1;
+```
+
+`avg_fanout ≈ 1` is eager: one launch, one kernel. `avg_fanout ≫ 1` means one
+`cudaGraphLaunch` is submitting that many kernels, and three things follow:
+
+- Test 2's per-kernel `queue_ns` is no longer meaningful — see the caveat in
+  §3.3.2 and read it at replay granularity.
+- Test 3's CUDA API time must be divided by `launch_fanout`, or you will report
+  a launch cost two orders of magnitude too large (§6.5, trap 8).
+- Utilization in test 1 is usually high *within* a replay, so a mediocre number
+  points at the gaps *between* replays — submission cost and syncs — not at the
+  kernels. Go to §3.4.2.
+
+The same reasoning applies to `torch.compile(mode="reduce-overhead")`, which
+captures graphs underneath.
+
 ### 3.3.1 Test 1 — GPU utilization over the decode window
 
 ```sql
@@ -147,6 +171,12 @@ cudagraph:  e2e_ms=13.02   gpu_busy_ms=12.512   gpu_util_pct=96.1
 Note the window is measured to the **last device op**, not the last annotation — under CUDA graphs the host finishes issuing long before the GPU finishes executing, and measuring to the annotation would report a nonsensical 2.5 ms.
 
 - **Utilization > 85%** → GPU-bound. Go to §5.1, §5.2, §5.5.
+- **Utilization 60–85%** → mixed, and the most common result on a partly
+  optimized stack. It is not a tie-breaker and it does not mean "nearly
+  GPU-bound": run tests 2 and 3 anyway, then attribute the idle with §3.4.2.
+  Report the device cost and the host cost side by side — in this band both are
+  usually worth fixing, and the gap attribution tells you which one to fix
+  first.
 - **Utilization < 60%** → the GPU is starving. Continue to test 2.
 
 ### 3.3.2 Test 2 — queue latency
@@ -194,7 +224,10 @@ FROM p;
 ### 3.3.4 Triage summary
 
 ```
+step 0: avg_fanout > 1 ? ──► graphs are replaying; reinterpret tests 2 and 3 (§3.3.0)
+
 util > 85% ────────────────────────────────► GPU-bound      → §5.1 §5.2 §5.5
+util 60-85% ───────────────────────────────► mixed; run tests 2+3, then §3.4.2
 util < 60% ─┬─ queue ≈ 0 ─┬─ API ≫ rest ───► launch-bound   → §4.3 §4.4
             │             ├─ API ≪ rest ───► dispatch-bound → §4.1 §4.3
             │             └─ sync dominates► sync-bound     → §4.2

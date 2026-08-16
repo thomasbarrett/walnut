@@ -11,7 +11,13 @@ description: >-
 
 # Analyzing a walnut trace
 
-## Collect a profile
+## Get a trace
+
+Look for one first: `ls -t profiles/*.trace.json.gz | head`. Before analyzing an
+existing trace, read the `.summary.txt` beside it and establish which model and
+flags produced it — every conclusion is conditional on them, and a comparison
+question like "did `--cuda-graph` help" is unanswerable without them. If you
+cannot establish them, capture a fresh trace rather than guessing:
 
 ```bash
 uv run walnut profile Qwen/Qwen3.5-0.8B --max-tokens 32
@@ -39,8 +45,6 @@ Kineto records `aten::` ops only on the thread that opened the window, and
 walnut serves on worker threads, so a server trace has the CUDA timeline but no
 operator names. Prefer `walnut profile` unless the question is about serving.
 
-To find existing traces: `ls -t profiles/*.trace.json.gz | head`
-
 ## Query it
 
 Never read a `.trace.json.gz` by hand — it is tens of megabytes of gzipped JSON
@@ -60,21 +64,47 @@ so without it those queries fail with `no such table`. Requires
 first use.
 
 `analyze_trace.py` also has canned `overview`, `top-ops`, `device`, and
-`launch` commands for a first look without writing SQL.
+`launch` commands for a first look without writing SQL. They are orientation,
+not validation — the §2.3 preflight is still the gate before you conclude
+anything.
 
 `ts` and `dur` are nanoseconds: divide by 1e3 for µs, 1e6 for ms.
 
 ## Analyze it
 
-Read [references/README.md](references/README.md) and follow it into the
-chapters. It is a textbook on using PerfettoSQL to find bottlenecks in
-inference traces — the trace format, the view layer, a triage procedure that
-identifies which bottleneck you have, and the host-side and device-side
-branches it sends you down.
+The chapters under [references/](references/README.md) are a textbook on
+finding bottlenecks in PyTorch inference traces. Read them on demand, not front
+to back:
 
-One walnut-specific difference from the book: walnut emits no
-`record_function` scopes, so `user_annotation` is empty and the book's `phase`
-table would have zero rows, silently emptying every per-token query.
-`prelude.sql` reads the Python frames instead — `_prefill`, `_decode_step` (one
-per token), and `DecodeGraph.capture` — which walnut names for the purpose.
-Match those names rather than the line numbers beside them.
+1. **Preflight** — run the five checks in §2.3 before trusting any number.
+   Skipping it is how a truncated trace becomes a confident, wrong answer.
+2. **Triage** — work through §3.3 in order, starting at step 0 (is a graph
+   replaying?). On the verdict, branch to Chapter 4 (host-bound) or Chapter 5
+   (device-bound). §3.3.4 is the whole procedure on one screen.
+3. Chapters 1–2 are lookups for when a query fails or a table comes back empty.
+
+Kernel families map back to source in `walnut/layers/`. For the bandwidth
+roofline in §5.2 you need the model's parameter count and dtype from its
+`config.json`.
+
+walnut emits no `record_function` scopes, so `prelude.sql` builds `phase` from
+the Python frames instead — `_prefill`, `_decode_step` (one per token), and
+`DecodeGraph.capture`. Match those names, not the line numbers beside them.
+(`prelude.sql` explains why; an empty `phase` table is the symptom.)
+
+## Report it
+
+A finished analysis states:
+
+- **Where the token goes**, as an accounting identity that closes:
+  `wall = GPU busy + idle`, with the idle attributed (§3.2.1, §3.4.2). If it
+  does not close, you have miscounted — find out why before writing anything
+  down.
+- **The ceiling and the headroom** — current tok/s against the GPU-side floor
+  (§3.2.2) or the bandwidth roofline (§5.2), as a ratio.
+- **Ranked findings**, each with its cost in µs/token or % of the phase, and
+  the source file it lives in.
+
+Before reporting, check the traps in §6.5 — at minimum the ones for the branch
+you took. Two apply to almost every walnut trace: drop the warm-up token
+(`WHERE seq > 0`), and do not sum kernel durations across streams.
