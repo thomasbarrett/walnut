@@ -225,4 +225,4 @@ Capture a short window periodically (`schedule(wait=N, warmup=1, active=2, repea
 
 ---
 
-[Index](README.md) · [← Chapter 5](chapter-5-device-side-bottlenecks.md) · [Appendix A →](appendix-a-category-and-arg-reference.md)
+[Index](README.md) · [← Chapter 5](chapter-5-device-side-bottlenecks.md)

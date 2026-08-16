@@ -111,15 +111,11 @@ Then follow the branch:
 | Comparing two runs, or a tail-latency question | [Chapter 6](references/chapter-6-practice.md) — case study, ITL percentiles, A/B, CI |
 
 Supporting material: [Chapter 1](references/chapter-1-trace-as-a-database.md)
-for the table layout, categories, and ingestion semantics;
-[Chapter 2](references/chapter-2-capture-and-view-layer.md) for capture detail
-and the preflight validation in §2.3;
-[Appendix A](references/appendix-a-category-and-arg-reference.md) for the
-category and argument tables;
-[Appendix C](references/appendix-c-query-index.md) to go from a question to the
-query that answers it. [references/README.md](references/README.md) indexes it
-all and explains the `§N.M` cross-references — the leading digit is the
-chapter.
+for the table layout, the category and argument tables, and ingestion
+semantics; [Chapter 2](references/chapter-2-capture-and-view-layer.md) for
+capture detail and the preflight validation in §2.3.
+[references/README.md](references/README.md) indexes the chapters and explains
+the `§N.M` cross-references — the leading digit is the chapter.
 
 **Run the preflight (§2.3) before concluding anything.** It catches dropped
 events, a truncated GPU timeline, and unlinked device ops — all of which

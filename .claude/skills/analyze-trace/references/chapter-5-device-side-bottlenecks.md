@@ -80,7 +80,7 @@ SELECT ph, family, COUNT(*) n, SUM(gdur)/1e3 us,
 FROM kfam GROUP BY 1,2 ORDER BY ph, us DESC;
 ```
 
-(This view is already defined in the prelude, Appendix B; it is repeated here for reference.) This is the view to put in a dashboard: it is stable across PyTorch versions and immediately shows a shift in the compute mix (e.g. `gemm` → `triton` after enabling `torch.compile`).
+(This view is already defined in the prelude, [`scripts/prelude.sql`](../scripts/prelude.sql); it is repeated here for reference.) This is the view to put in a dashboard: it is stable across PyTorch versions and immediately shows a shift in the compute mix (e.g. `gemm` → `triton` after enabling `torch.compile`).
 
 ### 5.1.4 The tiny-kernel census
 

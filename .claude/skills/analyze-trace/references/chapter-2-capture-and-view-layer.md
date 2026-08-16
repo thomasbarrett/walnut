@@ -112,7 +112,8 @@ Typical ratio is 8–12×. Do this by default for anything you will move between
 
 ## 2.2 The view layer
 
-Almost every question in this book is asked against five relations. Define them once; everything downstream is a two-line query. The complete file is in [Appendix B](appendix-b-prelude.md).
+Almost every question in this book is asked against five relations. Define them once; everything downstream is a two-line query. The complete file, with the phase override walnut needs, is
+[`scripts/prelude.sql`](../scripts/prelude.sql).
 
 ```sql
 -- ev: every slice with its thread/process context resolved.

@@ -63,22 +63,19 @@ and follow the branch it sends you down.
 &nbsp;&nbsp;&nbsp;&nbsp;6.4 Automation and CI
 &nbsp;&nbsp;&nbsp;&nbsp;6.5 Twelve traps
 
-**Appendices** · [A. Category and argument reference](appendix-a-category-and-arg-reference.md) · [B. The complete prelude](appendix-b-prelude.md) · [C. Query index](appendix-c-query-index.md)
-
 ---
 
 ## Two things to know before you start
 
 **Cross-references.** The text cites sections as `§N.M`. The leading digit is the
 chapter, so `§4.3` is section 4.3 of
-[Chapter 4](chapter-4-host-side-bottlenecks.md). Query numbers in
-[Appendix C](appendix-c-query-index.md) map the other way — from a question to
-the section that answers it.
+[Chapter 4](chapter-4-host-side-bottlenecks.md).
 
 **The prelude.** Nearly every query from Chapter 3 onward is written against the
 five views defined in §2.2 and collected in
-[Appendix B](appendix-b-prelude.md). Run that prelude against the trace first,
-or the queries will fail with `no such table`.
+[`scripts/prelude.sql`](../scripts/prelude.sql). Run that prelude against the
+trace first, or the queries will fail with `no such table`. The shipped copy
+also overrides `phase`, which walnut needs — see the skill for why.
 
 ---
 
