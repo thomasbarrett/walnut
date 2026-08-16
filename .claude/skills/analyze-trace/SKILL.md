@@ -72,8 +72,9 @@ inference traces — the trace format, the view layer, a triage procedure that
 identifies which bottleneck you have, and the host-side and device-side
 branches it sends you down.
 
-One walnut-specific difference from the book: walnut calls no
-`record_function`, so `user_annotation` is empty and the book's `phase` table
-would have zero rows, silently emptying every per-token query. `prelude.sql`
-rebuilds `phase` from `aten::item` — one per generated token — so those queries
-work as written. Its comments explain the reconstruction.
+One walnut-specific difference from the book: walnut emits no
+`record_function` scopes, so `user_annotation` is empty and the book's `phase`
+table would have zero rows, silently emptying every per-token query.
+`prelude.sql` reads the Python frames instead — `_prefill`, `_decode_step` (one
+per token), and `DecodeGraph.capture` — which walnut names for the purpose.
+Match those names rather than the line numbers beside them.

@@ -4,12 +4,10 @@
 -- The first half is Appendix B of references/ verbatim: ev, dev_op, api,
 -- phase, link, kfam, gap.
 --
--- The second half overrides `phase` and rebuilds `link`. walnut calls no
--- torch.profiler.record_function, so `user_annotation` is empty and the
--- book's phase table would have zero rows — taking every per-token query in
--- Chapters 3 and 6 down with it. Phases are reconstructed from `aten::item`
--- instead: walnut's sampler pulls each token to the host with
--- `int(next_token.item())`, so there is exactly one per generated token.
+-- `phase` is the one departure. walnut emits no record_function scopes, so
+-- `user_annotation` is empty and the book's definition would return no rows,
+-- silently emptying every per-token query in Chapters 3 and 6. It reads the
+-- Python frames instead, which walnut names for the purpose.
 --
 -- Pipe this in front of any query:
 --   cat prelude.sql q.sql | uv run python scripts/analyze_trace.py sql <trace>
@@ -44,31 +42,32 @@ FROM ev
 WHERE cat IN ('cuda_runtime', 'cuda_driver');
 
 -- ---------------------------------------------------------------------------
--- walnut override: phases from aten::item, one per generated token.
+-- walnut override: phases from the Python frames walnut names for it.
 --
--- prefill    trace start -> the first token reaching the host
--- decode[i]  token i -> token i+1   (so N items yield N-1 decode intervals)
+--   prefill              _prefill, once
+--   cuda_graph_capture   DecodeGraph.capture, once, with --cuda-graph
+--   decode               _decode_step, once per generated token
 --
--- If a future walnut wraps its phases in record_function, delete this block:
--- the book's own definition will then be correct.
+-- Match the name, not the line number in `file(line): function` — the line
+-- moves whenever the file above it is edited. Needs the stacks that
+-- `walnut profile` records; a server trace has no Python frames, so `phase`
+-- comes back empty there.
 -- ---------------------------------------------------------------------------
 CREATE PERFETTO TABLE phase AS
-WITH tok AS (
-  SELECT ts + dur AS te, ROW_NUMBER() OVER (ORDER BY ts) - 1 AS n
-  FROM slice WHERE name = 'aten::item'
-),
--- LAG must run over the unfiltered set: SQLite applies WHERE before window
--- functions, so filtering n > 0 first leaves the token-0 -> token-1 interval
--- with a NULL start and drops it from every average.
-iv AS (SELECT te, n, LAG(te) OVER (ORDER BY te) AS prev FROM tok)
-SELECT 0 AS id,
-       (SELECT start_ts FROM trace_bounds) AS ts,
-       (SELECT MIN(te) FROM tok) - (SELECT start_ts FROM trace_bounds) AS dur,
-       (SELECT MIN(te) FROM tok) AS te,
-       'prefill' AS name, 0 AS seq
-UNION ALL
-SELECT 1000 + n, prev, te - prev, te, 'decode', n - 1
-FROM iv WHERE n > 0;
+WITH frame AS (
+  SELECT id, ts, dur, ts + dur AS te,
+         CASE WHEN name GLOB '*: _prefill'     THEN 'prefill'
+              WHEN name GLOB '*: _decode_step' THEN 'decode'
+              ELSE 'cuda_graph_capture'
+         END AS name
+  FROM slice
+  WHERE category = 'python_function'
+    AND (name GLOB '*: _prefill' OR name GLOB '*: _decode_step'
+         OR name GLOB '*graph.py(*): capture')
+)
+SELECT id, ts, dur, te, name,
+       ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts) - 1 AS seq
+FROM frame;
 
 -- The central relation: device op x launching API call x ATen op x phase.
 -- Built on `flow`, so it survives CUDA graphs and missing correlation ids.
