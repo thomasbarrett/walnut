@@ -60,6 +60,30 @@ def test_rmsnorm_applies_one_centered_weight():
     assert torch.allclose(norm(torch.tensor([x])), expected, atol=1e-5)
 
 
+def test_rmsnorm_cached_scale_stays_out_of_the_state_dict():
+    # Derived from `weight`, so persisting it would put a second copy of the
+    # same information in every checkpoint walnut writes.
+    norm = RMSNorm(4)
+    norm(torch.randn(1, 4))  # builds the cache
+    assert norm._scale is not None
+    assert list(norm.state_dict()) == ["weight"]
+
+
+def test_rmsnorm_reload_invalidates_the_cached_scale():
+    # The cache is built on first use, so a reload after one must drop it or
+    # the module keeps normalizing with the weight it no longer has.
+    norm = RMSNorm(4)
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    before = norm(x)
+
+    reloaded = RMSNorm(4)
+    with torch.no_grad():
+        reloaded.weight.copy_(torch.full((4,), 3.0))
+    norm.load_state_dict(reloaded.state_dict())
+
+    assert torch.allclose(norm(x), before * 4.0, atol=1e-5)
+
+
 def test_rope_position_zero_is_identity():
     rope = RotaryEmbedding(head_dim=8, rope_theta=10000.0)
     cos, sin = rope(torch.zeros(1, dtype=torch.long))
