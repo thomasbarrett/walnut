@@ -33,10 +33,6 @@ covers all three.
 - `pyproject.toml` is the source of truth for deps and ruff/ty/pytest
   settings — check there, don't restate settings elsewhere.
 - Tests live in `tests/`, named `test_*.py`.
-- **Fixtures use the real names.** Test anything matching on parameter or
-  checkpoint names (`copy_weights`, `FUSED_PROJECTIONS`) with dotted names like
-  `mlp.gate_proj.weight`. The `0.weight` an `nn.Sequential` gives you never
-  reaches the suffix matching, so the test passes either way.
 
 ## Profiles
 
