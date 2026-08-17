@@ -7,13 +7,19 @@ An inference engine, built on PyTorch, exposing an OpenAI-compatible API.
 - Lint / format:  `uv run ruff check` (`--fix`) / `uv run ruff format` (`--check`)
 - Type check:     `uv run ty check`
 - Test:           `uv run pytest`
-- All checks:     `prek run --all-files`  (ruff, ty, hadolint, helm lint)
+- All checks:     `uvx prek run --all-files --stage pre-push`  (mirrors CI)
+- Fast subset:    `uvx prek run --all-files`  (drops pytest, docs, helm template)
 - Deps:           `uv sync --extra cpu --dev` / `uv add [--dev] <pkg>`
 - Chart lint:     `helm lint charts/walnut --strict --values charts/walnut/ci/lint-values.yaml`
 - Docs:           `uv run mkdocs serve` (preview) / `uv run mkdocs build --strict` (CI gate)
 
-`ruff` and `ty` are CI gates; run them (or `prek`) before declaring work done.
-`.github/workflows/ci.yml` also runs `helm-lint` + `dockerfile-lint`.
+`.pre-commit-config.yaml` mirrors `.github/workflows/ci.yml` job for job and is
+the single definition of the checks. `uv run pytest` alone passes while `ruff`
+and `ty` fail CI.
+
+Nothing runs on its own until `prek install --hook-type pre-commit --hook-type
+pre-push`. `hadolint` and `helm` come from the `Brewfile`; their hooks fail
+rather than skip when the binary is missing, and CI covers them anyway.
 
 ## Conventions
 
@@ -22,6 +28,10 @@ An inference engine, built on PyTorch, exposing an OpenAI-compatible API.
 - `pyproject.toml` is the source of truth for deps and ruff/ty/pytest
   settings — check there, don't restate settings elsewhere.
 - Tests live in `tests/`, named `test_*.py`.
+- **Fixtures use the real names.** Test anything matching on parameter or
+  checkpoint names (`copy_weights`, `FUSED_PROJECTIONS`) with dotted names like
+  `mlp.gate_proj.weight`. The `0.weight` an `nn.Sequential` gives you never
+  reaches the suffix matching, so the test passes either way.
 
 ## Profiles
 
