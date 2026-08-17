@@ -81,6 +81,25 @@ def _git_state() -> dict[str, Any]:
     return {"git_sha": head, "git_dirty": bool(status) if status is not None else None}
 
 
+def _inductor_cache_entries() -> int | None:
+    """Files in Inductor's on-disk cache, or None if torch won't say where.
+
+    Counted either side of the first request: the cache is keyed on the graph,
+    so growth means this process compiled and a hit leaves it alone.
+    """
+    try:
+        from torch._inductor.runtime.cache_dir_utils import cache_dir
+    except ImportError:
+        try:
+            from torch._inductor.codecache import cache_dir  # type: ignore[no-redef]
+        except ImportError:
+            return None
+    root = Path(cache_dir())
+    if not root.is_dir():
+        return 0
+    return sum(1 for path in root.rglob("*") if path.is_file())
+
+
 def _one_request(engine: Any, prompt: str, params: Any) -> dict[str, Any]:
     """Run one request, timestamping each generated token.
 
@@ -135,12 +154,27 @@ def run(args: argparse.Namespace) -> int:
 
     # Cold: compilation, autotuning and lazy init. Weight loading already
     # happened in load_model, so it is not in this number.
+    cache_before = _inductor_cache_entries()
     cold = time.perf_counter()
     engine.generate(
         [Message(role="user", content=args.prompt)],
         GenerationConfig(max_tokens=8, temperature=args.temperature),
     )
     first_request_ms = (time.perf_counter() - cold) * 1e3
+    cache_after = _inductor_cache_entries()
+
+    compiled = (
+        None
+        if cache_before is None or cache_after is None
+        else cache_after > cache_before
+    )
+    if compiled:
+        print(
+            "! the first request compiled from a cold Inductor cache, so "
+            "`first request (ms)` is a compile time. Re-run in a fresh process "
+            "for a number comparable with a warm baseline.",
+            file=sys.stderr,
+        )
 
     params = SamplingParams(
         max_new_tokens=args.tokens, temperature=args.temperature, seed=args.seed
@@ -206,6 +240,8 @@ def run(args: argparse.Namespace) -> int:
         "itl_p99_ms": _percentile(itl, 99),
         "itl_max_ms": max(itl),
         "first_request_ms": first_request_ms,
+        # None if torch won't name its cache dir; `compare` then stays quiet.
+        "first_request_compiled": compiled,
         # Per-run values, so dispersion can be checked downstream.
         "ttft_all_ms": ttft,
         "e2e_all_ms": e2e,
@@ -305,7 +341,19 @@ def compare(args: argparse.Namespace) -> int:
             continue
         lo = _cell(b, before.get(spread_key) if spread_key else None)
         hi = _cell(a, after.get(spread_key) if spread_key else None)
+        if key == "first_request_ms":
+            lo += "*" if before.get("first_request_compiled") else ""
+            hi += "*" if after.get("first_request_compiled") else ""
         print(f"{label:22} {lo:>15} {hi:>15} {_change(b, a):>9}")
+
+    # In the table, because the number that gets misread is the one pasted into
+    # a PR without the surrounding output.
+    if before.get("first_request_compiled") or after.get("first_request_compiled"):
+        print(
+            "\n* compiled from a cold Inductor cache: a compile time, not a "
+            "regression.\n  Editing the graph invalidates the cache, so this lands "
+            "on the changed side.\n  Re-run it in a fresh process."
+        )
 
     print()
     ok = True
