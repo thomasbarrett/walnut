@@ -120,7 +120,10 @@ fusion work actually causes, and it exercises one prompt at one temperature.
   per-request CUDA graph capture, so `--no-cuda-graph` shows a *lower* TTFT
   alongside a 2.6× TPOT regression. TTFT alone never justifies a change.
 - **Compilation, autotuning, lazy init** → `first request (ms)`. Weight loading
-  is not in it; that happens before the timer.
+  is not in it; that happens before the timer. Inductor caches compiled graphs
+  on disk across processes, so a build whose graph you edited compiles while
+  its baseline hits the cache. `compare` marks that cell `*`: a compile, not a
+  regression, and only comparable against another cold run.
 - **Anything end to end** → e2e, but only alongside `tokens_out`.
 
 ## Method
