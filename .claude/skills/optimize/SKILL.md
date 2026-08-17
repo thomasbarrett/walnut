@@ -60,6 +60,27 @@ code; it's the cheapest way to kill a bad idea. Then implement following
 `CLAUDE.md`, putting anything with a real cost behind a flag threaded the way
 `--cuda-graph` is.
 
+### Fusing projections
+
+The machinery already exists, so look for the precedent first:
+`FUSED_PROJECTIONS` (`walnut/models/qwen3_5.py`) is the map,
+`copy_weights(..., fused=)` (`walnut/models/loader.py`) applies it, and
+`walnut/layers/vision.py` already holds a single `qkv`. What it costs:
+
+- **Fuse at load, never in the graph.** A `torch.cat` inside `forward` moves
+  the whole weight every token, and with `freezing=False` the compiler can't
+  hoist it out — the same reason Inductor's `BatchLinearLHSFusion` is no
+  substitute.
+- **A split is a stride, not a contiguous tensor.** `.view()` on a
+  `.split()`/`.chunk()` result has to become `.reshape()`. It only fails past
+  one token, so decode passes and prefill breaks.
+- **Map the bias too**, or a biased projection loads with its bias unfilled.
+- **Order is the map's order**, not the checkpoint's. The shapes fit either
+  way, so getting it wrong is silent; `tests/test_models.py` pins it.
+
+Only projections sharing an input can fuse — otherwise you concatenate the
+inputs first, which costs more than the launch it saves.
+
 ## 5. Re-benchmark
 
 ```bash
