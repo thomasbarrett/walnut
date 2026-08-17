@@ -645,6 +645,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         params: SamplingParams | None = None,
         cuda_graph: bool = True,
         compile: bool = True,
+        autotune: bool = True,
     ) -> Iterator[int]:
         """Yield generated token ids (text-only, batch 1), one per step.
 
@@ -660,6 +661,15 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         otherwise spend a kernel apiece on. Prefill stays eager on purpose: its
         shapes follow the prompt, so compiling it recompiles per prompt length,
         while decode's are fixed and one compile serves every request.
+
+        ``autotune`` lets Inductor benchmark a Triton template against cuBLAS
+        for each projection instead of taking cuBLAS on faith. Decode's matmuls
+        are matrix-*vector* products, a shape cuBLAS's `gemv` serves at 48-57%
+        of this GPU's bandwidth where a Triton kernel reaches ~70%; picking per
+        shape is worth ~11% of TPOT. Autotuning runs at compile time and its
+        results land in the same on-disk cache as the compiled graph, so the
+        cost is one cold compile per build, not one per process. Ignored
+        without ``compile``.
         """
         params = params or SamplingParams()
         stop_ids = set(params.stop_token_ids)
@@ -706,7 +716,14 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         # Compile after prefill, so the trace dynamo records is the decode
         # branch. Rebuilding the wrapper per request is a few milliseconds:
         # dynamo's own cache keys on the code object, not on this object.
-        decode_forward: Any = torch.compile(self) if compile else self
+        #
+        # The autotuning mode is the "-no-cudagraphs" one because `DecodeGraph`
+        # captures the step itself; letting Inductor also apply cudagraphs
+        # would have it capture a region this code then captures again.
+        decode_forward: Any = self
+        if compile:
+            mode = "max-autotune-no-cudagraphs" if autotune else None
+            decode_forward = torch.compile(self, mode=mode)
 
         # Capture after prefill: the decode branch only exists once the caches
         # hold state, and capture records whichever branch it runs.

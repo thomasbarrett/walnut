@@ -148,7 +148,11 @@ class _ScriptedModel:
 
 
 def _generate(
-    model: _ScriptedModel, max_new_tokens: int, compile: bool = False, **kwargs
+    model: _ScriptedModel,
+    max_new_tokens: int,
+    compile: bool = False,
+    autotune: bool = True,
+    **kwargs,
 ) -> list[int]:
     params = SamplingParams(max_new_tokens=max_new_tokens, **kwargs)
     ids = torch.zeros(1, 3, dtype=torch.long)
@@ -157,7 +161,7 @@ def _generate(
     # loop, and tracing the stand-in would test dynamo instead.
     return list(
         Qwen3_5ForConditionalGeneration.iter_generate(
-            stand_in, ids, params, compile=compile
+            stand_in, ids, params, compile=compile, autotune=autotune
         )
     )
 
@@ -181,7 +185,7 @@ def test_iter_generate_compiles_the_decode_step_but_not_the_prefill(monkeypatch)
     """Prefill's shapes follow the prompt; compiling it recompiles per length."""
     compiled: list[tuple[object, int]] = []
 
-    def fake_compile(target):
+    def fake_compile(target, mode=None):
         # The forward count at compile time says which phases it can cover.
         compiled.append((target, target.forwards))
         return target
@@ -195,6 +199,27 @@ def test_iter_generate_compiles_the_decode_step_but_not_the_prefill(monkeypatch)
 
     assert _generate(_ScriptedModel([7, 8, 9]), max_new_tokens=3) == [7, 8, 9]
     assert len(compiled) == 1  # compile=False does not compile
+
+
+def test_autotune_picks_the_compile_mode_and_never_inductor_cudagraphs(monkeypatch):
+    """`DecodeGraph` captures the step, so Inductor must not also capture it:
+    a mode without "-no-cudagraphs" would have it graph a region walnut graphs
+    again."""
+    modes: list[object] = []
+
+    def fake_compile(target, mode=None):
+        modes.append(mode)
+        return target
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    _generate(_ScriptedModel([7]), max_new_tokens=1, compile=True, autotune=True)
+    _generate(_ScriptedModel([7]), max_new_tokens=1, compile=True, autotune=False)
+    assert modes == ["max-autotune-no-cudagraphs", None]
+
+    # Without a compile there is nothing to tune, so autotune must not compile.
+    _generate(_ScriptedModel([7]), max_new_tokens=1, compile=False, autotune=True)
+    assert len(modes) == 2
 
 
 def test_iter_generate_runs_each_phase_in_a_named_frame():
