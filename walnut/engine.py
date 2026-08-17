@@ -220,10 +220,12 @@ class TorchEngine(Engine):
         dtype: str | torch.dtype | None = None,
         cuda_graph: bool = True,
         compile: bool = True,
+        autotune: bool = True,
     ) -> None:
         self.model_id = model_id
         self.cuda_graph = cuda_graph
         self.compile = compile
+        self.autotune = autotune
         config = AutoConfig.from_pretrained(model_id)
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype, config, self.device)
@@ -259,6 +261,7 @@ class TorchEngine(Engine):
                 self._params(config),
                 cuda_graph=self.cuda_graph,
                 compile=self.compile,
+                autotune=self.autotune,
             )
         )
         text = self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -276,6 +279,7 @@ class TorchEngine(Engine):
             self._params(config),
             cuda_graph=self.cuda_graph,
             compile=self.compile,
+            autotune=self.autotune,
         ):
             ids.append(tok)
             text = self.tokenizer.decode(ids, skip_special_tokens=True)
@@ -298,13 +302,16 @@ def load_model(
     dtype: str | torch.dtype | None = None,
     cuda_graph: bool = True,
     compile: bool = True,
+    autotune: bool = True,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
     ``device`` and ``dtype`` default to auto-selection; see `resolve_device`
     and `resolve_dtype`. ``cuda_graph`` replays decode from a captured graph
     and has no effect off CUDA. ``compile`` runs the decode step through
-    `torch.compile`, paying a one-off compile for fused kernels.
+    `torch.compile`, paying a one-off compile for fused kernels. ``autotune``
+    has that compile benchmark a Triton template per projection rather than
+    take cuBLAS on faith; it is ignored without ``compile``.
     """
     return TorchEngine(
         model_id=model,
@@ -312,4 +319,5 @@ def load_model(
         dtype=dtype,
         cuda_graph=cuda_graph,
         compile=compile,
+        autotune=autotune,
     )

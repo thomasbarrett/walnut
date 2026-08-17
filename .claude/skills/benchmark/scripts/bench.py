@@ -118,7 +118,11 @@ def _one_request(engine: Any, prompt: str, params: Any) -> dict[str, Any]:
     start = time.perf_counter()
     stamps, ids = [], []
     for token in engine.model.iter_generate(
-        input_ids, params, cuda_graph=engine.cuda_graph, compile=engine.compile
+        input_ids,
+        params,
+        cuda_graph=engine.cuda_graph,
+        compile=engine.compile,
+        autotune=engine.autotune,
     ):
         stamps.append(time.perf_counter())
         ids.append(token)
@@ -150,6 +154,7 @@ def run(args: argparse.Namespace) -> int:
         dtype=parse_dtype(args.dtype),
         cuda_graph=args.cuda_graph,
         compile=args.compile,
+        autotune=args.autotune,
     )
 
     # Cold: compilation, autotuning and lazy init. Weight loading already
@@ -217,7 +222,11 @@ def run(args: argparse.Namespace) -> int:
         "host": platform.node(),
         "torch": torch.__version__,
         **_git_state(),
-        "flags": {"cuda_graph": args.cuda_graph, "compile": args.compile},
+        "flags": {
+            "cuda_graph": args.cuda_graph,
+            "compile": args.compile,
+            "autotune": args.autotune,
+        },
         "prompt": args.prompt,
         "prompt_tokens": int(
             engine._encode([Message(role="user", content=args.prompt)]).shape[1]
@@ -311,8 +320,28 @@ def compare(args: argparse.Namespace) -> int:
     after = json.loads(Path(args.after).read_text())
 
     mismatched = [f for f in COMPARABLE if before.get(f) != after.get(f)]
+
+    # A flag is the change under test when the point of the run *is* to flip
+    # one. Naming it here drops `flags` from the guard for that key only —
+    # every other flag must still match, and the exemption is printed with the
+    # table so it travels with any number pasted out of it.
+    under_test = set(args.flag or ())
+    if under_test and "flags" in mismatched:
+        b_flags = dict(before["flags"])
+        a_flags = dict(after["flags"])
+        for name in under_test:
+            b_flags.pop(name, None)
+            a_flags.pop(name, None)
+        if b_flags == a_flags:
+            mismatched.remove("flags")
+
     print(f"before: {before.get('label') or args.before}  {before['flags']}")
     print(f"after:  {after.get('label') or args.after}  {after['flags']}")
+    for name in sorted(under_test):
+        print(
+            f"  ! flag under test: {name} "
+            f"{before['flags'].get(name)!r} -> {after['flags'].get(name)!r}"
+        )
 
     if mismatched:
         # On stdout, and fatal: a mismatch pasted into a PR is worse than no
@@ -406,11 +435,23 @@ def main() -> int:
     r.add_argument("--no-cuda-graph", dest="cuda_graph", action="store_false")
     r.add_argument("--compile", action="store_true", default=True)
     r.add_argument("--no-compile", dest="compile", action="store_false")
+    r.add_argument("--autotune", action="store_true", default=True)
+    r.add_argument("--no-autotune", dest="autotune", action="store_false")
     r.add_argument("--label", default=None, help="name for this run in `compare`")
     r.add_argument("-o", "--out", default=None, help="write the JSON record here")
     r.set_defaults(func=run)
 
     c = sub.add_parser("compare", help="diff two records from `run`")
+    c.add_argument(
+        "--flag",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="a flag the two runs are meant to differ in, because flipping it "
+        "is the change being measured. Exempts that one key from the `flags` "
+        "guard and is printed above the table; every other flag must still "
+        "match. Repeatable.",
+    )
     c.add_argument("before")
     c.add_argument("after")
     c.set_defaults(func=compare)

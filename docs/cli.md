@@ -53,6 +53,25 @@ default.
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-compile
 ```
 
+## Autotuning
+
+That compile also autotunes by default: for each projection Inductor benchmarks
+a Triton kernel against cuBLAS and keeps whichever is faster, rather than taking
+cuBLAS on faith. It is worth doing because decode's matmuls are matrix-*vector*
+products — walnut serves one request at a time, so every projection is a batch
+of one — and cuBLAS's `gemv` serves the narrow ones at roughly half the GPU's
+bandwidth. On an RTX 5090 picking per shape is worth ~11% of TPOT.
+
+Autotuning runs at compile time, so it lands on the first request: expect
+seconds rather than the fraction of a second `--compile` alone costs. Inductor
+caches the result on disk beside the compiled graph, so the cost is one cold
+compile per build, not one per process. `--no-autotune` turns it off, and it is
+ignored with `--no-compile`, which skips the compile that would do the tuning.
+
+```console
+$ uv run walnut serve Qwen/Qwen3.5-0.8B --no-autotune
+```
+
 ## Sampling while profiling
 
 `walnut profile` decodes greedily by default (`--temperature 0`), which is what

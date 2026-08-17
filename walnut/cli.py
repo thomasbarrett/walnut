@@ -58,6 +58,17 @@ Compile = Annotated[
         "elementwise kernels. Costs a few seconds on the first request.",
     ),
 ]
+Autotune = Annotated[
+    bool,
+    typer.Option(
+        "--autotune/--no-autotune",
+        envvar="WALNUT_AUTOTUNE",
+        help="Have the compile benchmark a Triton kernel against cuBLAS for "
+        "each projection, rather than take cuBLAS on faith. Worth ~11% of "
+        "TPOT at decode's batch of 1. Costs a longer first compile, cached on "
+        "disk thereafter. Ignored with --no-compile.",
+    ),
+]
 
 
 @app.command()
@@ -76,6 +87,7 @@ def serve(
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
     compile: Compile = True,
+    autotune: Autotune = True,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -96,6 +108,7 @@ def serve(
         dtype=precision,
         cuda_graph=cuda_graph,
         compile=compile,
+        autotune=autotune,
     )
     typer.echo(
         f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
@@ -132,6 +145,7 @@ def profile(
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
     compile: Compile = True,
+    autotune: Autotune = True,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 
@@ -155,6 +169,7 @@ def profile(
         dtype=precision,
         cuda_graph=cuda_graph,
         compile=compile,
+        autotune=autotune,
     )
     config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
     messages = [Message(role="user", content=prompt)]
