@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from walnut.layers.linear import FusedLinear
 from walnut.models.loader import copy_weights
 from walnut.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from walnut.sampler import SamplingParams
@@ -46,13 +47,13 @@ def test_copy_weights_skips_listed_prefixes():
 
 
 # One `gate_up_proj` standing in for the checkpoint's `gate_proj` + `up_proj`.
-_FUSED = {"gate_up_proj.weight": ("gate_proj.weight", "up_proj.weight")}
 _GATE, _UP = torch.ones(2, 2), torch.full((3, 2), 2.0)
 
 
 def _fused_module() -> nn.Module:
+    parts = {"gate_proj": 2, "up_proj": 3}
     return nn.ModuleDict(
-        {"mlp": nn.ModuleDict({"gate_up_proj": nn.Linear(2, 5, False)})}
+        {"mlp": nn.ModuleDict({"gate_up_proj": FusedLinear(2, parts)})}
     )
 
 
@@ -63,7 +64,7 @@ def _weight(module: nn.Module) -> torch.Tensor:
 def test_copy_weights_concatenates_a_fused_parameter():
     module = _fused_module()
     sources = [("mlp.gate_proj.weight", _GATE), ("mlp.up_proj.weight", _UP)]
-    copy_weights(module, sources, fused=_FUSED)
+    copy_weights(module, sources)
     assert torch.equal(_weight(module), torch.cat([_GATE, _UP]))
 
 
@@ -72,14 +73,53 @@ def test_copy_weights_concatenates_in_declared_order_not_arrival_order():
     ``gate``, which is silent — the concatenation still has the right shape."""
     module = _fused_module()
     sources = [("mlp.up_proj.weight", _UP), ("mlp.gate_proj.weight", _GATE)]
-    copy_weights(module, sources, fused=_FUSED)
+    copy_weights(module, sources)
     assert torch.equal(_weight(module), torch.cat([_GATE, _UP]))
 
 
 def test_copy_weights_rejects_a_fused_parameter_missing_a_source():
     module = _fused_module()
     with pytest.raises(ValueError, match="unfilled"):
-        copy_weights(module, [("mlp.gate_proj.weight", _GATE)], fused=_FUSED)
+        copy_weights(module, [("mlp.gate_proj.weight", _GATE)])
+
+
+def test_copy_weights_fills_a_fused_bias():
+    parts = {"q_proj": 2, "k_proj": 1}
+    module = nn.ModuleDict(
+        {"attn": nn.ModuleDict({"qkv_proj": FusedLinear(2, parts, bias=True)})}
+    )
+    q, k = torch.ones(2, 2), torch.full((1, 2), 2.0)
+    qb, kb = torch.ones(2), torch.full((1,), 2.0)
+    copy_weights(
+        module,
+        [
+            ("attn.q_proj.weight", q),
+            ("attn.k_proj.weight", k),
+            ("attn.q_proj.bias", qb),
+            ("attn.k_proj.bias", kb),
+        ],
+    )
+    params = dict(module.named_parameters())
+    assert torch.equal(params["attn.qkv_proj.weight"], torch.cat([q, k]))
+    assert torch.equal(params["attn.qkv_proj.bias"], torch.cat([qb, kb]))
+
+
+def test_fused_linear_splits_in_the_order_it_loads():
+    """The bug this guards: the split widths and the load order living in two
+    places, so a reordered checkpoint loads silently into the wrong slices.
+
+    Loading an identity-per-part weight makes each part recoverable, so the
+    tensor `forward` returns as ``gate`` must be the one loaded as
+    ``gate_proj``."""
+    module = _fused_module()
+    copy_weights(
+        module,
+        [("mlp.gate_proj.weight", _GATE), ("mlp.up_proj.weight", _UP)],
+    )
+    fused = cast(FusedLinear, module.get_submodule("mlp.gate_up_proj"))
+    gate, up = fused(torch.ones(1, 2))
+    assert torch.equal(gate, _GATE.sum(dim=1).unsqueeze(0))
+    assert torch.equal(up, _UP.sum(dim=1).unsqueeze(0))
 
 
 class _ScriptedModel:
