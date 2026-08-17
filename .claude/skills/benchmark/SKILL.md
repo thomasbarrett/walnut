@@ -112,6 +112,25 @@ Know what this check does *not* cover: perturbing every weight by a relative
 character 480. It catches gross breakage, not the small numeric drift that
 fusion work actually causes, and it exercises one prompt at one temperature.
 
+### Explaining a changed hash
+
+"Explained" means naming the mechanism, not asserting the change is exact. Each
+step removes a layer, so stop at the first one that answers it.
+
+1. **The op alone**, old vs new on the same input at the decode shape,
+   `torch.equal`. Differing here means the change is wrong. Identical here
+   points the drift at the shapes you didn't test — prefill dispatches
+   differently.
+2. **`--no-compile` on both sides.** Divergence survives ⇒ not Inductor.
+3. **`--dtype float32` on both sides.** Identical ⇒ no difference large enough
+   for fp32 `argmax` to see, i.e. bf16 rounding, usually cuBLAS choosing a
+   different kernel for the new shape. Enough of an explanation for a PR.
+4. **Still differing in float32** ⇒ a real numerics change. Explain it or
+   revert.
+
+Greedy `argmax` only flips at a near-tie, so rounding diverges *late* — in #40,
+character 433. An immediate divergence is evidence against rounding.
+
 ## Which number leads
 
 - **Decode path** (kernels, fusion, the graph's contents) → TPOT. ITL p99 tracks
