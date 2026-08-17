@@ -18,6 +18,7 @@ from torch import nn
 from walnut.graph import DecodeGraph
 from walnut.layers import (
     Attention,
+    FusedLinear,
     GatedDeltaNet,
     RMSNorm,
     RotaryEmbedding,
@@ -33,41 +34,23 @@ from walnut.layers.linear_attention import ConvState
 from walnut.models.loader import copy_weights
 from walnut.sampler import Sampler, SamplingParams
 
-# Projections the checkpoint stores separately that walnut runs as one gemv.
-# Each group shares an input, so concatenating the weights along dim 0 computes
-# the same values in one memory-bound kernel instead of two to four — worth
-# ~180 µs of a 1.8 ms decode token, since a batch-1 gemv is bandwidth-bound and
-# the small ones never even reach the bandwidth roof.
-FUSED_PROJECTIONS = {
-    "gate_up_proj.weight": ("gate_proj.weight", "up_proj.weight"),
-    "qkv_proj.weight": ("q_proj.weight", "k_proj.weight", "v_proj.weight"),
-    "qkv_proj.bias": ("q_proj.bias", "k_proj.bias", "v_proj.bias"),
-    "in_proj.weight": (
-        "in_proj_qkv.weight",
-        "in_proj_z.weight",
-        "in_proj_b.weight",
-        "in_proj_a.weight",
-    ),
-}
-
 
 class Qwen3_5MLP(nn.Module):
     """SwiGLU feed-forward: ``down(silu(gate(x)) * up(x))``.
 
     ``gate`` and ``up`` read the same input, so they are held as one
-    ``gate_up_proj`` and split after — one gemv instead of two, which at decode's
-    batch of 1 is the difference between one memory-bound kernel and two (see
-    `FUSED_PROJECTIONS`).
+    `FusedLinear` — one gemv instead of two, which at decode's batch of 1 is
+    the difference between one memory-bound kernel and two.
     """
 
     def __init__(self, config: Any) -> None:
         super().__init__()
         hidden, inter = config.hidden_size, config.intermediate_size
-        self.gate_up_proj = nn.Linear(hidden, 2 * inter, bias=False)
+        self.gate_up_proj = FusedLinear(hidden, {"gate_proj": inter, "up_proj": inter})
         self.down_proj = nn.Linear(inter, hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        gate, up = self.gate_up_proj(x)
         return self.down_proj(F.silu(gate) * up)
 
 
@@ -78,8 +61,8 @@ class Qwen3_5Attention(nn.Module):
     half is the query, half is a sigmoid gate applied to the attention output
     before ``o_proj``.
 
-    Q, K and V read the same input and are held as one ``qkv_proj``, split after
-    (see `FUSED_PROJECTIONS`).
+    Q, K and V read the same input and are held as one `FusedLinear`, split
+    after.
     """
 
     def __init__(self, config: Any, layer_idx: int) -> None:
@@ -91,10 +74,12 @@ class Qwen3_5Attention(nn.Module):
         self.output_gate = config.attn_output_gate
         bias = config.attention_bias
 
-        self.q_out = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
-        self.kv_out = self.num_kv_heads * self.head_dim
-        self.qkv_proj = nn.Linear(
-            config.hidden_size, self.q_out + 2 * self.kv_out, bias=bias
+        q_out = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        kv_out = self.num_kv_heads * self.head_dim
+        self.qkv_proj = FusedLinear(
+            config.hidden_size,
+            {"q_proj": q_out, "k_proj": kv_out, "v_proj": kv_out},
+            bias=bias,
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, config.hidden_size, bias=False
@@ -123,13 +108,11 @@ class Qwen3_5Attention(nn.Module):
     ) -> torch.Tensor:
         bsz, seq, _ = x.shape
 
-        q, k, v = self.qkv_proj(x).split([self.q_out, self.kv_out, self.kv_out], dim=-1)
+        q, k, v = self.qkv_proj(x)
 
         gate = None
         if self.output_gate:
             # Reshape to (B, S, heads, 2*D) first, so query/gate split per head.
-            # ``reshape``, not ``view``: a split is a stride into ``qkv_proj``'s
-            # output, which is only viewable when the prompt is one token long.
             q = q.reshape(bsz, seq, self.num_heads, 2 * self.head_dim)
             q, gate = q.chunk(2, dim=-1)
             gate = gate.reshape(bsz, seq, -1)
@@ -755,7 +738,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
         ``mtp`` is the multi-token prediction head, used for speculative
         decoding; walnut has no module for it, so those tensors are skipped.
-        `FUSED_PROJECTIONS` names the groups this model concatenates into a
-        single `nn.Linear`, so the checkpoint loads unmodified.
+        The model's `FusedLinear` layers each hold several of the checkpoint's
+        projections; `copy_weights` finds them and concatenates their parts, so
+        the checkpoint loads unmodified.
         """
-        copy_weights(self, weights, skip_prefixes=("mtp.",), fused=FUSED_PROJECTIONS)
+        copy_weights(self, weights, skip_prefixes=("mtp.",))

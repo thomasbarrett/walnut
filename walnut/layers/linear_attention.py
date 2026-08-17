@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from walnut.layers.cache import Cache
+from walnut.layers.linear import FusedLinear
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -159,13 +160,15 @@ class GatedDeltaNet(nn.Module):
         # as one gemv and split after. ``in_proj_b``/``in_proj_a`` produce 16
         # values each: as their own kernels they cost the launch floor rather
         # than the 32 KB they read.
-        self.in_proj_splits = [
-            self.conv_dim,
-            self.value_dim,
-            num_value_heads,
-            num_value_heads,
-        ]
-        self.in_proj = nn.Linear(hidden_size, sum(self.in_proj_splits), bias=False)
+        self.in_proj = FusedLinear(
+            hidden_size,
+            {
+                "in_proj_qkv": self.conv_dim,
+                "in_proj_z": self.value_dim,
+                "in_proj_b": num_value_heads,
+                "in_proj_a": num_value_heads,
+            },
+        )
 
     def make_cache(
         self,
@@ -193,9 +196,7 @@ class GatedDeltaNet(nn.Module):
         batch, seq, _ = hidden_states.shape
         pad = self.conv_kernel_size - 1
 
-        qkv_pre, z, b, a = self.in_proj(hidden_states).split(
-            self.in_proj_splits, dim=-1
-        )
+        qkv_pre, z, b, a = self.in_proj(hidden_states)
         qkv_pre = qkv_pre.transpose(1, 2)
         z = z.reshape(batch, seq, -1, self.head_v_dim)
 
