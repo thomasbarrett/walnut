@@ -65,6 +65,16 @@ The whole-repo hooks (`pytest`, `mkdocs build --strict`, `helm template`) are
 tagged `pre-push` so committing stays instant. `--stage pre-push` runs every
 hook, not just those three.
 
+`uvx prek run …` fetches `prek` on demand, so nothing needs installing — except
+for `install` itself, whose git hook calls `prek` by name. The `hadolint`,
+`helm-lint` and `helm-template` hooks shell out to system binaries either way,
+and fail rather than skip when those are missing:
+
+```bash
+uvx prek run --all-files --stage pre-push \
+    --skip hadolint --skip helm-lint --skip helm-template
+```
+
 ## Docs
 
 The docs are built with [MkDocs Material](https://squidfunk.github.io/mkdocs-material/)

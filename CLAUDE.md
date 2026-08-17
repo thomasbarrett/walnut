@@ -17,9 +17,14 @@ An inference engine, built on PyTorch, exposing an OpenAI-compatible API.
 the single definition of the checks. `uv run pytest` alone passes while `ruff`
 and `ty` fail CI.
 
-Nothing runs on its own until `prek install --hook-type pre-commit --hook-type
-pre-push`. `hadolint` and `helm` come from the `Brewfile`; their hooks fail
-rather than skip when the binary is missing, and CI covers them anyway.
+`uvx` fetches `prek`, so there is nothing to install first. Nothing runs on its
+own, though, until `prek install --hook-type pre-commit --hook-type pre-push` —
+use a real `prek` for that, since the hook it writes calls `prek` by name.
+
+`hadolint` and `helm` come from the `Brewfile`; their hooks fail rather than
+skip when the binary is missing. Without them: `uvx prek run --all-files
+--stage pre-push --skip hadolint --skip helm-lint --skip helm-template`. CI
+covers all three.
 
 ## Conventions
 
