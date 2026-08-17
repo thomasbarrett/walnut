@@ -45,6 +45,43 @@ def test_copy_weights_skips_listed_prefixes():
     assert all((p == 1).all() for p in module.parameters())
 
 
+# One `gate_up_proj` standing in for the checkpoint's `gate_proj` + `up_proj`.
+_FUSED = {"gate_up_proj.weight": ("gate_proj.weight", "up_proj.weight")}
+_GATE, _UP = torch.ones(2, 2), torch.full((3, 2), 2.0)
+
+
+def _fused_module() -> nn.Module:
+    return nn.ModuleDict(
+        {"mlp": nn.ModuleDict({"gate_up_proj": nn.Linear(2, 5, False)})}
+    )
+
+
+def _weight(module: nn.Module) -> torch.Tensor:
+    return dict(module.named_parameters())["mlp.gate_up_proj.weight"]
+
+
+def test_copy_weights_concatenates_a_fused_parameter():
+    module = _fused_module()
+    sources = [("mlp.gate_proj.weight", _GATE), ("mlp.up_proj.weight", _UP)]
+    copy_weights(module, sources, fused=_FUSED)
+    assert torch.equal(_weight(module), torch.cat([_GATE, _UP]))
+
+
+def test_copy_weights_concatenates_in_declared_order_not_arrival_order():
+    """The bug this guards: a checkpoint listing ``up`` first would load it as
+    ``gate``, which is silent — the concatenation still has the right shape."""
+    module = _fused_module()
+    sources = [("mlp.up_proj.weight", _UP), ("mlp.gate_proj.weight", _GATE)]
+    copy_weights(module, sources, fused=_FUSED)
+    assert torch.equal(_weight(module), torch.cat([_GATE, _UP]))
+
+
+def test_copy_weights_rejects_a_fused_parameter_missing_a_source():
+    module = _fused_module()
+    with pytest.raises(ValueError, match="unfilled"):
+        copy_weights(module, [("mlp.gate_proj.weight", _GATE)], fused=_FUSED)
+
+
 class _ScriptedModel:
     """Stand-in that drives `iter_generate`'s loop off a fixed token list.
 
