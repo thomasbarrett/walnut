@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from walnut.layers.attention import Attention, KVCache
-from walnut.layers.linear_attention import GatedDeltaNet
+from walnut.layers.linear_attention import (
+    _CHUNK,
+    GatedDeltaNet,
+    _chunked_gated_delta_rule,
+    _recurrent_gated_delta_rule,
+)
 from walnut.layers.norm import RMSNorm
 from walnut.layers.rotary import (
     RotaryEmbedding,
@@ -164,6 +169,52 @@ def test_gated_delta_net_incremental_matches_prefill():
     incremental = torch.cat(steps, dim=1)
 
     assert torch.allclose(full, incremental, atol=1e-5)
+
+
+@pytest.mark.parametrize("seq", [1, 5, _CHUNK, _CHUNK + 1, 2 * _CHUNK + 7])
+def test_chunked_delta_rule_matches_the_recurrent_one(seq):
+    """The chunked form is the recurrent one reassociated, so it must agree.
+
+    Both are driven directly, past `_gated_delta_rule`'s dispatch, so the
+    lengths where only one of them normally runs are covered too. `g` is
+    negative and the keys are L2-normalized, as the layer guarantees.
+    """
+    torch.manual_seed(0)
+    heads, k_dim, v_dim = 3, 8, 8
+    shape = (1, heads, seq)
+
+    def norm(x):
+        return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+    query = norm(torch.randn(*shape, k_dim))
+    key = norm(torch.randn(*shape, k_dim))
+    value = torch.randn(*shape, v_dim)
+    g = -torch.rand(*shape)
+    beta = torch.rand(*shape)
+    state = torch.randn(1, heads, k_dim, v_dim) * 0.1
+
+    out, final = _recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    chunk_out, chunk_final = _chunked_gated_delta_rule(
+        query, key, value, g, beta, state
+    )
+
+    assert torch.allclose(out, chunk_out, atol=1e-5)
+    assert torch.allclose(final, chunk_final, atol=1e-5)
+
+
+def test_delta_rule_does_not_mutate_the_state_it_is_given():
+    """`ConvState.recurrent` is passed in directly and copied out afterwards;
+    writing through it would corrupt the cache mid-step."""
+    torch.manual_seed(0)
+    query, key, value = (torch.randn(1, 2, 5, 4) for _ in range(3))
+    g, beta = -torch.rand(1, 2, 5), torch.rand(1, 2, 5)
+    state = torch.randn(1, 2, 4, 4) * 0.1
+    original = state.clone()
+
+    _recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    assert torch.equal(state, original)
+    _chunked_gated_delta_rule(query, key, value, g, beta, state)
+    assert torch.equal(state, original)
 
 
 def test_gated_delta_net_writes_cache_buffers_in_place():

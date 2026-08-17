@@ -143,7 +143,6 @@ class _ScriptedModel:
         return torch.zeros(1, 1, 1)
 
     def sampler(self, logits, params, generator):
-        # The loop samples one token past the last one it yields; 0 stands in.
         return torch.tensor([[self.tokens.pop(0) if self.tokens else 0]])
 
 
@@ -195,10 +194,38 @@ def test_iter_generate_compiles_the_decode_step_but_not_the_prefill(monkeypatch)
     model = _ScriptedModel([7, 8, 9])
     assert _generate(model, max_new_tokens=3, compile=True) == [7, 8, 9]
     assert compiled == [(model, 1)]  # compiled once, after the prefill forward
-    assert model.forwards == 4  # one prefill, three decode steps
+    # One prefill and two decode steps for three tokens: prefill samples the
+    # first, so a step is only spent on a token that gets yielded.
+    assert model.forwards == 3
 
     assert _generate(_ScriptedModel([7, 8, 9]), max_new_tokens=3) == [7, 8, 9]
     assert len(compiled) == 1  # compile=False does not compile
+
+
+def test_first_token_is_yielded_before_the_decode_step_is_set_up(monkeypatch):
+    """Compiling and capturing serve the second token onwards.
+
+    The first token exists as soon as prefill has sampled it, so nothing below
+    it may run before the caller has it — that setup is ~13 ms of TTFT for a
+    token that is already computed.
+    """
+    compiled: list[object] = []
+    monkeypatch.setattr(
+        torch, "compile", lambda target, mode=None: compiled.append(target) or target
+    )
+
+    model = _ScriptedModel([7, 8, 9])
+    tokens = Qwen3_5ForConditionalGeneration.iter_generate(
+        cast(Qwen3_5ForConditionalGeneration, model),
+        torch.zeros(1, 3, dtype=torch.long),
+        SamplingParams(max_new_tokens=3),
+        compile=True,
+    )
+
+    assert next(tokens) == 7
+    assert compiled == []  # not yet: the caller already has its first token
+    assert next(tokens) == 8
+    assert compiled == [model]
 
 
 def test_autotune_picks_the_compile_mode_and_never_inductor_cudagraphs(monkeypatch):
@@ -236,4 +263,5 @@ def test_iter_generate_runs_each_phase_in_a_named_frame():
 
     frames = [event.name for event in prof.events()]
     assert sum(name.endswith(": _prefill") for name in frames) == 1
-    assert sum(name.endswith(": _decode_step") for name in frames) == 3
+    # Three tokens: prefill samples the first, decode steps the other two.
+    assert sum(name.endswith(": _decode_step") for name in frames) == 2
