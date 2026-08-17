@@ -28,10 +28,11 @@ to `float16`, with a warning, on pre-Ampere CUDA devices.
 ## CUDA graphs
 
 Decode is replayed from a captured CUDA graph by default, which removes the
-per-token kernel launch cost. Capture happens once per request, after prefill,
-and adds to time-to-first-token; `--no-cuda-graph` turns it off. The flag is
-ignored off CUDA, and `walnut profile` takes it with the same default, so a
-profile measures what a server runs.
+per-token kernel launch cost. Capture happens once per request, after prefill
+has already handed back the first token, so it falls between the first and
+second token rather than into time-to-first-token; `--no-cuda-graph` turns it
+off. The flag is ignored off CUDA, and `walnut profile` takes it with the same
+default, so a profile measures what a server runs.
 
 ```console
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-cuda-graph

@@ -713,6 +713,15 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
         next_token, tok = _prefill()
 
+        # Hand the first token over before setting decode up. Everything below
+        # this line serves the *second* token onwards, so holding the first one
+        # behind it only adds its cost to TTFT; the caller gets the token as
+        # soon as it exists and pays the setup while consuming it. A caller
+        # that stops here never pays it at all.
+        yield tok
+        if tok in stop_ids:
+            return
+
         # Compile after prefill, so the trace dynamo records is the decode
         # branch. Rebuilding the wrapper per request is a few milliseconds:
         # dynamo's own cache keys on the code object, not on this object.
@@ -731,11 +740,13 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         if cuda_graph and input_ids.device.type == "cuda":
             graph = DecodeGraph(decode_forward, cache, input_ids.device)
 
-        for step in range(params.max_new_tokens):
+        # The first token is already out, so this runs one step per *remaining*
+        # token and samples nothing it will not yield.
+        for step in range(params.max_new_tokens - 1):
+            next_token, tok = _decode_step(next_token, seq + step)
             yield tok
             if tok in stop_ids:
                 return
-            next_token, tok = _decode_step(next_token, seq + step)
 
     @torch.no_grad()
     def generate(
