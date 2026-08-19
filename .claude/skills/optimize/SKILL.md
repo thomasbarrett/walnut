@@ -79,7 +79,7 @@ prompt at one temperature is a weak correctness check, so re-run with a second
 
 Both runs have to have measured the same thing — same model, device, dtype,
 prompt, token count and flags — or the difference is not a result. Each table
-prints a `cv` column; a change wants to clear about twice it.
+prints a `std` column; a change wants to clear about twice it.
 
 Then capture a second trace and re-run the query that produced the diagnosis —
 the mechanism you named should be the one that moved.

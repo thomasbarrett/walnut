@@ -45,29 +45,6 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, rank - 1))]
 
 
-def cv(values: list[float]) -> str:
-    """Coefficient of variation — the standard deviation as a percentage of the
-    median. The dispersion figure a change has to clear before it is a result.
-
-    Relative rather than absolute so it reads directly against a percentage
-    change, and standard deviation rather than the widest deviation from the
-    median because the latter is an extreme-value statistic: it grows with
-    sample count and never settles, so two runs at different iteration counts
-    could not be read against each other. Measured on an RTX 5090, TTFT's
-    widest deviation went 1.9% -> 4.8% between 5 and 40 iterations while this
-    held at ~1.7%.
-
-    One standard deviation covers about two thirds of a normal sample, so a
-    change wants to clear roughly twice this before it means anything.
-    """
-    if len(values) < 2:
-        return ""
-    mid = statistics.median(values)
-    if not mid:
-        return ""
-    return f"{statistics.pstdev(values) / mid * 100:.1f}%"
-
-
 def resolves(q: float, n: int) -> bool:
     """Whether a nearest-rank percentile is distinguishable from the maximum.
 
@@ -77,15 +54,19 @@ def resolves(q: float, n: int) -> bool:
     return math.ceil(q / 100 * n) < n
 
 
-def summarize(
-    values: list[float], percentiles: list[float], repeats: bool = False
-) -> dict[str, Any]:
+def summarize(values: list[float], percentiles: list[float]) -> dict[str, Any]:
     """One metric's distribution, in ms.
 
-    ``repeats`` says the samples are independent measurements of the same
-    thing, which is the only case where `cv` means anything. Over a
-    within-request distribution it would describe the workload's variance, not
-    the measurement's; percentiles describe those.
+    `std` is the standard deviation, and what it means depends on what the
+    samples are. Over repeats of one measurement (`latency`, `startup`) it is
+    the noise floor a change has to clear — want about twice it. Over a
+    workload of differently-scheduled requests it describes the traffic, and
+    the percentiles are what to read.
+
+    Deliberately not the widest deviation from the median: that is an
+    extreme-value statistic, so it climbs with sample count and never settles,
+    and two runs at different iteration counts could not be read against each
+    other.
     """
     if not values:
         return {}
@@ -95,7 +76,6 @@ def summarize(
         "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
         "max": max(values),
         "samples": len(values),
-        "cv": cv(values) if repeats else "",
     }
     for q in percentiles:
         out[f"p{q:g}"] = percentile(values, q)

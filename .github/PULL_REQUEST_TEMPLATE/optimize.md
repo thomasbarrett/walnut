@@ -47,7 +47,7 @@ were taken at.
 
 Include every metric printed, not the flattering subset. If TTFT regressed
 while TPOT improved, that is the interesting part of the PR. Each table carries
-a `cv` column — quote a change only if it clears about twice it. -->
+a `std` column — quote a change only if it clears about twice it. -->
 
 ```
 uv run walnut bench latency <model> --label before -o before.json  # on main

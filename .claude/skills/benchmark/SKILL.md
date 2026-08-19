@@ -41,23 +41,30 @@ Every subcommand with a distribution prints the same shape — one row per
 metric, one column per statistic:
 
 ```
-                           mean      p50      p90      p99      max       cv        n
-TTFT (ms)                 19.46    19.72   19.87*   19.87*    19.87     2.2%        5
-TPOT (ms)                  1.61     1.61    1.63*    1.63*     1.63     1.1%        5
-ITL (ms)                   1.60     1.36     1.37    15.55    17.95        —      315
-E2EL (ms)                120.73   121.02  122.58*  122.58*   122.58     1.2%        5
+                           mean      p50      p90      p99      max      std        n
+TTFT (ms)                 19.52    19.82   19.93*   19.93*    19.93    0.422        5
+TPOT (ms)                  1.61     1.61    1.62*    1.62*     1.62    0.011        5
+ITL (ms)                   1.60     1.36     1.37    15.72    17.57    1.898      315
+E2EL (ms)                120.77   121.24  122.19*  122.19*   122.19    1.084        5
 * rank equals the sample count: this is the maximum, not a tail.
 ```
 
 **Read down a column, not across a row.** Whether the TTFT tail is blowing up
 while TPOT holds is the question that matters, and it is one glance down `p99`.
 
-**`cv`** is the standard deviation as a percentage of the median — the noise
-floor. It appears only where the samples are repeats of one measurement
-(`latency`, `startup`); on a workload of 200 differently-scheduled requests
-dispersion describes the traffic, not the measurement, and the column is
-dropped. **A change wants to clear roughly 2× `cv` before it means anything** —
-one standard deviation covers about two thirds of a sample.
+**`std`** is the standard deviation, in the row's own units, and what it means
+depends on what the samples are. On `latency` and `startup` they are repeats of
+one measurement, so it is the noise floor: **a change wants to clear about 2×
+`std` before it means anything**, since one standard deviation covers about two
+thirds of a sample. On `serve` the samples are 120 differently-scheduled
+requests, so it describes the traffic rather than the measurement, and the
+percentiles are what to read.
+
+It is a standard deviation and not the widest deviation from the median because
+the latter is an extreme-value statistic: it climbs with sample count and never
+settles. Measured here, max-deviation on TTFT went 1.9% → 4.8% between 5 and 40
+iterations while `std` held — so two runs at different `--num-iters` could not
+otherwise be read against each other.
 
 **`n`** is a column because it varies by row: ITL pools every gap of every
 request and reaches thousands where per-request metrics have hundreds. A p99
@@ -124,11 +131,11 @@ Request goodput (req/s):           13.19
 Goodput (% of requests):           100.0
 Output throughput (tok/s):       1688.65
 
-                           mean      p50      p90      p99      max        n
-TTFT (ms)                 27.56    24.17    41.35    56.01    62.34      120
-TPOT (ms)                  4.60     4.88     5.84     6.38     6.40      120
-ITL (ms)                   4.60     3.50     4.63    24.72    26.51    15240
-E2EL (ms)                611.68   646.64   766.07   840.74   852.78      120
+                           mean      p50      p90      p99      max      std        n
+TTFT (ms)                 26.33    23.13    40.59    49.05    53.08    7.340      120
+TPOT (ms)                  4.39     4.59     5.63     6.22     6.25    1.008      120
+ITL (ms)                   4.39     3.35     4.55    23.82    25.85    4.690    15240
+E2EL (ms)                584.22   609.20   744.71   819.21   830.95  129.925      120
 ```
 
 **Rate and concurrency are different knobs.** `--request-rate` is the traffic:
@@ -245,11 +252,11 @@ walnut bench startup Qwen/Qwen3.5-0.8B --num-iters 3
 ```
 
 ```
-                         median     mean       cv        n
-load weights (s)           1.63     1.63     2.4%        3
-prepare batch (s)          0.14     0.14     0.2%        3
-first request (s)          0.03     0.03     0.4%        3
-total (s)                  1.80     1.80     2.1%        3
+                         median     mean      std        n
+load weights (s)          1.587    1.603    0.023        3
+prepare batch (s)         0.144    0.144    0.000        3
+first request (s)         0.031    0.031    0.000        3
+total (s)                 1.763    1.778    0.023        3
 ```
 
 Three phases, paid at different times and fixed by different work. Each
@@ -261,15 +268,15 @@ being deferred into a request. `--no-first-request` drops that phase.
 
 ## Believing a delta
 
-**Read the `cv` column, and want ~2× it.** On a quiet RTX 5090 at default
-iteration counts, TTFT sits near 1.7% and TPOT near 0.5%, so a TPOT change
-under ~1% has not been shown. `cv` converges by about ten iterations — raise
-`--num-iters` if you need a tighter floor, and it will not drift for having
-done so.
+**Read the `std` column, and want ~2× it.** On a quiet RTX 5090 at default
+iteration counts `latency` gives TTFT std ≈ 0.4 ms on a ~19 ms median and TPOT
+std ≈ 0.011 ms on a ~1.6 ms median — so a TPOT change under ~0.02 ms, about 1%,
+has not been shown. It converges by about ten iterations: raise `--num-iters`
+for a tighter floor and it will not drift for having done so.
 
-`serve` prints no `cv`, because its samples are not repeats. There the floor is
-about 2% on medians and p99s at 120 requests, and under 0.1% on throughput.
-Fewer requests, wider tails.
+`serve`'s `std` is not a noise floor — its samples are 120 different requests.
+There the run-to-run floor is about 2% on medians and p99s at 120 requests, and
+under 0.1% on throughput. Fewer requests, wider tails.
 
 Two runs are only comparable if they measured the same thing — same model,
 device, dtype, prompt, token count and flags. Nothing enforces that; check it.
@@ -296,7 +303,7 @@ the mean misses this.
 
 ## Which number leads
 
-- **Decode kernels, fusion, graph contents** → `latency` TPOT, against its `cv`.
+- **Decode kernels, fusion, graph contents** → `latency` TPOT, against its `std`.
   ITL p99 tracks the mean there, so read `ITL max` for genuine spikes.
 - **Scheduler, batching, admission** → `serve` output tok/s *and* ITL p99. A
   change that raises throughput while widening the ITL tail traded away what

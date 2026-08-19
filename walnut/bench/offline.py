@@ -172,11 +172,9 @@ def run_latency(
         "itl": [gap for r in runs for gap in r["itl_ms"]],
         "e2el": [r["e2e_ms"] for r in runs],
     }
-    # One sample per iteration for everything but ITL, which pools every gap —
-    # a max-deviation over that would describe the workload, not the run.
-    metrics = {
-        k: summarize(v, quantiles, repeats=k != "itl") for k, v in samples.items()
-    }
+    # One sample per iteration for everything but ITL, which pools every gap of
+    # every iteration and so describes the workload rather than the run.
+    metrics = {k: summarize(v, quantiles) for k, v in samples.items()}
 
     record = {
         "mode": "latency",
@@ -385,13 +383,13 @@ def run_startup(
         one_startup(opts, first_request)
     runs = [one_startup(opts, first_request) for _ in range(num_iters)]
 
-    # Every phase is a repeat of the same measurement, so `cv` is populated and
-    # means what it means everywhere else: the floor a change has to clear.
+    # Every phase is a repeat of the same measurement, so its `std` is a noise
+    # floor rather than a description of a workload.
     phases = {}
     for phase in ("load_s", "prepare_s", "first_request_s", "total_s"):
         values = [v for r in runs if (v := r[phase]) is not None]
         if values:
-            phases[phase] = summarize(values, [], repeats=True)
+            phases[phase] = summarize(values, [])
 
     record = {
         "mode": "startup",

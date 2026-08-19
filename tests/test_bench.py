@@ -15,7 +15,7 @@ from typer.testing import CliRunner
 
 from walnut.bench import cli as bench_cli
 from walnut.bench.errors import BenchError
-from walnut.bench.metrics import SLO_METRICS, cv, percentile, summarize
+from walnut.bench.metrics import SLO_METRICS, percentile, summarize
 from walnut.bench.online import (
     RequestResult,
     ServeOptions,
@@ -54,52 +54,45 @@ def test_percentile_returns_a_value_that_was_actually_measured():
     assert percentile([], 99) == 0.0
 
 
-def test_summarize_carries_its_own_dispersion_across_repeats():
-    """`cv` travels in the record so no caller can print a value without the
+def test_summarize_carries_its_own_dispersion():
+    """`std` travels in the record so no caller can print a value without the
     dispersion it has to be read against."""
-    stats = summarize([10.0, 10.0, 12.0], [99.0], repeats=True)
+    stats = summarize([10.0, 10.0, 12.0], [99.0])
     assert stats["median"] == 10.0
-    assert stats["cv"] == "9.4%"
+    assert stats["std"] == pytest.approx(0.9428, abs=1e-4)
     assert stats["samples"] == 3
     # p99 of three samples is the maximum wearing a tail statistic's name.
     assert stats["p99_resolves"] is False
 
 
-def test_summarize_withholds_dispersion_from_a_within_run_distribution():
-    """Dispersion over pooled per-token gaps describes the workload's variance,
-    not the measurement's. Percentiles describe those."""
-    stats = summarize([1.4] * 500 + [17.0], [99.0])
-    assert stats["cv"] == ""
-
-
-def test_cv_does_not_grow_with_sample_count():
+def test_std_does_not_grow_with_sample_count():
     """Why dispersion is a standard deviation and not the widest deviation from
     the median.
 
     Max-deviation is an extreme-value statistic: more samples means more
     chances to stray, so it climbs without settling and two runs at different
-    --num-iters cannot be read against each other. `cv` converges. Averaged
-    over trials because a single draw of either is itself noisy.
+    --num-iters could not be read against each other. `std` converges.
+    Averaged over trials because a single draw of either is itself noisy.
     """
     import random
 
     def widest(values: list[float]) -> float:
         mid = statistics.median(values)
-        return max(abs(v - mid) for v in values) / mid * 100
+        return max(abs(v - mid) for v in values)
 
     rng = random.Random(0)
-    small_cv, large_cv, small_widest, large_widest = [], [], [], []
+    small_std, large_std, small_widest, large_widest = [], [], [], []
     for _ in range(40):
         small = [rng.gauss(100.0, 2.0) for _ in range(20)]
         large = [rng.gauss(100.0, 2.0) for _ in range(400)]
-        small_cv.append(float(cv(small).rstrip("%")))
-        large_cv.append(float(cv(large).rstrip("%")))
+        small_std.append(summarize(small, [])["std"])
+        large_std.append(summarize(large, [])["std"])
         small_widest.append(widest(small))
         large_widest.append(widest(large))
 
-    # 20x the samples moves cv by a few percent of itself...
-    assert statistics.fmean(large_cv) == pytest.approx(
-        statistics.fmean(small_cv), rel=0.15
+    # 20x the samples moves std by a few percent of itself...
+    assert statistics.fmean(large_std) == pytest.approx(
+        statistics.fmean(small_std), rel=0.15
     )
     # ...and max-deviation by a third, on the very same samples.
     assert statistics.fmean(large_widest) > statistics.fmean(small_widest) * 1.25

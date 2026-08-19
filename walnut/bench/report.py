@@ -57,14 +57,7 @@ def metrics_table(
     it *is* the maximum wearing a tail statistic's name.
     """
     present = [(key, label) for key, label in rows if metrics.get(key)]
-    # `cv` only means something for repeated measurements of one thing, so on a
-    # workload it is empty for every row. A column of em-dashes is not a column.
-    show_cv = any(metrics[key].get("cv") for key, _ in present)
-
-    columns = ["mean", *(f"p{q:g}" for q in percentiles), "max"]
-    if show_cv:
-        columns.append("cv")
-    columns.append("n")
+    columns = ["mean", *(f"p{q:g}" for q in percentiles), "max", "std", "n"]
     print(f"{'':<{LABEL}}" + "".join(f"{c:>{COL}}" for c in columns))
 
     marked = False
@@ -78,8 +71,7 @@ def metrics_table(
                 marked = True
             cells.append(cell)
         cells.append(f"{stats['max']:.2f}")
-        if show_cv:
-            cells.append(stats.get("cv") or "—")
+        cells.append(f"{stats['std']:.3f}")
         cells.append(str(stats["samples"]))
         print(f"{label:<{LABEL}}" + "".join(f"{c:>{COL}}" for c in cells))
 
@@ -91,7 +83,7 @@ def metrics_table(
 
 
 def report_serve(record: dict[str, Any]) -> None:
-    columns = len(record["percentiles"]) + 3
+    columns = len(record["percentiles"]) + 4
     rule("Serving Benchmark Result", columns)
     line("Successful requests:", record["completed"])
     if record["failed"]:
@@ -230,9 +222,8 @@ def report_sweep(rungs: list[dict[str, Any]], stopped: str) -> None:
 
 
 def report_latency(record: dict[str, Any]) -> None:
-    """The same table `serve` prints. Here the `cv` column is populated: these
-    samples are repeats of one measurement, so their dispersion is the noise
-    floor a change has to clear."""
+    """The same table `serve` prints. Here the samples are repeats of one
+    measurement, so `std` is the noise floor a change has to clear."""
     columns = len(record["percentiles"]) + 4
     rule("Latency Benchmark Result", columns)
     line(
@@ -319,7 +310,8 @@ def report_startup(record: dict[str, Any]) -> None:
 
     print()
     print(
-        f"{'':<{LABEL}}" + "".join(f"{c:>{COL}}" for c in ("median", "mean", "cv", "n"))
+        f"{'':<{LABEL}}"
+        + "".join(f"{c:>{COL}}" for c in ("median", "mean", "std", "n"))
     )
     for key, label in (
         ("load_s", "load weights (s)"),
@@ -331,9 +323,9 @@ def report_startup(record: dict[str, Any]) -> None:
         if not stats:
             continue
         cells = (
-            f"{stats['median']:.2f}",
-            f"{stats['mean']:.2f}",
-            stats.get("cv") or "—",
+            f"{stats['median']:.3f}",
+            f"{stats['mean']:.3f}",
+            f"{stats['std']:.3f}",
             str(stats["samples"]),
         )
         print(f"{label:<{LABEL}}" + "".join(f"{c:>{COL}}" for c in cells))
