@@ -88,7 +88,7 @@ testpaths = ["tests"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
-    "ruff>=0.15.21",
+    "ruff>=0.16.3",
     "ty>=0.0.71",
     # Reads traces in .claude/skills/analyze-trace; a developer tool, so it
     # stays out of the served image. Downloads trace_processor_shell on first
