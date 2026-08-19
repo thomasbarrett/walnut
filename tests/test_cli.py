@@ -1,4 +1,5 @@
 import click
+import torch
 import typer.main
 from typer.testing import CliRunner
 
@@ -20,26 +21,53 @@ def test_serve_help_lists_arguments():
         assert opt in out
 
 
-def test_serve_passes_cuda_graph_through(monkeypatch):
+def _pretend_cuda(monkeypatch):
+    """Stand in for a GPU, so a flag-plumbing test still runs on CI.
+
+    `serve` and `profile` resolve the device before loading, and walnut serves
+    on CUDA only; without this these tests would only pass on a machine with a
+    card, which is not what they are about.
+    """
+    monkeypatch.setattr("walnut.engine.resolve_device", lambda _: torch.device("cuda"))
+
+
+def test_serve_passes_the_speed_flags_through(monkeypatch):
     seen: dict[str, bool] = {}
+    _pretend_cuda(monkeypatch)
 
     class _Engine:
         model_id = "m"
         device = "cpu"
         dtype = "float32"
+        max_batch_size = 8
+        max_seq_len = 8192
 
-    def fake_load_model(model, device=None, dtype=None, cuda_graph=True):
-        seen["cuda_graph"] = cuda_graph
+        def start(self):
+            pass
+
+    def fake_load_model(
+        model,
+        device=None,
+        dtype=None,
+        cuda_graph=True,
+        compile=True,
+        autotune=True,
+        **kwargs,
+    ):
+        seen.update(cuda_graph=cuda_graph, compile=compile, autotune=autotune)
         return _Engine()
 
     monkeypatch.setattr("walnut.engine.load_model", fake_load_model)
     monkeypatch.setattr("walnut.server.serve", lambda *args, **kwargs: None)
 
     assert runner.invoke(app, ["serve", "m"]).exit_code == 0
-    assert seen["cuda_graph"] is True
+    assert seen == {"cuda_graph": True, "compile": True, "autotune": True}
 
-    assert runner.invoke(app, ["serve", "m", "--no-cuda-graph"]).exit_code == 0
-    assert seen["cuda_graph"] is False
+    invoked = runner.invoke(
+        app, ["serve", "m", "--no-cuda-graph", "--no-compile", "--no-autotune"]
+    )
+    assert invoked.exit_code == 0
+    assert seen == {"cuda_graph": False, "compile": False, "autotune": False}
 
 
 def _params(command: str) -> dict[str, click.Parameter]:
@@ -54,7 +82,17 @@ def test_model_loading_options_match_between_serve_and_profile():
     serve_params = _params("serve")
     profile_params = _params("profile")
 
-    for name in ("model", "device", "dtype", "cuda_graph"):
+    # `max_batch_size` is deliberately absent: see
+    # `test_profile_defaults_to_one_sequence_so_it_traces_one`.
+    for name in (
+        "model",
+        "device",
+        "dtype",
+        "cuda_graph",
+        "compile",
+        "autotune",
+        "max_seq_len",
+    ):
         mine, theirs = serve_params[name], profile_params[name]
         assert mine.opts == theirs.opts, name
         assert mine.default == theirs.default, name
@@ -62,20 +100,46 @@ def test_model_loading_options_match_between_serve_and_profile():
         assert getattr(mine, "help", None) == getattr(theirs, "help", None), name
 
 
-def test_profile_passes_cuda_graph_through(monkeypatch):
-    seen: dict[str, bool] = {}
+def test_profile_defaults_to_greedy_so_it_matches_the_benchmark():
+    """The benchmark samples greedily; a profile at another temperature would
+    trace the sampler's softmax, which the benchmarked path never runs."""
+    temperature = _params("profile")["temperature"]
+    assert temperature.default == 0.0
 
-    def fake_load_model(model, device=None, dtype=None, cuda_graph=True):
-        seen["cuda_graph"] = cuda_graph
+
+def test_profile_defaults_to_one_sequence_so_it_traces_one():
+    """A profile traces a single generation. Serving's default batch would
+    preallocate slots nothing fills and capture a graph per bucket, and the
+    decode step in the trace would be mostly padding rows."""
+    assert _params("profile")["max_batch_size"].default == 1
+    assert _params("serve")["max_batch_size"].default == 8
+
+
+def test_profile_passes_the_speed_flags_through(monkeypatch):
+    seen: dict[str, bool] = {}
+    _pretend_cuda(monkeypatch)
+
+    def fake_load_model(
+        model,
+        device=None,
+        dtype=None,
+        cuda_graph=True,
+        compile=True,
+        autotune=True,
+        **kwargs,
+    ):
+        seen.update(cuda_graph=cuda_graph, compile=compile, autotune=autotune)
         raise RuntimeError("stop before the profiled run")
 
     monkeypatch.setattr("walnut.engine.load_model", fake_load_model)
 
     runner.invoke(app, ["profile", "m"])
-    assert seen["cuda_graph"] is True
+    assert seen == {"cuda_graph": True, "compile": True, "autotune": True}
 
-    runner.invoke(app, ["profile", "m", "--no-cuda-graph"])
-    assert seen["cuda_graph"] is False
+    runner.invoke(
+        app, ["profile", "m", "--no-cuda-graph", "--no-compile", "--no-autotune"]
+    )
+    assert seen == {"cuda_graph": False, "compile": False, "autotune": False}
 
 
 def test_chat_help_lists_options():

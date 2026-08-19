@@ -18,6 +18,7 @@ from torch import nn
 from walnut.graph import DecodeGraph
 from walnut.layers import (
     Attention,
+    FusedLinear,
     GatedDeltaNet,
     RMSNorm,
     RotaryEmbedding,
@@ -35,24 +36,33 @@ from walnut.sampler import Sampler, SamplingParams
 
 
 class Qwen3_5MLP(nn.Module):
-    """SwiGLU feed-forward: ``down(silu(gate(x)) * up(x))``."""
+    """SwiGLU feed-forward: ``down(silu(gate(x)) * up(x))``.
+
+    ``gate`` and ``up`` read the same input, so they are held as one
+    `FusedLinear` — one gemv instead of two, which at decode's batch of 1 is
+    the difference between one memory-bound kernel and two.
+    """
 
     def __init__(self, config: Any) -> None:
         super().__init__()
         hidden, inter = config.hidden_size, config.intermediate_size
-        self.gate_proj = nn.Linear(hidden, inter, bias=False)
-        self.up_proj = nn.Linear(hidden, inter, bias=False)
+        self.gate_up_proj = FusedLinear(hidden, {"gate_proj": inter, "up_proj": inter})
         self.down_proj = nn.Linear(inter, hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_up_proj(x)
+        return self.down_proj(F.silu(gate) * up)
 
 
 class Qwen3_5Attention(nn.Module):
     """Full grouped-query self-attention with QK-norm and output gating.
 
-    When ``attn_output_gate`` is set, ``q_proj`` is doubled: half is the query,
-    half is a sigmoid gate applied to the attention output before ``o_proj``.
+    When ``attn_output_gate`` is set, the query half of ``qkv_proj`` is doubled:
+    half is the query, half is a sigmoid gate applied to the attention output
+    before ``o_proj``.
+
+    Q, K and V read the same input and are held as one `FusedLinear`, split
+    after.
     """
 
     def __init__(self, config: Any, layer_idx: int) -> None:
@@ -66,9 +76,11 @@ class Qwen3_5Attention(nn.Module):
 
         q_out = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
         kv_out = self.num_kv_heads * self.head_dim
-        self.q_proj = nn.Linear(config.hidden_size, q_out, bias=bias)
-        self.k_proj = nn.Linear(config.hidden_size, kv_out, bias=bias)
-        self.v_proj = nn.Linear(config.hidden_size, kv_out, bias=bias)
+        self.qkv_proj = FusedLinear(
+            config.hidden_size,
+            {"q_proj": q_out, "k_proj": kv_out, "v_proj": kv_out},
+            bias=bias,
+        )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, config.hidden_size, bias=False
         )
@@ -91,21 +103,23 @@ class Qwen3_5Attention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cache: KVCache | None = None,
-        input_pos: torch.Tensor | None = None,
+        cache: KVCache,
+        input_pos: torch.Tensor,
     ) -> torch.Tensor:
         bsz, seq, _ = x.shape
+
+        q, k, v = self.qkv_proj(x)
 
         gate = None
         if self.output_gate:
             # Reshape to (B, S, heads, 2*D) first, so query/gate split per head.
-            q = self.q_proj(x).view(bsz, seq, self.num_heads, 2 * self.head_dim)
+            q = q.reshape(bsz, seq, self.num_heads, 2 * self.head_dim)
             q, gate = q.chunk(2, dim=-1)
             gate = gate.reshape(bsz, seq, -1)
         else:
-            q = self.q_proj(x).view(bsz, seq, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(bsz, seq, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(bsz, seq, self.num_kv_heads, self.head_dim)
+            q = q.reshape(bsz, seq, self.num_heads, self.head_dim)
+        k = k.reshape(bsz, seq, self.num_kv_heads, self.head_dim)
+        v = v.reshape(bsz, seq, self.num_kv_heads, self.head_dim)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -159,8 +173,8 @@ class Qwen3_5DecoderLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cache: Cache | None = None,
-        input_pos: torch.Tensor | None = None,
+        cache: Cache,
+        input_pos: torch.Tensor,
     ) -> torch.Tensor:
         normed = self.input_layernorm(x)
         if self.block_type == "full_attention":
@@ -216,7 +230,8 @@ class Qwen3_5TextModel(nn.Module):
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        cache: list[Cache] | None = None,
+        *,
+        cache: list[Cache],
     ) -> torch.Tensor:
         if inputs_embeds is None:
             assert input_ids is not None
@@ -231,7 +246,7 @@ class Qwen3_5TextModel(nn.Module):
                 h,
                 cos,
                 sin,
-                cache[i] if cache is not None else None,
+                cache[i],
                 input_pos=positions,
             )
         return self.norm(h)
@@ -564,7 +579,8 @@ class Qwen3_5Model(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        cache: list[Cache] | None = None,
+        *,
+        cache: list[Cache],
     ) -> torch.Tensor:
         if pixel_values is None:
             return self.language_model(input_ids, positions, cache=cache)
@@ -612,7 +628,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        cache: list[Cache] | None = None,
+        *,
+        cache: list[Cache],
     ) -> torch.Tensor:
         hidden = self.model(
             input_ids,
@@ -620,9 +637,22 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             pixel_values,
             image_grid_thw,
             mm_token_type_ids,
-            cache,
+            cache=cache,
         )
         return self.lm_head(hidden)
+
+    def make_cache(self, max_batch_size: int, max_seq_len: int) -> list[Cache]:
+        """A decode-state pool: ``max_batch_size`` slots of ``max_seq_len``.
+
+        What `walnut.scheduler.Scheduler` batches over; `iter_generate` builds
+        its own single-slot cache sized to the one request it serves.
+        """
+        return self.model.language_model.make_cache(
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            dtype=self.lm_head.weight.dtype,
+            device=self.lm_head.weight.device,
+        )
 
     @torch.no_grad()
     def iter_generate(
@@ -630,6 +660,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         params: SamplingParams | None = None,
         cuda_graph: bool = True,
+        compile: bool = True,
+        autotune: bool = True,
     ) -> Iterator[int]:
         """Yield generated token ids (text-only, batch 1), one per step.
 
@@ -639,6 +671,21 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         ``cuda_graph`` captures the decode step and replays it, trading a
         one-off capture for the per-step kernel launch cost (see `DecodeGraph`).
         It has no effect off CUDA.
+
+        ``compile`` runs the decode step through `torch.compile`, which fuses
+        the elementwise chains the norms and the delta-rule recurrence would
+        otherwise spend a kernel apiece on. Prefill stays eager on purpose: its
+        shapes follow the prompt, so compiling it recompiles per prompt length,
+        while decode's are fixed and one compile serves every request.
+
+        ``autotune`` lets Inductor benchmark a Triton template against cuBLAS
+        for each projection instead of taking cuBLAS on faith. Decode's matmuls
+        are matrix-*vector* products, a shape cuBLAS's `gemv` serves at 48-57%
+        of this GPU's bandwidth where a Triton kernel reaches ~70%; picking per
+        shape is worth ~11% of TPOT. Autotuning runs at compile time and its
+        results land in the same on-disk cache as the compiled graph, so the
+        cost is one cold compile per build, not one per process. Ignored
+        without ``compile``.
         """
         params = params or SamplingParams()
         stop_ids = set(params.stop_token_ids)
@@ -656,6 +703,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             device=input_ids.device,
         )
         positions = torch.arange(seq, device=input_ids.device)
+        # Decode positions carry a batch dim even at batch 1: the cache writes
+        # and the attention mask read one position per row, and a fixed buffer
+        # is what the captured graph copies into.
+        decode_pos = torch.zeros(1, 1, dtype=torch.long, device=input_ids.device)
 
         # Separate functions so a profile can name the phases; inlining either
         # back into the loop leaves a trace that cannot be read per phase.
@@ -672,27 +723,50 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             token: torch.Tensor, position: int
         ) -> tuple[torch.Tensor, int]:
             """Advance one token: replay or forward, then sample."""
+            decode_pos.fill_(position)
             if graph is not None:
-                logits = graph.replay(token, position)
+                logits = graph.replay(token, decode_pos)
             else:
-                pos = torch.tensor([position], device=input_ids.device)
-                logits = self(token, positions=pos, cache=cache)
+                logits = decode_forward(token, positions=decode_pos, cache=cache)
             next_token = self.sampler(logits[:, -1], params, gen)
             return next_token, int(next_token.item())
 
         next_token, tok = _prefill()
 
+        # Hand the first token over before setting decode up. Everything below
+        # this line serves the *second* token onwards, so holding the first one
+        # behind it only adds its cost to TTFT; the caller gets the token as
+        # soon as it exists and pays the setup while consuming it. A caller
+        # that stops here never pays it at all.
+        yield tok
+        if tok in stop_ids:
+            return
+
+        # Compile after prefill, so the trace dynamo records is the decode
+        # branch. Rebuilding the wrapper per request is a few milliseconds:
+        # dynamo's own cache keys on the code object, not on this object.
+        #
+        # The autotuning mode is the "-no-cudagraphs" one because `DecodeGraph`
+        # captures the step itself; letting Inductor also apply cudagraphs
+        # would have it capture a region this code then captures again.
+        decode_forward: Any = self
+        if compile:
+            mode = "max-autotune-no-cudagraphs" if autotune else None
+            decode_forward = torch.compile(self, mode=mode)
+
         # Capture after prefill: the decode branch only exists once the caches
         # hold state, and capture records whichever branch it runs.
         graph = None
         if cuda_graph and input_ids.device.type == "cuda":
-            graph = DecodeGraph(self, cache, input_ids.device)
+            graph = DecodeGraph(decode_forward, cache, input_ids.device)
 
-        for step in range(params.max_new_tokens):
+        # The first token is already out, so this runs one step per *remaining*
+        # token and samples nothing it will not yield.
+        for step in range(params.max_new_tokens - 1):
+            next_token, tok = _decode_step(next_token, seq + step)
             yield tok
             if tok in stop_ids:
                 return
-            next_token, tok = _decode_step(next_token, seq + step)
 
     @torch.no_grad()
     def generate(
@@ -712,5 +786,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
         ``mtp`` is the multi-token prediction head, used for speculative
         decoding; walnut has no module for it, so those tensors are skipped.
+        The model's `FusedLinear` layers each hold several of the checkpoint's
+        projections; `copy_weights` finds them and concatenates their parts, so
+        the checkpoint loads unmodified.
         """
         copy_weights(self, weights, skip_prefixes=("mtp.",))

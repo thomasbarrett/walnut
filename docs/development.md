@@ -22,9 +22,15 @@ uv run ty check        # type check
 uv run pytest          # run tests
 ```
 
-`ruff` and `ty` are CI gates — run them (or `prek`) before declaring work
-done. `pyproject.toml` is the source of truth for dependencies and the
-ruff/ty/pytest settings.
+Or everything CI runs, in one command — the same hooks as [Git
+hooks](#git-hooks), so there is one definition and not a list to keep in step:
+
+```bash
+uvx prek run --all-files --stage pre-push
+```
+
+`pyproject.toml` is the source of truth for dependencies and the ruff/ty/pytest
+settings.
 
 ## Analyzing profiles
 
@@ -50,8 +56,23 @@ Local hooks are managed with [prek](https://prek.j178.dev) (a drop-in
 `pre-commit` replacement) and mirror the CI checks:
 
 ```bash
-prek install           # enable the hook (once per clone)
-prek run --all-files   # ruff, ty, hadolint, and helm lint
+prek install --hook-type pre-commit --hook-type pre-push   # once per clone
+prek run --all-files                  # the fast hooks: ruff, ty, hadolint, helm lint
+prek run --all-files --stage pre-push # those plus pytest, docs, helm template
+```
+
+The whole-repo hooks (`pytest`, `mkdocs build --strict`, `helm template`) are
+tagged `pre-push` so committing stays instant. `--stage pre-push` runs every
+hook, not just those three.
+
+`uvx prek run …` fetches `prek` on demand, so nothing needs installing — except
+for `install` itself, whose git hook calls `prek` by name. The `hadolint`,
+`helm-lint` and `helm-template` hooks shell out to system binaries either way,
+and fail rather than skip when those are missing:
+
+```bash
+uvx prek run --all-files --stage pre-push \
+    --skip hadolint --skip helm-lint --skip helm-template
 ```
 
 ## Docs

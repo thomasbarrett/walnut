@@ -23,7 +23,7 @@ that query the result.
 ## [Chapter 2 — Capture and the Analysis Kernel](chapter-2-capture-and-view-layer.md)
 
 Producing a trace worth trusting — warm-up, flushing before the window closes,
-and what each capture flag costs — then the five-view SQL layer that every
+and what each capture flag costs — then the seven-view SQL layer that every
 later query is written against. That layer ships as
 [`scripts/prelude.sql`](../scripts/prelude.sql); run it against the trace
 first, or the queries fail with `no such table`. The preflight in §2.3 catches
@@ -37,7 +37,8 @@ answers.
 ## [Chapter 3 — The Performance Model and Bottleneck Triage](chapter-3-performance-model-and-triage.md)
 
 The diagnostic core. Prefill and decode as separate workloads with separate
-limits, per-token latency budgets, and a three-test procedure in §3.3 that
+limits, per-token latency budgets, and a graph check plus three-test procedure
+in §3.3 that
 tells you which bottleneck you have before you try to fix one. §3.4 attributes
 each GPU idle gap to the host work that caused it.
 
@@ -74,14 +75,13 @@ occupancy and wave quantization.
 ## [Chapter 6 — Practice](chapter-6-practice.md)
 
 Putting it together: a diagnosis carried end to end, inter-token latency
-percentiles and what explains the outliers, comparing two traces, wiring the
-queries into CI, and the twelve mistakes in §6.5 that invalidate a result.
+percentiles and what explains the outliers, comparing two traces, and the
+twelve mistakes in §6.4 that invalidate a result.
 
 - 6.1 Worked case study: 485 → 2457 tok/s
 - 6.2 Tail latency and outlier tokens
 - 6.3 A/B trace comparison
-- 6.4 Automation and CI
-- 6.5 Twelve traps
+- 6.4 Twelve traps
 
 ## Sources
 

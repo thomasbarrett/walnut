@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from walnut.layers.cache import Cache
+from walnut.layers.linear import FusedLinear
+
+#: Positions per chunk in `_chunked_gated_delta_rule`. The chunk's cost is
+#: quadratic in this and the number of sequential steps is inversely
+#: proportional to it, so the balance depends on which side the loop is bound
+#: by. It is bound by the host: a chunk's matmuls are far too small to fill the
+#: GPU, so a prefill costs what it costs to *issue* one chunk times the number
+#: of chunks, and prefill time is close to linear in that count. 256 is where
+#: measurement puts the turn — a 1024-token prompt takes 91 ms at 64 and 35 ms
+#: at 256 — and going further only wins for a prompt no longer than one chunk.
+#: The quadratic term stays affordable at this width, and the reassociation
+#: costs nothing in accuracy: against the recurrent form, a 1024-position run
+#: is 4e-7 relative at this chunk size, three orders inside bfloat16's own
+#: resolution. Decode does not come through here at all — a single position
+#: takes `_recurrent_gated_delta_rule`.
+_CHUNK = 256
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -46,6 +64,33 @@ class ConvState(Cache):
         )
         self.primed = False
 
+    @classmethod
+    def _view(
+        cls, conv: torch.Tensor, recurrent: torch.Tensor, primed: bool
+    ) -> ConvState:
+        state = cls.__new__(cls)
+        state.conv, state.recurrent = conv, recurrent
+        state.primed = primed
+        return state
+
+    def view(self, start: int, stop: int) -> ConvState:
+        """A view inherits ``primed``: it names the same buffers, so a view that
+        called itself empty would take the prefill branch over state the
+        sequence had already built and silently start it over.
+        """
+        return ConvState._view(
+            self.conv[start:stop], self.recurrent[start:stop], self.primed
+        )
+
+    def reset(self, index: int) -> None:
+        """Zero a slot. Zeroed state is what "no context yet" means here, so a
+        reset slot decodes as a fresh sequence without unpriming the pool."""
+        self.conv[index].zero_()
+        self.recurrent[index].zero_()
+
+    def prime(self) -> None:
+        self.primed = True
+
     @property
     def empty(self) -> bool:
         """True until a forward pass has written state into the buffers."""
@@ -58,32 +103,18 @@ def _recurrent_gated_delta_rule(
     value: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    initial_state: torch.Tensor | None = None,
+    state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Recurrent gated delta rule with q/k L2-norm; returns (out, final_state).
+    """The delta rule stepped one position at a time; returns (out, state).
 
-    q/k/v are (B, S, heads, dim); g/beta are (B, S, heads). Runs from
-    initial_state (zeros if None).
+    Inputs are the normalized (B, heads, S, dim) float32 tensors `_gated_delta_rule`
+    prepares. Every step depends on the one before, so this costs S rounds of
+    host-side dispatch: it is the decode path, where S is 1 and the whole body
+    is captured into `DecodeGraph`. `_chunked_gated_delta_rule` covers prefill.
     """
-    initial_dtype = query.dtype
-    query = _l2norm(query)
-    key = _l2norm(key)
-    query, key, value, beta, g = (
-        x.transpose(1, 2).contiguous().to(torch.float32)
-        for x in (query, key, value, beta, g)
-    )
-
-    batch, heads, seq, k_dim = key.shape
+    batch, heads, seq, _ = key.shape
     v_dim = value.shape[-1]
-    query = query * (1 / (query.shape[-1] ** 0.5))
-
     out = torch.zeros(batch, heads, seq, v_dim, dtype=value.dtype, device=value.device)
-    if initial_state is None:
-        state = torch.zeros(
-            batch, heads, k_dim, v_dim, dtype=value.dtype, device=value.device
-        )
-    else:
-        state = initial_state
     for i in range(seq):
         q_t = query[:, :, i]
         k_t = key[:, :, i]
@@ -97,6 +128,117 @@ def _recurrent_gated_delta_rule(
         state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
         out[:, :, i] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
 
+    return out, state
+
+
+@functools.lru_cache(maxsize=8)
+def _causal_masks(
+    length: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(eye, j <= t, j < t)`` for a chunk, built once per length and device."""
+    ones = torch.ones(length, length, dtype=torch.bool, device=device)
+    eye = torch.eye(length, dtype=torch.float32, device=device)
+    return eye, ones.tril(), ones.tril(-1)
+
+
+def _chunked_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The delta rule over `_CHUNK` positions at a time; returns (out, state).
+
+    Same inputs and outputs as `_recurrent_gated_delta_rule`, and the same
+    arithmetic reassociated so a chunk costs a fixed handful of matmuls instead
+    of one dispatch round per position. That is what prefill needs: the loop
+    body is far too small to keep the GPU busy, so S sequential rounds are paid
+    almost entirely in host-side dispatch.
+
+    Writing the step's rank-1 update as ``S_t = a_t S_{t-1} + k_t u_t^T`` makes
+    the state linear in ``u``, so with ``c_t = sum_{j<=t} g_j`` a whole chunk
+    closes in one solve::
+
+        u_t = b_t [ v_t - e^{c_t} S_0^T k_t - sum_{j<t} e^{c_t-c_j}(k_t.k_j) u_j ]
+        o_t = e^{c_t} S_0^T q_t + sum_{j<=t} e^{c_t-c_j} (q_t.k_j) u_j
+        S_C = e^{c_C} S_0 + sum_j e^{c_C-c_j} k_j u_j^T
+
+    The ``u`` system is unit lower triangular, hence exactly solvable. Keys are
+    L2-normalized and ``g <= 0``, so every coefficient is bounded by 1 and the
+    solve stays well conditioned however long the chunk runs.
+    """
+    outs = []
+    for start in range(0, key.shape[-2], _CHUNK):
+        window = slice(start, start + _CHUNK)
+        q, k, v = query[:, :, window], key[:, :, window], value[:, :, window]
+        eye, causal, strict = _causal_masks(k.shape[-2], k.device)
+
+        c = g[:, :, window].cumsum(-1)
+        # Masking before the exp zeroes the masked entries for free.
+        logit = c.unsqueeze(-1) - c.unsqueeze(-2)
+        gain = c.exp().unsqueeze(-1)
+        b = beta[:, :, window].unsqueeze(-1)
+
+        coupling = (k @ k.transpose(-1, -2)) * logit.masked_fill(
+            ~strict, -torch.inf
+        ).exp()
+        rhs = b * (v - gain * (k @ state))
+        u = torch.linalg.solve_triangular(
+            eye + b * coupling, rhs, upper=False, unitriangular=True
+        )
+
+        weight = (q @ k.transpose(-1, -2)) * logit.masked_fill(
+            ~causal, -torch.inf
+        ).exp()
+        outs.append(gain * (q @ state) + weight @ u)
+
+        tail = (c[..., -1:] - c).exp().unsqueeze(-1)
+        state = gain[..., -1:, :] * state + k.transpose(-1, -2) @ (tail * u)
+
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=-2), state
+
+
+def _gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gated delta rule with q/k L2-norm; returns (out, final_state).
+
+    q/k/v are (B, S, heads, dim); g/beta are (B, S, heads). Runs from
+    initial_state (zeros if None). A single position takes the recurrent form,
+    which is what `DecodeGraph` captures; a prompt takes the chunked one.
+    """
+    initial_dtype = query.dtype
+    query = _l2norm(query)
+    key = _l2norm(key)
+    query, key, value, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    )
+
+    batch, heads, seq, k_dim = key.shape
+    query = query * (1 / (k_dim**0.5))
+
+    if initial_state is None:
+        state = torch.zeros(
+            batch,
+            heads,
+            k_dim,
+            value.shape[-1],
+            dtype=value.dtype,
+            device=value.device,
+        )
+    else:
+        state = initial_state
+
+    rule = _recurrent_gated_delta_rule if seq == 1 else _chunked_gated_delta_rule
+    out, state = rule(query, key, value, g, beta, state)
     return out.transpose(1, 2).contiguous().to(initial_dtype), state
 
 
@@ -155,10 +297,19 @@ class GatedDeltaNet(nn.Module):
         self.norm = _RMSNormGated(value_head_dim, eps)
         self.out_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
-        self.in_proj_qkv = nn.Linear(hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(hidden_size, num_value_heads, bias=False)
-        self.in_proj_a = nn.Linear(hidden_size, num_value_heads, bias=False)
+        # All four in-projections read the same hidden state, so they are held
+        # as one gemv and split after. ``in_proj_b``/``in_proj_a`` produce 16
+        # values each: as their own kernels they cost the launch floor rather
+        # than the 32 KB they read.
+        self.in_proj = FusedLinear(
+            hidden_size,
+            {
+                "in_proj_qkv": self.conv_dim,
+                "in_proj_z": self.value_dim,
+                "in_proj_b": num_value_heads,
+                "in_proj_a": num_value_heads,
+            },
+        )
 
     def make_cache(
         self,
@@ -186,10 +337,9 @@ class GatedDeltaNet(nn.Module):
         batch, seq, _ = hidden_states.shape
         pad = self.conv_kernel_size - 1
 
-        qkv_pre = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch, seq, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        qkv_pre, z, b, a = self.in_proj(hidden_states)
+        qkv_pre = qkv_pre.transpose(1, 2)
+        z = z.reshape(batch, seq, -1, self.head_v_dim)
 
         decoding = cache is not None and not cache.empty
         if decoding:
@@ -224,7 +374,7 @@ class GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(rep, dim=2)
 
         init = cache.recurrent if decoding else None
-        core, state = _recurrent_gated_delta_rule(query, key, value, g, beta, init)
+        core, state = _gated_delta_rule(query, key, value, g, beta, init)
         if cache is not None:
             cache.recurrent.copy_(state)
             cache.primed = True

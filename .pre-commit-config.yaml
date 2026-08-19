@@ -40,3 +40,36 @@ repos:
         language: system
         files: ^charts/walnut/
         pass_filenames: false
+
+      # Whole-repo checks, held at `pre-push` so committing stays instant.
+      # `prek run --all-files --stage pre-push` runs these *and* everything
+      # above — the one command that mirrors CI.
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: mkdocs-build
+        name: mkdocs build --strict
+        # `--group docs`: those deps are their own group. No `files:`
+        # filter, since the build reads docstrings out of `walnut/`.
+        entry: uv run --group docs mkdocs build --strict
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: helm-template
+        name: helm template
+        # Rendering catches what `lint` does not. No redirect needed: prek
+        # only shows a hook's output when it fails.
+        entry: >-
+          helm template rel charts/walnut
+          --values charts/walnut/ci/lint-values.yaml
+        language: system
+        files: ^charts/walnut/
+        pass_filenames: false
+        stages: [pre-push]

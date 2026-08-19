@@ -75,12 +75,13 @@ select = [
 ]
 
 [tool.ty.environment]
-# The trace-analysis script sits with its skill, not on the default path.
+# The trace-analysis scripts sit with their skill, not on the default path.
+# The benchmark harness is not here: it is `walnut.bench`, a package command.
 extra-paths = [".claude/skills/analyze-trace/scripts"]
 
 [tool.pytest.ini_options]
-# The trace-analysis script lives with the skill that documents it, not in the
-# walnut package; it is still covered by tests.
+# The trace-analysis scripts live with the skill that documents them, not in
+# the walnut package; they are still covered by tests.
 pythonpath = [".", ".claude/skills/analyze-trace/scripts"]
 testpaths = ["tests"]
 

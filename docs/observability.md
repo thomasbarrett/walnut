@@ -106,7 +106,8 @@ Two values walnut had to choose:
   also omits the `usage` block from chat completion responses.
 - **Content capture** — prompts and completions as events. Opt-in, high volume,
   and a privacy decision.
-- **Queue depth** — walnut serves one request at a time.
+- **Queue depth** — the scheduler knows how many requests are waiting for a
+  slot and how many are running, but does not export either yet.
 - **`gen_ai.client.*`** — those belong to clients calling walnut.
 
 !!! warning "Stability"
@@ -173,9 +174,11 @@ trace:   profiles/walnut-20260815-182128-392836.trace.json.gz
 summary: profiles/walnut-20260815-182128-392836.summary.txt
 ```
 
-CUDA graphs are on by default here, as everywhere else: replaying decode from a
-captured graph drops the per-token launch cost, so that is the configuration
-worth measuring. `--no-cuda-graph` turns it off.
+CUDA graphs, `torch.compile` and its autotuning are on by default here, as
+everywhere else: replaying an autotuned, compiled decode step from a captured
+graph is the configuration worth measuring. `--no-cuda-graph`, `--no-compile`
+and `--no-autotune` turn them off. The warm-up pass absorbs the compile and the
+autotuning, so neither lands inside the profiled window.
 
 ### On a running server
 

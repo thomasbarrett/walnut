@@ -57,30 +57,18 @@ The `cpu_launch_us` column is the punchline: for `native_layer_norm`, `copy_`, a
 
 ### 5.1.3 Kernel name normalization
 
-For grouping across shapes and template parameters, strip the parameters:
+Kernel names carry shapes and template parameters. `kfam` — defined in
+[`scripts/prelude.sql`](../scripts/prelude.sql) — strips them down to a
+`family` column (`gemv`, `gemm`, `attention`, `norm`, `elementwise`, `reduce`,
+`collective`, `triton`, `other`), so:
 
 ```sql
-CREATE PERFETTO VIEW kfam AS
-SELECT *,
-  CASE
-    WHEN kname GLOB '*gemv*'                      THEN 'gemv'
-    WHEN kname GLOB '*gemm*' OR kname GLOB '*cutlass*' THEN 'gemm'
-    WHEN kname GLOB '*flash*' OR kname GLOB '*fmha*'   THEN 'attention'
-    WHEN kname GLOB '*layer_norm*' OR kname GLOB '*rms_norm*' THEN 'norm'
-    WHEN kname GLOB '*elementwise*'               THEN 'elementwise'
-    WHEN kname GLOB '*reduce*'                    THEN 'reduce'
-    WHEN kname GLOB '*nccl*' OR kname GLOB '*ncclDevKernel*' THEN 'collective'
-    WHEN kname GLOB '*triton*'                    THEN 'triton'
-    ELSE 'other'
-  END AS family
-FROM link;
-
 SELECT ph, family, COUNT(*) n, SUM(gdur)/1e3 us,
        SUM(gdur)*100.0/SUM(SUM(gdur)) OVER (PARTITION BY ph) AS pct
 FROM kfam GROUP BY 1,2 ORDER BY ph, us DESC;
 ```
 
-(This view is already defined in the prelude, [`scripts/prelude.sql`](../scripts/prelude.sql); it is repeated here for reference.) This is the view to put in a dashboard: it is stable across PyTorch versions and immediately shows a shift in the compute mix (e.g. `gemm` → `triton` after enabling `torch.compile`).
+This is the rollup to put in a dashboard: it is stable across PyTorch versions and immediately shows a shift in the compute mix (e.g. `gemm` → `triton` after enabling `torch.compile`).
 
 ### 5.1.4 The tiny-kernel census
 
@@ -123,7 +111,46 @@ lhs        rhs           n
 
 The `M = 1` rows are the entire decode story. At `M = 1` there is no data reuse across rows: every weight element is read once and used once, arithmetic intensity is ~1 FLOP/byte, and no tensor core can help. cuBLAS dispatches `gemvx` rather than a tensor-op GEMM, which is why the prefill kernels are `cutlass_80_tensorop_f16_s16816gemm` and the decode kernels are not.
 
-**The actionable consequence:** decode throughput is bounded by `model_bytes / HBM_bandwidth`, and the only lever that changes the *shape* is batch size. Confirm the transition empirically:
+**The actionable consequence:** decode throughput is bounded by `model_bytes / HBM_bandwidth`, and the only lever that changes the *shape* is batch size.
+
+Neither input is in the trace, so fetch them before quoting the bound:
+
+- `model_bytes` — the weights **actually read to produce one token**, times
+  bytes per element for the serving dtype (2 for fp16/bf16, 1 for fp8/int8).
+  That is every transformer-block weight plus `lm_head`. **Exclude the input
+  embedding table**: decode reads a single row of it, not the matrix. On a
+  small model that matters — a 0.8B with vocab 150k × hidden 1024 carries ~19%
+  of its parameters in embeddings, so a naive `total_params × dtype_bytes`
+  overstates `model_bytes` and understates the ceiling by the same fraction.
+  When embeddings are *tied*, `lm_head` is that same matrix and is read in
+  full: count it once. Get the count from `model.safetensors.index.json`, the
+  model card, or `sum(p.numel() for p in model.parameters())` — not from
+  `config.json`, which carries architecture dims and `torch_dtype`, never a
+  parameter count.
+- `HBM_bandwidth` — `nvidia-smi --query-gpu=name --format=csv` and then the
+  card's spec sheet. Use ~80% of the theoretical peak as the achievable figure;
+  a well-written gemv reaches roughly that.
+
+The ceiling is `HBM_bandwidth / model_bytes` tokens/s at batch 1 **and short
+context**. Once the context is long enough to matter, per-token traffic is
+`model_bytes + 2 × n_layers × n_kv_heads × head_dim × seq_len × dtype_bytes`
+for the KV read (§5.3).
+
+Quote the ceiling next to the measured rate — the ratio is the headroom, and it
+is the number worth arguing over. Then check whether the weight reads are
+actually the problem: the gemv family's achieved bandwidth is
+`model_bytes / SUM(gdur)` over one steady-state token,
+
+```sql
+SELECT SUM(gdur)/1e3 AS gemv_us_per_token
+FROM kfam WHERE family = 'gemv' AND ph = 'decode' AND seq = 1;
+```
+
+If that comes out near peak while the overall ratio is poor, the loss is not in
+the weight reads, and no amount of kernel tuning on the GEMMs will recover it —
+look at what surrounds them (§5.1.1) and at the host (Chapter 4).
+
+Confirm the batch-size transition empirically:
 
 ```sql
 -- Correlate M with the kernel family actually chosen.

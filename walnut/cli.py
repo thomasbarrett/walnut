@@ -6,11 +6,17 @@ from typing import Annotated
 
 import typer
 
+from walnut.bench.cli import app as bench_app
+
 app = typer.Typer(
     help="walnut — an inference engine, built on PyTorch.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+# `bench` is a group of its own: five subcommands that measure five
+# different things, and share most of their flags with `serve`.
+app.add_typer(bench_app, name="bench")
 
 DEFAULT_URL = "http://127.0.0.1:8000/v1"
 
@@ -49,6 +55,47 @@ CudaGraph = Annotated[
         "per-token launch cost. Ignored off CUDA.",
     ),
 ]
+Compile = Annotated[
+    bool,
+    typer.Option(
+        "--compile/--no-compile",
+        envvar="WALNUT_COMPILE",
+        help="Run the decode step through torch.compile, fusing its "
+        "elementwise kernels. Costs a few seconds on the first request.",
+    ),
+]
+Autotune = Annotated[
+    bool,
+    typer.Option(
+        "--autotune/--no-autotune",
+        envvar="WALNUT_AUTOTUNE",
+        help="Have the compile benchmark a Triton kernel against cuBLAS for "
+        "each projection, rather than take cuBLAS on faith. Worth ~11% of "
+        "TPOT at decode's batch of 1. Costs a longer first compile, cached on "
+        "disk thereafter. Ignored with --no-compile.",
+    ),
+]
+MaxBatchSize = Annotated[
+    int,
+    typer.Option(
+        min=1,
+        envvar="WALNUT_MAX_BATCH_SIZE",
+        help="Requests decoded as one batch. Sequences join and leave the "
+        "batch as they arrive and finish; this is the number of slots, and "
+        "the ceiling on concurrency. Each slot preallocates its own KV cache, "
+        "so raising it costs memory whether or not the requests arrive.",
+    ),
+]
+MaxSeqLen = Annotated[
+    int | None,
+    typer.Option(
+        min=1,
+        envvar="WALNUT_MAX_SEQ_LEN",
+        help="Context length each batch slot is preallocated for, prompt plus "
+        "completion. A longer request is rejected. Defaults to the "
+        "checkpoint's own limit, capped at 8192.",
+    ),
+]
 
 
 @app.command()
@@ -66,6 +113,10 @@ def serve(
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
+    compile: Compile = True,
+    autotune: Autotune = True,
+    max_batch_size: MaxBatchSize = 8,
+    max_seq_len: MaxSeqLen = None,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -80,10 +131,24 @@ def serve(
         raise typer.BadParameter(str(exc)) from exc
 
     typer.echo(f"Loading '{model}'...")
-    engine = load_model(model, device=target, dtype=precision, cuda_graph=cuda_graph)
+    engine = load_model(
+        model,
+        device=target,
+        dtype=precision,
+        cuda_graph=cuda_graph,
+        compile=compile,
+        autotune=autotune,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+    )
+    # Compile and capture before the port opens, so the first request meets a
+    # warm engine rather than paying for everyone else's.
+    typer.echo(f"Preparing a batch of {engine.max_batch_size}...")
+    engine.start()
     typer.echo(
         f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
-        f"({engine.device}, {str(engine.dtype).removeprefix('torch.')})"
+        f"({engine.device}, {str(engine.dtype).removeprefix('torch.')}, "
+        f"batch {engine.max_batch_size} x {engine.max_seq_len} tokens)"
     )
     run_server(engine, host=host, port=port)
 
@@ -104,9 +169,21 @@ def profile(
             help="Directory to write the trace and summary to.",
         ),
     ] = "./profiles",
+    temperature: Annotated[
+        float,
+        typer.Option(
+            help="Sampling temperature for the profiled generation. Defaults to "
+            "greedy, matching the benchmark; raise it to see the sampler's own "
+            "kernels, which greedy decoding never runs.",
+        ),
+    ] = 0.0,
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
+    compile: Compile = True,
+    autotune: Autotune = True,
+    max_batch_size: MaxBatchSize = 1,
+    max_seq_len: MaxSeqLen = None,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 
@@ -124,13 +201,22 @@ def profile(
         raise typer.BadParameter(str(exc)) from exc
 
     typer.echo(f"Loading '{model}'...")
-    engine = load_model(model, device=target, dtype=precision, cuda_graph=cuda_graph)
-    config = GenerationConfig(max_tokens=max_tokens)
+    engine = load_model(
+        model,
+        device=target,
+        dtype=precision,
+        cuda_graph=cuda_graph,
+        compile=compile,
+        autotune=autotune,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+    )
+    config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
     messages = [Message(role="user", content=prompt)]
 
     # A cold pass pays for autotuning and lazy init, swamping the real numbers.
     typer.echo("Warming up...")
-    engine.generate(messages, GenerationConfig(max_tokens=4))
+    engine.generate(messages, GenerationConfig(max_tokens=4, temperature=temperature))
 
     typer.echo(f"Profiling {max_tokens} tokens on {engine.device}...")
     profiler = TorchProfiler(output_dir)

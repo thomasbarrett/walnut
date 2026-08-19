@@ -8,7 +8,7 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from walnut.engine import Engine, GenerationConfig, Message
+from walnut.engine import Completion, Engine, GenerationConfig, Message, Usage
 from walnut.server import create_app
 
 
@@ -21,11 +21,20 @@ class StubEngine(Engine):
     def __init__(self, model_id: str = "test-model") -> None:
         self.model_id = model_id
 
-    def generate(self, messages: list[Message], config: GenerationConfig) -> str:
+    def complete(self, messages: list[Message], config: GenerationConfig) -> Completion:
         last_user = next(
             (m.content for m in reversed(messages) if m.role == "user"), ""
         )
-        return f"echo: {last_user}".strip()
+        text = f"echo: {last_user}".strip()
+        # No tokenizer here, so "tokens" are words — enough for the HTTP layer
+        # to have counts to report.
+        return Completion(
+            text=text,
+            usage=Usage(
+                prompt_tokens=sum(len(m.content.split()) for m in messages),
+                completion_tokens=len(text.split()),
+            ),
+        )
 
 
 @pytest.fixture

@@ -7,9 +7,15 @@
 
 ## Install
 
+Serving needs a CUDA GPU, Ampere or newer — walnut's attention kernel has no
+CPU build:
+
 ```bash
-uv sync --extra cpu --dev
+uv sync --extra cu130 --dev
 ```
+
+`--extra cpu` installs a torch that lints, type-checks and runs the test suite,
+which is what CI uses, but it cannot serve a model.
 
 ## Serve a model
 

@@ -62,7 +62,7 @@ If you need per-token metadata (sequence length, batch size), emit it as a separ
 > "slice_drop_overlapping_complete_event",9
 > ```
 >
-> Your `phase` table comes back empty and every per-token query returns zero rows. **Always run the preflight in §2.3.** Workarounds: profile without `with_stack`, or fall back to the GPU-side `gpu_user_annotation` slices (§3.2.3), which live on a different track and survive.
+> Your `phase` table comes back empty and every per-token query returns zero rows. **Always run the preflight in §2.3.** Workarounds: profile without `with_stack`, or fall back to the GPU-side `gpu_user_annotation` slices (§3.2.4), which live on a different track and survive.
 
 ### 2.1.4 Capturing from a serving stack
 
@@ -112,59 +112,17 @@ Typical ratio is 8–12×. Do this by default for anything you will move between
 
 ## 2.2 The view layer
 
-Almost every question in this book is asked against five relations. Define them once; everything downstream is a two-line query. The complete file, with the phase override walnut needs, is
-[`scripts/prelude.sql`](../scripts/prelude.sql).
+Almost every question in this book is asked against seven relations — `ev`,
+`dev_op`, `api`, `phase`, `link`, `kfam`, `gap`. Define them once; everything
+downstream is a two-line query. They live in
+[`scripts/prelude.sql`](../scripts/prelude.sql), which is the authoritative
+copy: read it there rather than from a listing here, because walnut's `phase`
+is built from Python frames, not from the `user_annotation` slices this chapter
+assumes.
 
-```sql
--- ev: every slice with its thread/process context resolved.
-CREATE PERFETTO VIEW ev AS
-SELECT s.id, s.ts, s.dur, s.ts + s.dur AS te, s.name, s.category AS cat,
-       s.track_id, s.parent_id, s.depth, s.arg_set_id,
-       th.utid, th.tid, th.name AS thread_name, p.pid, p.name AS process_name
-FROM slice s
-JOIN thread_track tt ON s.track_id = tt.id
-JOIN thread th USING (utid)
-JOIN process p USING (upid);
-
--- dev_op: everything that executed ON the GPU.
-CREATE PERFETTO VIEW dev_op AS
-SELECT *,
-       extract_arg(arg_set_id, 'args.stream')      AS stream,
-       extract_arg(arg_set_id, 'args.correlation') AS corr,
-       extract_arg(arg_set_id, 'args.graph id')    AS graph_id,
-       extract_arg(arg_set_id, 'args.bytes')       AS bytes
-FROM ev WHERE cat IN ('kernel', 'gpu_memcpy', 'gpu_memset');
-
--- api: every host-side CUDA call. Runtime AND driver.
-CREATE PERFETTO VIEW api AS
-SELECT *, extract_arg(arg_set_id, 'args.correlation') AS corr
-FROM ev WHERE cat IN ('cuda_runtime', 'cuda_driver');
-
--- phase: your record_function markers, indexed.
-CREATE PERFETTO TABLE phase AS
-SELECT id, ts, dur, ts + dur AS te, name,
-       ROW_NUMBER() OVER (PARTITION BY name ORDER BY ts) - 1 AS seq
-FROM slice WHERE category = 'user_annotation';
-
--- link: THE central relation. One row per device op, joined to its
--- launching API call, its ATen operator, and its phase.
-CREATE PERFETTO TABLE link AS
-SELECT
-  d.id AS gid, d.ts AS gts, d.dur AS gdur, d.te AS gte, d.name AS kname,
-  d.cat AS gcat, d.stream, d.graph_id, d.bytes,
-  a.id AS lid, a.ts AS lts, a.dur AS ldur, a.te AS lte, a.name AS lname, a.tid AS ltid,
-  d.arg_set_id AS gargs, a.arg_set_id AS largs,
-  d.ts - a.te                            AS queue_ns,        -- see §3.3.2
-  COUNT(*) OVER (PARTITION BY a.id)      AS launch_fanout,   -- see §4.3.2
-  (SELECT x.name FROM ancestor_slice(a.id) x ORDER BY x.depth DESC LIMIT 1) AS op,
-  (SELECT p.name FROM phase p WHERE a.ts >= p.ts AND a.ts < p.te ORDER BY p.ts DESC LIMIT 1) AS ph,
-  (SELECT p.seq  FROM phase p WHERE a.ts >= p.ts AND a.ts < p.te ORDER BY p.ts DESC LIMIT 1) AS seq
-FROM flow f
-JOIN dev_op d ON f.slice_in  = d.id
-JOIN api    a ON f.slice_out = a.id;
-```
-
-Four design decisions worth stating explicitly:
+`link` is the one to understand — one row per device op, joined to its
+launching API call, its ATen operator, and its phase. Four design decisions in
+it are worth stating explicitly:
 
 - **`link` is built from `flow`, not from `correlation`.** Robust to CUDA graphs and to ROCm traces with missing correlation ids.
 - **`op` is the *innermost* ancestor** (`ORDER BY depth DESC LIMIT 1`), i.e. `aten::mm`, not the outer `aten::matmul`. Swap to `depth = 0` for the outermost, or drop the `LIMIT` and `group_concat` for the full chain.

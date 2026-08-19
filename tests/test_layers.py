@@ -1,10 +1,16 @@
 import math
+from typing import Any, cast
 
 import pytest
 import torch
 
 from walnut.layers.attention import Attention, KVCache
-from walnut.layers.linear_attention import GatedDeltaNet
+from walnut.layers.linear_attention import (
+    _CHUNK,
+    GatedDeltaNet,
+    _chunked_gated_delta_rule,
+    _recurrent_gated_delta_rule,
+)
 from walnut.layers.norm import RMSNorm
 from walnut.layers.rotary import (
     RotaryEmbedding,
@@ -95,49 +101,89 @@ def test_rope_partial_rotary_passes_tail_through():
     assert not torch.allclose(q_rot[:, 1:, :, :rotary_dim], q[:, 1:, :, :rotary_dim])
 
 
-def test_attention_matches_manual_softmax():
-    # Single head, head_dim=2, seq=2: compare against a hand-rolled causal
-    # softmax attention so the numbers -- not just the shapes -- are pinned.
-    attn = Attention(num_heads=1, num_kv_heads=1, head_dim=2)
-    q = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]])  # (B=1, S=2, H=1, D=2)
-    k = torch.tensor([[[[1.0, 0.0]], [[1.0, 1.0]]]])
-    v = torch.tensor([[[[2.0, 3.0]], [[4.0, 5.0]]]])
+#: Attention runs through FlashAttention's variable-length kernel, which is
+#: CUDA-only and built for float16/bfloat16 — and it is the only path there is,
+#: with no cacheless branch left to check it against on CPU. So every test of
+#: attention itself skips on CI's runner. What still runs there is the cache's
+#: own bookkeeping (`KVCache.update`, the slot views) and the scheduler driving
+#: a stand-in model, which is where the batching logic lives.
+cuda_only = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="attention needs CUDA"
+)
 
-    qm, km, vm = q[0, :, 0], k[0, :, 0], v[0, :, 0]
-    scores = (qm @ km.T) * (2**-0.5)
-    scores = scores.masked_fill(~torch.tril(torch.ones(2, 2)).bool(), float("-inf"))
+#: Where and in what precision the kernel exists.
+_HALF: Any = {"device": "cuda", "dtype": torch.bfloat16}
+
+
+def _kv(rows: int, heads: int, length: int, head_dim: int) -> KVCache:
+    return KVCache(
+        max_batch_size=rows,
+        n_kv_heads=heads,
+        max_seq_len=length,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+
+@cuda_only
+def test_attention_matches_manual_softmax():
+    """Compare against a hand-rolled causal softmax so the numbers -- not just
+    the shapes -- are pinned.
+
+    With no cacheless branch left, this is the only place attention is checked
+    against its own definition rather than against another run of the same
+    kernel. head_dim is 8 because that is the narrowest the kernel takes; the
+    trailing dimensions are zero, so the arithmetic is still the 2-D one.
+    """
+    head_dim = 8
+    attn = Attention(num_heads=1, num_kv_heads=1, head_dim=head_dim)
+
+    def pad(pair):
+        return [*pair, *([0.0] * (head_dim - 2))]
+
+    q = torch.tensor([[[pad([1.0, 0.0])], [pad([0.0, 1.0])]]], **_HALF)
+    k = torch.tensor([[[pad([1.0, 0.0])], [pad([1.0, 1.0])]]], **_HALF)
+    v = torch.tensor([[[pad([2.0, 3.0])], [pad([4.0, 5.0])]]], **_HALF)
+
+    qm, km, vm = (t[0, :, 0].float() for t in (q, k, v))
+    scores = (qm @ km.T) * head_dim**-0.5
+    ones = torch.ones(2, 2, device="cuda")
+    scores = scores.masked_fill(~torch.tril(ones).bool(), float("-inf"))
     expected = torch.softmax(scores, dim=-1) @ vm
 
-    got = attn(q, k, v)[0, :, 0]
-    assert torch.allclose(got, expected, atol=1e-6)
+    got = attn(q, k, v, _kv(1, 1, 2, head_dim), torch.arange(2, device="cuda"))
+    assert torch.allclose(got[0, :, 0].float(), expected, atol=2e-2)
 
 
+@cuda_only
 def test_attention_incremental_matches_prefill():
+    """A prompt read at once, and the same tokens stepped through one at a
+    time, have to land in the same place -- which is what the cache's positions
+    and the kernel's per-row lengths are together for."""
     torch.manual_seed(0)
-    attn = Attention(num_heads=4, num_kv_heads=2, head_dim=8)
+    attn = Attention(num_heads=4, num_kv_heads=2, head_dim=64)
     seq = 5
-    q = torch.randn(1, seq, 4, 8)
-    k = torch.randn(1, seq, 2, 8)
-    v = torch.randn(1, seq, 2, 8)
+    q = torch.randn(1, seq, 4, 64, **_HALF)
+    k = torch.randn(1, seq, 2, 64, **_HALF)
+    v = torch.randn(1, seq, 2, 64, **_HALF)
 
-    full = attn(q, k, v)
+    full = attn(q, k, v, _kv(1, 2, seq, 64), torch.arange(seq, device="cuda"))
 
-    cache = KVCache(
-        max_batch_size=1, n_kv_heads=2, max_seq_len=seq, head_dim=8, dtype=q.dtype
-    )
+    cache = _kv(1, 2, seq, 64)
     steps = [
         attn(
             q[:, i : i + 1],
             k[:, i : i + 1],
             v[:, i : i + 1],
             cache,
-            input_pos=torch.tensor([i]),
+            input_pos=torch.tensor([[i]], device="cuda"),
         )
         for i in range(seq)
     ]
     incremental = torch.cat(steps, dim=1)
 
-    assert torch.allclose(full, incremental, atol=1e-5)
+    assert torch.allclose(full.float(), incremental.float(), atol=2e-2)
 
 
 def _delta_net() -> GatedDeltaNet:
@@ -166,6 +212,52 @@ def test_gated_delta_net_incremental_matches_prefill():
     assert torch.allclose(full, incremental, atol=1e-5)
 
 
+@pytest.mark.parametrize("seq", [1, 5, _CHUNK, _CHUNK + 1, 2 * _CHUNK + 7])
+def test_chunked_delta_rule_matches_the_recurrent_one(seq):
+    """The chunked form is the recurrent one reassociated, so it must agree.
+
+    Both are driven directly, past `_gated_delta_rule`'s dispatch, so the
+    lengths where only one of them normally runs are covered too. `g` is
+    negative and the keys are L2-normalized, as the layer guarantees.
+    """
+    torch.manual_seed(0)
+    heads, k_dim, v_dim = 3, 8, 8
+    shape = (1, heads, seq)
+
+    def norm(x):
+        return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+    query = norm(torch.randn(*shape, k_dim))
+    key = norm(torch.randn(*shape, k_dim))
+    value = torch.randn(*shape, v_dim)
+    g = -torch.rand(*shape)
+    beta = torch.rand(*shape)
+    state = torch.randn(1, heads, k_dim, v_dim) * 0.1
+
+    out, final = _recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    chunk_out, chunk_final = _chunked_gated_delta_rule(
+        query, key, value, g, beta, state
+    )
+
+    assert torch.allclose(out, chunk_out, atol=1e-5)
+    assert torch.allclose(final, chunk_final, atol=1e-5)
+
+
+def test_delta_rule_does_not_mutate_the_state_it_is_given():
+    """`ConvState.recurrent` is passed in directly and copied out afterwards;
+    writing through it would corrupt the cache mid-step."""
+    torch.manual_seed(0)
+    query, key, value = (torch.randn(1, 2, 5, 4) for _ in range(3))
+    g, beta = -torch.rand(1, 2, 5), torch.rand(1, 2, 5)
+    state = torch.randn(1, 2, 4, 4) * 0.1
+    original = state.clone()
+
+    _recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    assert torch.equal(state, original)
+    _chunked_gated_delta_rule(query, key, value, g, beta, state)
+    assert torch.equal(state, original)
+
+
 def test_gated_delta_net_writes_cache_buffers_in_place():
     # A captured CUDA graph replays into the buffers it recorded, so the state
     # must stay at one address rather than being rebound to a fresh tensor.
@@ -183,20 +275,75 @@ def test_gated_delta_net_writes_cache_buffers_in_place():
     assert recurrent.abs().sum() > 0
 
 
+@cuda_only
 def test_attention_is_causal_in_prefill():
     torch.manual_seed(0)
-    attn = Attention(num_heads=2, num_kv_heads=2, head_dim=8)
+    attn = Attention(num_heads=2, num_kv_heads=2, head_dim=64)
     seq = 4
-    q = torch.randn(1, seq, 2, 8)
-    k = torch.randn(1, seq, 2, 8)
-    v = torch.randn(1, seq, 2, 8)
+    positions = torch.arange(seq, device="cuda")
+    q = torch.randn(1, seq, 2, 64, **_HALF)
+    k = torch.randn(1, seq, 2, 64, **_HALF)
+    v = torch.randn(1, seq, 2, 64, **_HALF)
 
-    out = attn(q, k, v)
+    out = attn(q, k, v, _kv(1, 2, seq, 64), positions)
     # Perturbing a future key/value must not change an earlier query's output.
-    k2 = k.clone()
-    v2 = v.clone()
+    k2, v2 = k.clone(), v.clone()
     k2[:, -1] += 5.0
     v2[:, -1] += 5.0
-    out2 = attn(q, k2, v2)
-    assert torch.allclose(out[:, 0], out2[:, 0], atol=1e-5)
-    assert not torch.allclose(out[:, -1], out2[:, -1], atol=1e-5)
+    out2 = attn(q, k2, v2, _kv(1, 2, seq, 64), positions)
+    assert torch.allclose(out[:, 0].float(), out2[:, 0].float(), atol=2e-2)
+    assert not torch.allclose(out[:, -1].float(), out2[:, -1].float(), atol=2e-2)
+
+
+def _pool(rows: int = 4, length: int = 8) -> KVCache:
+    return KVCache(max_batch_size=rows, n_kv_heads=2, max_seq_len=length, head_dim=8)
+
+
+def test_a_slot_view_writes_the_pool_it_came_from():
+    """A prefill runs batch-1 against a view; the batched decode reads the
+    pool. If the view were a copy, the sequence would decode from nothing."""
+    pool = _pool()
+    view = cast(KVCache, pool.slot(2))
+    keys = torch.randn(1, 3, 2, 8)
+    view.update(torch.arange(3), keys, keys)
+    assert torch.equal(pool.k[2, :3], keys[0])
+    assert (pool.k[0] == 0).all() and (pool.k[1] == 0).all()
+
+
+def test_resetting_a_slot_leaves_the_others_alone():
+    pool = _pool()
+    pool.k.fill_(1.0)
+    pool.reset(1)
+    assert (pool.k[1] == 0).all()
+    assert (pool.k[0] == 1).all() and (pool.k[2] == 1).all()
+
+
+def test_a_batched_update_writes_one_position_per_row():
+    """The bug this guards: rows of a decode batch sit at different positions,
+    and a shared-position write would put every row's token in one slot."""
+    pool = _pool(rows=3, length=8)
+    positions = torch.tensor([[0], [4], [7]])
+    values = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1)
+    values = values.expand(3, 1, 2, 8).contiguous()
+    pool.update(positions, values, values)
+    for row, position in enumerate((0, 4, 7)):
+        assert (pool.k[row, position] == row).all()
+        assert pool.k[row].sum() == pool.k[row, position].sum()
+
+
+def test_a_conv_state_view_stays_primed():
+    """The bug this guards: a view that reported itself empty would send a
+    decode step down the prefill branch and restart the recurrence."""
+    from walnut.layers.linear_attention import ConvState
+
+    state = ConvState(
+        max_batch_size=2,
+        conv_dim=4,
+        conv_kernel_size=3,
+        num_value_heads=2,
+        key_head_dim=4,
+        value_head_dim=4,
+    )
+    assert state.empty
+    state.prime()
+    assert not state.empty and not state.view(0, 1).empty
