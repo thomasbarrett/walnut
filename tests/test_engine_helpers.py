@@ -34,17 +34,36 @@ def test_first_stop_ignores_empty_stop_strings():
     assert _first_stop("hello", [""]) is None
 
 
-def test_resolve_device_auto_follows_cuda_availability():
-    expected = "cuda" if torch.cuda.is_available() else "cpu"
-    assert resolve_device().type == expected
-    assert resolve_device("auto").type == expected
-
-
-def test_resolve_device_passes_through_explicit_selection(monkeypatch):
+def _pretend_cuda(monkeypatch, count=2, capability=(9, 0)):
+    """A machine with CUDA, for the checks that are about the selection."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
-    assert resolve_device("cpu") == CPU
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: count)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _=None: capability)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _=None: "Pretend GPU")
+
+
+def test_resolve_device_auto_selects_cuda(monkeypatch):
+    _pretend_cuda(monkeypatch)
+    assert resolve_device() == CUDA
+    assert resolve_device("auto") == CUDA
+
+
+def test_resolve_device_passes_through_an_explicit_index(monkeypatch):
+    _pretend_cuda(monkeypatch)
     assert resolve_device("cuda:1") == torch.device("cuda:1")
+
+
+def test_resolve_device_rejects_cpu():
+    """walnut decodes through a CUDA-only attention kernel, so a CPU selection
+    has to fail here rather than inside the first request."""
+    with pytest.raises(ValueError, match="CUDA"):
+        resolve_device("cpu")
+
+
+def test_resolve_device_rejects_a_gpu_older_than_the_kernel(monkeypatch):
+    _pretend_cuda(monkeypatch, capability=(7, 5))
+    with pytest.raises(ValueError, match="Ampere"):
+        resolve_device("cuda")
 
 
 def test_resolve_device_rejects_cuda_when_unavailable(monkeypatch):
@@ -60,26 +79,47 @@ def test_resolve_device_rejects_out_of_range_index(monkeypatch):
         resolve_device("cuda:9")
 
 
-def test_resolve_dtype_auto_uses_checkpoint_dtype():
+def _bf16(monkeypatch, supported=True):
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: supported)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _=None: "Pretend GPU")
+
+
+def test_resolve_dtype_auto_uses_checkpoint_dtype(monkeypatch):
+    _bf16(monkeypatch)
     config = PretrainedConfig(dtype="bfloat16")
-    assert resolve_dtype("auto", config, CPU) == torch.bfloat16
+    assert resolve_dtype("auto", config, CUDA) == torch.bfloat16
     assert resolve_dtype(None, config, CUDA) == torch.bfloat16
 
 
-def test_resolve_dtype_auto_downcasts_float32_off_cpu():
-    config = PretrainedConfig(dtype="float32")
-    assert resolve_dtype("auto", config, CUDA) == torch.bfloat16
-    assert resolve_dtype("auto", config, CPU) == torch.float32
+def test_resolve_dtype_auto_downcasts_a_float32_checkpoint(monkeypatch):
+    """The attention kernel has no float32 build, so auto cannot leave one
+    alone the way it could when there was a fallback."""
+    _bf16(monkeypatch)
+    assert resolve_dtype("auto", PretrainedConfig(dtype="float32"), CUDA) == (
+        torch.bfloat16
+    )
+    assert resolve_dtype("auto", PretrainedConfig(), CUDA) == torch.bfloat16
 
 
-def test_resolve_dtype_auto_defaults_to_float32_without_declaration():
-    assert resolve_dtype("auto", PretrainedConfig(), CPU) == torch.float32
+def test_resolve_dtype_rejects_float32_asked_for_by_name(monkeypatch):
+    """Downcasting silently is right for a checkpoint's own declaration and
+    wrong for a flag: the caller asked for a precision walnut cannot serve."""
+    _bf16(monkeypatch)
+    with pytest.raises(ValueError, match="float32"):
+        resolve_dtype("float32", PretrainedConfig(dtype="bfloat16"), CUDA)
 
 
-def test_resolve_dtype_explicit_overrides_checkpoint():
+def test_resolve_dtype_explicit_overrides_checkpoint(monkeypatch):
+    _bf16(monkeypatch)
     config = PretrainedConfig(dtype="bfloat16")
-    assert resolve_dtype("float32", config, CPU) == torch.float32
-    assert resolve_dtype(torch.float16, config, CPU) == torch.float16
+    assert resolve_dtype(torch.float16, config, CUDA) == torch.float16
+
+
+def test_resolve_dtype_falls_back_to_float16_without_bf16(monkeypatch):
+    _bf16(monkeypatch, supported=False)
+    config = PretrainedConfig(dtype="bfloat16")
+    with pytest.warns(UserWarning, match="bfloat16 is unsupported"):
+        assert resolve_dtype("auto", config, CUDA) == torch.float16
 
 
 def test_parse_dtype_defers_auto_to_the_checkpoint():
@@ -126,3 +166,13 @@ def test_resolve_model_class_unknown_architecture_raises():
 def test_resolve_model_class_missing_architectures_raises():
     with pytest.raises(ValueError):
         resolve_model_class(PretrainedConfig())
+
+
+def test_parse_dtype_rejects_a_precision_the_kernel_lacks():
+    """The bug this guards: rejecting float32 only in `resolve_dtype` puts the
+    error after `AutoConfig.from_pretrained`, so a mistyped flag costs a
+    download and arrives as a traceback instead of a bad-parameter message."""
+    with pytest.raises(ValueError, match="unsupported"):
+        parse_dtype("float32")
+    with pytest.raises(ValueError, match="unsupported"):
+        parse_dtype(torch.float64)

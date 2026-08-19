@@ -35,6 +35,7 @@ import platform
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -141,6 +142,65 @@ def _one_request(engine: Any, prompt: str, params: Any) -> dict[str, Any]:
     }
 
 
+def _one_served_request(engine: Any, prompt: str, params: Any) -> dict[str, Any]:
+    """Run one request through the scheduler, timestamping each token.
+
+    The served path, as opposed to `_one_request`'s direct drive of the model:
+    the tokens come off a batch that other requests may be sharing, which is
+    the only way to see what concurrency costs a single stream.
+    """
+    from walnut.engine import Message
+    from walnut.scheduler import Request
+
+    prompt_ids = engine._encode([Message(role="user", content=prompt)])
+    stop_ids = frozenset({engine.model.eos_token_id})
+
+    start = time.perf_counter()
+    request = engine.scheduler.submit(
+        Request(prompt=prompt_ids, params=params, stop_ids=stop_ids)
+    )
+    stamps, ids = [], []
+    for token in request.stream():
+        stamps.append(time.perf_counter())
+        ids.append(token)
+    end = time.perf_counter()
+
+    if not stamps:
+        raise RuntimeError("the engine generated nothing; check the prompt")
+    return {
+        "ttft_ms": (stamps[0] - start) * 1e3,
+        "e2e_ms": (end - start) * 1e3,
+        "itl_ms": [(b - a) * 1e3 for a, b in zip(stamps, stamps[1:], strict=False)],
+        "tokens_out": len(ids),
+        "text": engine.tokenizer.decode(ids, skip_special_tokens=True),
+    }
+
+
+def _concurrent_requests(
+    engine: Any, prompt: str, params: Any, streams: int
+) -> tuple[list[dict[str, Any]], float]:
+    """``streams`` requests at once; their results and the group's wall time.
+
+    They are released together rather than at some arrival rate: this measures
+    what a full batch does to a stream, which is the question a batch size
+    setting raises. A rate-based load generator answers a different one.
+    """
+    results: list[Any] = [None] * streams
+    barrier = threading.Barrier(streams)
+
+    def drive(index: int) -> None:
+        barrier.wait()
+        results[index] = _one_served_request(engine, prompt, params)
+
+    threads = [threading.Thread(target=drive, args=(i,)) for i in range(streams)]
+    start = time.perf_counter()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results, (time.perf_counter() - start) * 1e3
+
+
 def run(args: argparse.Namespace) -> int:
     import torch
 
@@ -148,6 +208,7 @@ def run(args: argparse.Namespace) -> int:
     from walnut.engine import resolve_device as resolve
     from walnut.sampler import SamplingParams
 
+    streams = args.concurrency
     engine = load_model(
         args.model,
         device=resolve(args.device),
@@ -155,6 +216,7 @@ def run(args: argparse.Namespace) -> int:
         cuda_graph=args.cuda_graph,
         compile=args.compile,
         autotune=args.autotune,
+        max_batch_size=args.max_batch_size or max(1, streams or 1),
     )
 
     # Cold: compilation, autotuning and lazy init. Weight loading already
@@ -184,9 +246,21 @@ def run(args: argparse.Namespace) -> int:
     params = SamplingParams(
         max_new_tokens=args.tokens, temperature=args.temperature, seed=args.seed
     )
-    for _ in range(args.warmup):
-        _one_request(engine, args.prompt, params)
-    runs = [_one_request(engine, args.prompt, params) for _ in range(args.repeats)]
+    # `--concurrency` switches to the served path. Left off, this drives the
+    # model directly, exactly as every record taken before batching existed.
+    group_ms: list[float] = []
+    if streams is None:
+        for _ in range(args.warmup):
+            _one_request(engine, args.prompt, params)
+        runs = [_one_request(engine, args.prompt, params) for _ in range(args.repeats)]
+    else:
+        for _ in range(args.warmup):
+            _concurrent_requests(engine, args.prompt, params, streams)
+        runs = []
+        for _ in range(args.repeats):
+            group, wall = _concurrent_requests(engine, args.prompt, params, streams)
+            runs += group
+            group_ms.append(wall)
 
     # Every run is hashed, not just the last: a change that makes generation
     # nondeterministic is exactly what this is meant to catch.
@@ -222,10 +296,18 @@ def run(args: argparse.Namespace) -> int:
         "host": platform.node(),
         "torch": torch.__version__,
         **_git_state(),
+        # `concurrency` and `max_batch_size` join `flags` only on the served
+        # path, so `compare` refuses to read a served run against a direct one
+        # while every record taken before batching stays comparable.
         "flags": {
             "cuda_graph": args.cuda_graph,
             "compile": args.compile,
             "autotune": args.autotune,
+            **(
+                {"concurrency": streams, "max_batch_size": engine.max_batch_size}
+                if streams
+                else {}
+            ),
         },
         "prompt": args.prompt,
         "prompt_tokens": int(
@@ -249,6 +331,13 @@ def run(args: argparse.Namespace) -> int:
         "itl_p99_ms": _percentile(itl, 99),
         "itl_max_ms": max(itl),
         "first_request_ms": first_request_ms,
+        # Tokens per second out of the engine as a whole, which is what a batch
+        # size buys; `tok_per_s` above stays per-stream and does not.
+        "system_tok_per_s": (
+            sum(r["tokens_out"] for r in runs) / (sum(group_ms) / 1e3)
+            if group_ms
+            else None
+        ),
         # None if torch won't name its cache dir; `compare` then stays quiet.
         "first_request_compiled": compiled,
         # Per-run values, so dispersion can be checked downstream.
@@ -437,6 +526,21 @@ def main() -> int:
     r.add_argument("--no-compile", dest="compile", action="store_false")
     r.add_argument("--autotune", action="store_true", default=True)
     r.add_argument("--no-autotune", dest="autotune", action="store_false")
+    r.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="requests in flight at once, driven through the scheduler. Left "
+        "off, the model is driven directly (one request, no scheduler), which "
+        "is what every record taken before batching measured.",
+    )
+    r.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=None,
+        help="slots in the engine's batch. Defaults to --concurrency, so the "
+        "batch is exactly full; set it higher to measure padding.",
+    )
     r.add_argument("--label", default=None, help="name for this run in `compare`")
     r.add_argument("-o", "--out", default=None, help="write the JSON record here")
     r.set_defaults(func=run)

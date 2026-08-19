@@ -69,6 +69,27 @@ Autotune = Annotated[
         "disk thereafter. Ignored with --no-compile.",
     ),
 ]
+MaxBatchSize = Annotated[
+    int,
+    typer.Option(
+        min=1,
+        envvar="WALNUT_MAX_BATCH_SIZE",
+        help="Requests decoded as one batch. Sequences join and leave the "
+        "batch as they arrive and finish; this is the number of slots, and "
+        "the ceiling on concurrency. Each slot preallocates its own KV cache, "
+        "so raising it costs memory whether or not the requests arrive.",
+    ),
+]
+MaxSeqLen = Annotated[
+    int | None,
+    typer.Option(
+        min=1,
+        envvar="WALNUT_MAX_SEQ_LEN",
+        help="Context length each batch slot is preallocated for, prompt plus "
+        "completion. A longer request is rejected. Defaults to the "
+        "checkpoint's own limit, capped at 8192.",
+    ),
+]
 
 
 @app.command()
@@ -88,6 +109,8 @@ def serve(
     cuda_graph: CudaGraph = True,
     compile: Compile = True,
     autotune: Autotune = True,
+    max_batch_size: MaxBatchSize = 8,
+    max_seq_len: MaxSeqLen = None,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -109,10 +132,17 @@ def serve(
         cuda_graph=cuda_graph,
         compile=compile,
         autotune=autotune,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
     )
+    # Compile and capture before the port opens, so the first request meets a
+    # warm engine rather than paying for everyone else's.
+    typer.echo(f"Preparing a batch of {engine.max_batch_size}...")
+    engine.start()
     typer.echo(
         f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
-        f"({engine.device}, {str(engine.dtype).removeprefix('torch.')})"
+        f"({engine.device}, {str(engine.dtype).removeprefix('torch.')}, "
+        f"batch {engine.max_batch_size} x {engine.max_seq_len} tokens)"
     )
     run_server(engine, host=host, port=port)
 
@@ -146,6 +176,8 @@ def profile(
     cuda_graph: CudaGraph = True,
     compile: Compile = True,
     autotune: Autotune = True,
+    max_batch_size: MaxBatchSize = 1,
+    max_seq_len: MaxSeqLen = None,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 
@@ -170,6 +202,8 @@ def profile(
         cuda_graph=cuda_graph,
         compile=compile,
         autotune=autotune,
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
     )
     config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
     messages = [Message(role="user", content=prompt)]

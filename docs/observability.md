@@ -106,7 +106,8 @@ Two values walnut had to choose:
   also omits the `usage` block from chat completion responses.
 - **Content capture** — prompts and completions as events. Opt-in, high volume,
   and a privacy decision.
-- **Queue depth** — walnut serves one request at a time.
+- **Queue depth** — the scheduler knows how many requests are waiting for a
+  slot and how many are running, but does not export either yet.
 - **`gen_ai.client.*`** — those belong to clients calling walnut.
 
 !!! warning "Stability"

@@ -13,26 +13,65 @@ always matches the installed version. You can also run `walnut --help` or
 
 ## Device and precision
 
-`--device` and `--dtype` both default to `auto`: CUDA when it is available, at
-the dtype the checkpoint declares. Running on CUDA needs the CUDA wheels
-(`uv sync --extra cu130`, not `--extra cpu`).
+**walnut serves on CUDA only, from Ampere (compute capability 8.0) onwards.**
+It decodes through FlashAttention's variable-length kernel, which has no CPU
+build and no float32 or pre-Ampere one. A CPU selection, an older card, or
+`--dtype float32` is refused up front rather than allowed to fail inside the
+first request. Running it needs the CUDA wheels: `uv sync --extra cu130`, not
+`--extra cpu`, which installs a torch that can lint and test but not serve.
+
+`--device` and `--dtype` both default to `auto`: the default CUDA device, at
+the dtype the checkpoint declares.
 
 ```console
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --device cuda:1 --dtype bfloat16
 ```
 
 `auto` adjusts the checkpoint's dtype twice: a float32 checkpoint is downcast to
-`bfloat16` on an accelerator (but left alone on CPU), and `bfloat16` falls back
-to `float16`, with a warning, on pre-Ampere CUDA devices.
+`bfloat16`, and `bfloat16` falls back to `float16`, with a warning, on CUDA
+devices that cannot do bf16.
+
+## Batch size
+
+`--max-batch-size` is how many requests the server decodes as one batch,
+defaulting to 8. It is the same knob as vLLM's `--max-num-seqs` and SGLang's
+`--max-running-requests`: the number of sequence slots, and so the ceiling on
+concurrency.
+
+```console
+$ uv run walnut serve Qwen/Qwen3.5-0.8B --max-batch-size 16
+```
+
+The batch is continuous. A request joins at the next decode step rather than
+waiting for the current group to finish, and a finished sequence frees its slot
+the step it stops — so a slow request never holds a fast one behind it. Prefill
+runs on its own, one request at a time, into the slot the request was given.
+
+Batching trades a stream's own latency for the engine's throughput. On an RTX
+5090 serving Qwen3.5-0.8B, eight streams at once cost each of them 63% more
+time per output token than a stream running alone, and produce 4.1× the tokens
+per second overall.
+
+Each slot preallocates its own KV cache, so the memory a batch costs is
+`--max-batch-size` times `--max-seq-len`, whether or not the requests ever
+arrive. `--max-seq-len` is the context each slot is allocated for — prompt plus
+completion — and defaults to the checkpoint's own limit capped at 8192; a
+request that does not fit is rejected with a 400 rather than allowed to displace
+a running one. Decode reads only as far as each sequence has actually got, so a
+long `--max-seq-len` costs memory but not time.
+
+`walnut profile` takes both flags, defaulting to a batch of 1: it traces one
+generation, and a larger batch would fill the trace with padding rows.
 
 ## CUDA graphs
 
 Decode is replayed from a captured CUDA graph by default, which removes the
-per-token kernel launch cost. Capture happens once per request, after prefill
-has already handed back the first token, so it falls between the first and
-second token rather than into time-to-first-token; `--no-cuda-graph` turns it
-off. The flag is ignored off CUDA, and `walnut profile` takes it with the same
-default, so a profile measures what a server runs.
+per-token kernel launch cost. One graph is captured per power-of-two batch size
+and the smallest one that fits is replayed, so the capture count grows with the
+logarithm of `--max-batch-size`. Capture happens at start-up, before the port
+opens, so no request pays for it; `--no-cuda-graph` turns it off. The flag is
+ignored off CUDA, and `walnut profile` takes it with the same default, so a
+profile measures what a server runs.
 
 ```console
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-cuda-graph
@@ -59,9 +98,9 @@ $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-compile
 That compile also autotunes by default: for each projection Inductor benchmarks
 a Triton kernel against cuBLAS and keeps whichever is faster, rather than taking
 cuBLAS on faith. It is worth doing because decode's matmuls are matrix-*vector*
-products — walnut serves one request at a time, so every projection is a batch
-of one — and cuBLAS's `gemv` serves the narrow ones at roughly half the GPU's
-bandwidth. On an RTX 5090 picking per shape is worth ~11% of TPOT.
+products at the batch sizes serving actually reaches — and cuBLAS's `gemv`
+serves the narrow ones at roughly half the GPU's bandwidth. On an RTX 5090
+picking per shape is worth ~11% of TPOT.
 
 Autotuning runs at compile time, so it lands on the first request: expect
 seconds rather than the fraction of a second `--compile` alone costs. Inductor

@@ -54,6 +54,33 @@ class ConvState(Cache):
         )
         self.primed = False
 
+    @classmethod
+    def _view(
+        cls, conv: torch.Tensor, recurrent: torch.Tensor, primed: bool
+    ) -> ConvState:
+        state = cls.__new__(cls)
+        state.conv, state.recurrent = conv, recurrent
+        state.primed = primed
+        return state
+
+    def view(self, start: int, stop: int) -> ConvState:
+        """A view inherits ``primed``: it names the same buffers, so a view that
+        called itself empty would take the prefill branch over state the
+        sequence had already built and silently start it over.
+        """
+        return ConvState._view(
+            self.conv[start:stop], self.recurrent[start:stop], self.primed
+        )
+
+    def reset(self, index: int) -> None:
+        """Zero a slot. Zeroed state is what "no context yet" means here, so a
+        reset slot decodes as a fresh sequence without unpriming the pool."""
+        self.conv[index].zero_()
+        self.recurrent[index].zero_()
+
+    def prime(self) -> None:
+        self.primed = True
+
     @property
     def empty(self) -> bool:
         """True until a forward pass has written state into the buffers."""

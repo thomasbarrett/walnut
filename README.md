@@ -22,8 +22,9 @@ brew bundle          # installs uv, helm, hadolint, prek, gh
 ## Getting started
 
 ```bash
-# Install dependencies (including dev tools)
-uv sync --extra cpu --dev
+# Install dependencies (including dev tools). Serving needs a CUDA GPU,
+# Ampere or newer; `--extra cpu` can lint and test but not serve.
+uv sync --extra cu130 --dev
 
 # Serve a model behind an OpenAI-compatible API (Hugging Face id or local path)
 uv run walnut serve Qwen/Qwen3.5-0.8B --host 0.0.0.0 --port 8000
