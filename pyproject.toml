@@ -14,7 +14,7 @@ dependencies = [
     "prometheus-fastapi-instrumentator>=8.0.2",
     "safetensors>=0.8.0",
     "transformers>=5.15.0",
-    "typer>=0.26.8",
+    "typer>=0.27.1",
     "uvicorn>=0.51.0",
 ]
 
