@@ -13,8 +13,18 @@ from walnut.layers.linear import FusedLinear
 
 #: Positions per chunk in `_chunked_gated_delta_rule`. The chunk's cost is
 #: quadratic in this and the number of sequential steps is inversely
-#: proportional to it; 64 is the usual balance and covers a short prompt whole.
-_CHUNK = 64
+#: proportional to it, so the balance depends on which side the loop is bound
+#: by. It is bound by the host: a chunk's matmuls are far too small to fill the
+#: GPU, so a prefill costs what it costs to *issue* one chunk times the number
+#: of chunks, and prefill time is close to linear in that count. 256 is where
+#: measurement puts the turn — a 1024-token prompt takes 91 ms at 64 and 35 ms
+#: at 256 — and going further only wins for a prompt no longer than one chunk.
+#: The quadratic term stays affordable at this width, and the reassociation
+#: costs nothing in accuracy: against the recurrent form, a 1024-position run
+#: is 4e-7 relative at this chunk size, three orders inside bfloat16's own
+#: resolution. Decode does not come through here at all — a single position
+#: takes `_recurrent_gated_delta_rule`.
+_CHUNK = 256
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
