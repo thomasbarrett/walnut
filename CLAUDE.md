@@ -41,9 +41,9 @@ Three skills in `.claude/skills/` cover performance work, and they compose:
 - **`analyze-trace`** — why it is slow. Wraps Perfetto's `trace_processor` for
   traces from `walnut profile` (or `/stop_profile`). Don't read a
   `.trace.json.gz` by hand.
-- **`benchmark`** — how fast it is. TTFT, TPOT, ITL percentiles, and a `compare`
-  that diffs two runs. Numbers quoted to a human come from here, not
-  from a trace.
+- **`benchmark`** — how fast it is. Drives `walnut bench`
+  (`serve`, `throughput`, `latency`, `startup`, `sweep`). Numbers quoted to a
+  human come from here, not from a trace.
 - **`optimize`** — the loop that uses both: baseline, profile, diagnose,
   prototype, implement, re-measure, then a PR from
   `.github/PULL_REQUEST_TEMPLATE/optimize.md` or an honest abandon.

@@ -15,7 +15,8 @@ walnut chat  ──HTTP──▶  server (FastAPI)  ──▶  Engine  ──▶
 - **`walnut/server.py`** — the OpenAI-compatible FastAPI app. Translates HTTP
   requests into `Engine` calls and formats responses (including SSE streaming).
 - **`walnut/engine.py`** — the engine interface plus `Message`,
-  `GenerationConfig`, and the default `TorchEngine`.
+  `GenerationConfig`, `Completion`/`Usage`/`Stream`, and the default
+  `TorchEngine`.
 - **`walnut/scheduler.py`** — the continuous batching loop: a pool of sequence
   slots, decoded as one batch, that requests join and leave as they arrive and
   finish.
@@ -30,10 +31,17 @@ checkpoint and runs it in PyTorch. Because the server depends only on the
 interface, an alternative engine plugs in without touching the HTTP layer:
 
 1. Implement an `Engine` subclass — load weights in `__init__` (or a
-   classmethod), set `model_id`, and produce tokens in `generate`.
-2. Optionally override `stream` for token-by-token streaming; the default yields
-   the whole completion in one chunk.
+   classmethod), set `model_id`, and produce a `Completion` (text plus its
+   `Usage` token counts) from `complete`.
+2. Optionally override `stream` for token-by-token streaming; it returns a
+   `Stream`, which yields text deltas and carries the token counts behind them.
+   The default yields the whole completion in one chunk.
 3. Return it from `load_model` in place of `TorchEngine`.
+
+A `Stream` counts tokens rather than deltas because the two do not always line
+up: detokenization holds a piece back until it completes a character, so one
+delta can carry two tokens. That is why the counts travel with the stream
+instead of being left for the caller to infer.
 
 ## The batch
 

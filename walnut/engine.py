@@ -45,6 +45,70 @@ class GenerationConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     stop: list[str] | None = None
+    seed: int | None = None
+    #: Generate the full ``max_tokens`` even if the model emits end-of-text.
+    #: Not part of the OpenAI schema; it exists because a benchmark cannot
+    #: compare latencies across requests that produced different numbers of
+    #: tokens, and EOS otherwise decides that per request.
+    ignore_eos: bool = False
+
+
+@dataclass(frozen=True)
+class Usage:
+    """Token counts for one completion, in the OpenAI schema's spelling."""
+
+    prompt_tokens: int
+    completion_tokens: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+@dataclass(frozen=True)
+class Completion:
+    """A finished completion and the token counts behind it."""
+
+    text: str
+    usage: Usage
+
+
+class Stream:
+    """The text deltas of one completion, and the tokens behind them.
+
+    Iterating yields the deltas a client sees. `completion_tokens` counts the
+    tokens those deltas were decoded from and is only final once the iterator
+    is exhausted — which is exactly when the OpenAI schema wants usage sent.
+
+    The distinction matters to anything timing the stream: a delta is not a
+    token. Detokenization holds a piece back until it completes a character, so
+    one delta can carry two tokens (an emoji, most CJK) and a client counting
+    deltas under-counts. That is why `usage` exists on the streaming path at
+    all.
+    """
+
+    def __init__(self, prompt_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = 0
+        #: Assigned by the producer, which also advances `completion_tokens`.
+        self.pieces: Iterator[str] = iter(())
+
+    def __iter__(self) -> Iterator[str]:
+        return self
+
+    def __next__(self) -> str:
+        return next(self.pieces)
+
+    @property
+    def usage(self) -> Usage:
+        return Usage(self.prompt_tokens, self.completion_tokens)
 
 
 class Engine:
@@ -52,30 +116,40 @@ class Engine:
 
     Concrete engines carry a loaded model and turn a list of chat messages
     into generated text. Subclasses must set `model_id` and implement
-    `generate`; `stream` is optional and defaults to yielding the
-    full completion in one chunk.
+    `complete`; `stream` is optional and defaults to yielding the full
+    completion in one chunk.
     """
 
     #: Identifier reported by ``GET /v1/models`` and echoed in responses.
     model_id: str
 
-    def generate(self, messages: list[Message], config: GenerationConfig) -> str:
-        """Return a completion for ``messages``."""
+    def complete(self, messages: list[Message], config: GenerationConfig) -> Completion:
+        """Return a completion for ``messages``, with its token counts."""
         raise NotImplementedError
 
-    def stream(
-        self, messages: list[Message], config: GenerationConfig
-    ) -> Iterator[str]:
+    def generate(self, messages: list[Message], config: GenerationConfig) -> str:
+        """Return just the text of a completion for ``messages``."""
+        return self.complete(messages, config).text
+
+    def stream(self, messages: list[Message], config: GenerationConfig) -> Stream:
         """Yield incremental completion chunks.
 
-        The default implementation calls `generate` and yields the whole
+        The default implementation calls `complete` and yields the whole
         result once; override it for true token streaming.
 
         Called before the response is committed, so an implementation that can
         reject a request should do it here rather than on the first pull — by
         then the status code has been sent. See `TorchEngine.stream`.
         """
-        yield self.generate(messages, config)
+        completion = self.complete(messages, config)
+        stream = Stream(completion.usage.prompt_tokens)
+
+        def once() -> Iterator[str]:
+            yield completion.text
+            stream.completion_tokens = completion.usage.completion_tokens
+
+        stream.pieces = once()
+        return stream
 
     def close(self) -> None:
         """Release whatever the engine is holding. Default: nothing to do."""
@@ -340,27 +414,37 @@ class TorchEngine(Engine):
             max_new_tokens=config.max_tokens,
             temperature=config.temperature,
             top_p=config.top_p,
+            seed=config.seed,
         )
 
     def _submit(self, messages: list[Message], config: GenerationConfig) -> Request:
         """Hand one request to the scheduler; its tokens arrive on its queue."""
         params = self._params(config)
         stop_ids = frozenset(params.stop_token_ids)
-        if not stop_ids and self.model.eos_token_id is not None:
+        # No stop ids at all is how the scheduler spells "run to max_tokens":
+        # `_deliver` retires on membership, and nothing is a member.
+        if config.ignore_eos:
+            stop_ids = frozenset()
+        elif not stop_ids and self.model.eos_token_id is not None:
             stop_ids = frozenset({self.model.eos_token_id})
         return self.scheduler.submit(
             Request(prompt=self._encode(messages), params=params, stop_ids=stop_ids)
         )
 
-    def generate(self, messages: list[Message], config: GenerationConfig) -> str:
-        ids = list(self._submit(messages, config).stream())
+    def complete(self, messages: list[Message], config: GenerationConfig) -> Completion:
+        request = self._submit(messages, config)
+        ids = list(request.stream())
         text = self.tokenizer.decode(ids, skip_special_tokens=True)
         cut = _first_stop(text, config.stop)
-        return text if cut is None else text[:cut]
+        # The token count is what the model produced, not what survived a stop
+        # string: the truncated tail was still generated, and billing and
+        # benchmarks both need the work, not the output.
+        return Completion(
+            text=text if cut is None else text[:cut],
+            usage=Usage(int(request.prompt.shape[1]), len(ids)),
+        )
 
-    def stream(
-        self, messages: list[Message], config: GenerationConfig
-    ) -> Iterator[str]:
+    def stream(self, messages: list[Message], config: GenerationConfig) -> Stream:
         """Submit now, yield later.
 
         Deliberately not a generator: the submission — and so the rejection of
@@ -370,14 +454,24 @@ class TorchEngine(Engine):
         status code. Submitting costs nothing to wait for; the request is
         queued, and the model runs on the scheduler's thread.
         """
-        return self._pieces(self._submit(messages, config), config)
+        request = self._submit(messages, config)
+        stream = Stream(int(request.prompt.shape[1]))
+        stream.pieces = self._pieces(request, config, stream)
+        return stream
 
-    def _pieces(self, request: Request, config: GenerationConfig) -> Iterator[str]:
-        """Detokenize a request's ids into the text deltas a client sees."""
+    def _pieces(
+        self, request: Request, config: GenerationConfig, stream: Stream
+    ) -> Iterator[str]:
+        """Detokenize a request's ids into the text deltas a client sees.
+
+        Advances ``stream.completion_tokens`` per token rather than per delta,
+        so the count is right even where the two do not line up.
+        """
         ids: list[int] = []
         emitted = ""
         for tok in request.stream():
             ids.append(tok)
+            stream.completion_tokens = len(ids)
             text = self.tokenizer.decode(ids, skip_special_tokens=True)
             # Wait for complete characters (partial multi-byte decodes to U+FFFD).
             if text.endswith("�"):

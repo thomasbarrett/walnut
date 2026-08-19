@@ -2,7 +2,7 @@ import json
 
 from fastapi.testclient import TestClient
 
-from walnut.engine import Engine
+from walnut.engine import Completion, Engine, GenerationConfig, Usage
 from walnut.scheduler import RequestError
 from walnut.server import create_app
 
@@ -61,7 +61,7 @@ class _RejectingEngine(Engine):
 
     model_id = "test-model"
 
-    def generate(self, messages, config):
+    def complete(self, messages, config):
         raise RequestError("47 prompt tokens exceeds the 16-token context")
 
     def stream(self, messages, config):
@@ -89,3 +89,95 @@ def test_a_rejected_streaming_request_is_a_400_not_a_broken_stream():
     )
     assert response.status_code == 400
     assert "16-token context" in response.json()["detail"]
+
+
+def test_chat_completion_reports_usage(make_client):
+    """The benchmark's token counts come from here, not from counting deltas."""
+    resp = make_client().post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "ping"}]},
+    )
+    usage = resp.json()["usage"]
+    assert usage["prompt_tokens"] == 1
+    assert usage["completion_tokens"] == 2  # "echo: ping"
+    assert usage["total_tokens"] == 3
+
+
+def _sse(resp) -> list[dict]:
+    payloads = [
+        line[len("data: ") :] for line in resp.iter_lines() if line.startswith("data: ")
+    ]
+    assert payloads[-1] == "[DONE]"
+    return [json.loads(p) for p in payloads[:-1]]
+
+
+def test_streaming_omits_usage_unless_it_is_asked_for(make_client):
+    with (
+        make_client() as client,
+        client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "ping"}], "stream": True},
+        ) as resp,
+    ):
+        chunks = _sse(resp)
+    assert all("usage" not in chunk for chunk in chunks)
+
+
+def test_streaming_usage_arrives_as_a_final_choiceless_chunk(make_client):
+    """OpenAI's `stream_options.include_usage` shape, which clients look for:
+    every content chunk carries `usage: null`, and one final chunk carries the
+    counts with no choices."""
+    with (
+        make_client() as client,
+        client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        ) as resp,
+    ):
+        chunks = _sse(resp)
+
+    assert all(chunk["usage"] is None for chunk in chunks[:-1])
+    assert all(chunk["choices"] for chunk in chunks[:-1])
+    final = chunks[-1]
+    assert final["choices"] == []
+    assert final["usage"] == {
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "total_tokens": 3,
+    }
+
+
+class _RecordingEngine(Engine):
+    """Keeps the config it was handed, so pass-through can be asserted."""
+
+    model_id = "test-model"
+
+    def __init__(self) -> None:
+        self.config: GenerationConfig | None = None
+
+    def complete(self, messages, config):
+        self.config = config
+        return Completion(text="ok", usage=Usage(1, 1))
+
+
+def test_seed_and_ignore_eos_reach_the_engine():
+    """Both are pass-through, but a benchmark that silently loses `ignore_eos`
+    gets a different output length per request and never says so."""
+    engine = _RecordingEngine()
+    TestClient(create_app(engine)).post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "ping"}],
+            "seed": 7,
+            "ignore_eos": True,
+        },
+    )
+    assert engine.config is not None
+    assert engine.config.seed == 7
+    assert engine.config.ignore_eos is True

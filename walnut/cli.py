@@ -6,11 +6,17 @@ from typing import Annotated
 
 import typer
 
+from walnut.bench.cli import app as bench_app
+
 app = typer.Typer(
     help="walnut — an inference engine, built on PyTorch.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+# `bench` is a group of its own: five subcommands that measure five
+# different things, and share most of their flags with `serve`.
+app.add_typer(bench_app, name="bench")
 
 DEFAULT_URL = "http://127.0.0.1:8000/v1"
 

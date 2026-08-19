@@ -32,7 +32,7 @@ from prometheus_client import Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
-from .engine import Engine, GenerationConfig, Message
+from .engine import Engine, GenerationConfig, Message, Stream
 from .scheduler import RequestError
 from .telemetry import configure_logging
 
@@ -117,6 +117,10 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
@@ -125,6 +129,13 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     stop: list[str] | str | None = None
     stream: bool = False
+    stream_options: StreamOptions | None = None
+    seed: int | None = None
+    #: walnut-specific, borrowed from vLLM: generate the full ``max_tokens``
+    #: even if the model emits end-of-text. A load generator needs every
+    #: request to produce the same number of tokens, and EOS otherwise decides
+    #: that per request, which makes per-request latencies incomparable.
+    ignore_eos: bool = False
 
 
 def _stop_list(stop: list[str] | str | None) -> list[str] | None:
@@ -244,6 +255,8 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
             temperature=req.temperature,
             top_p=req.top_p,
             stop=_stop_list(req.stop),
+            seed=req.seed,
+            ignore_eos=req.ignore_eos,
         )
         completion_id = f"chatcmpl-{int(time.time() * 1000):x}"
         created = int(time.time())
@@ -257,14 +270,23 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
             # a generator, so anything it calls runs after the 200 has been
             # committed, and a rejection would reach the client as a stream
             # that stops for no stated reason.
-            pieces = engine.stream(messages, config)
+            stream = engine.stream(messages, config)
+            options = req.stream_options or StreamOptions()
             return StreamingResponse(
-                _stream_chunks(pieces, engine, completion_id, created, labels, start),
+                _stream_chunks(
+                    stream,
+                    engine,
+                    completion_id,
+                    created,
+                    labels,
+                    start,
+                    include_usage=options.include_usage,
+                ),
                 media_type="text/event-stream",
             )
 
         try:
-            content = engine.generate(messages, config)
+            completion = engine.complete(messages, config)
         except Exception as exc:
             _observe_duration(labels, start, type(exc).__qualname__)
             raise
@@ -277,10 +299,11 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": content},
+                    "message": {"role": "assistant", "content": completion.text},
                     "finish_reason": "stop",
                 }
             ],
+            "usage": completion.usage.as_dict(),
         }
 
     def _profiler() -> TorchProfiler:
@@ -349,18 +372,24 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
 
 
 def _stream_chunks(
-    pieces: Iterator[str],
+    stream: Stream,
     engine: Engine,
     completion_id: str,
     created: int,
     labels: dict[str, str],
     start: float,
+    include_usage: bool = False,
 ) -> Iterator[str]:
     """Yield Server-Sent Events in the OpenAI streaming chunk format.
 
     Token timings are taken here: the streamed pieces are the only
     token-granular signal `Engine` exposes, so only streaming requests get
     them.
+
+    ``include_usage`` appends the OpenAI usage chunk — one final event with an
+    empty ``choices`` and the token counts. A client cannot derive those from
+    the stream, because a delta is held back until it completes a character and
+    so does not always mean one token.
     """
 
     def event(delta: dict, finish_reason: str | None) -> str:
@@ -371,6 +400,8 @@ def _stream_chunks(
             "model": engine.model_id,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
+        if include_usage:
+            chunk["usage"] = None
         return f"data: {json.dumps(chunk)}\n\n"
 
     # The role delta carries no generated text, so it doesn't mark first token.
@@ -378,7 +409,7 @@ def _stream_chunks(
     previous: float | None = None
     error_type = ""
     try:
-        for piece in pieces:
+        for piece in stream:
             if not piece:
                 continue
             now = time.perf_counter()
@@ -389,6 +420,17 @@ def _stream_chunks(
             previous = now
             yield event({"content": piece}, None)
         yield event({}, "stop")
+        if include_usage:
+            # After the last content chunk, so `completion_tokens` is final.
+            usage = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": engine.model_id,
+                "choices": [],
+                "usage": stream.usage.as_dict(),
+            }
+            yield f"data: {json.dumps(usage)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as exc:
         error_type = type(exc).__qualname__
