@@ -19,10 +19,6 @@ description: >-
 uv run walnut bench latency <model> --label baseline -o /tmp/before.json
 ```
 
-Before editing anything — a baseline reconstructed later is worth less and
-costs more. Run it twice on the same build, as separate processes: that delta
-is the noise floor, and anything smaller later is not a result.
-
 `latency` is the decode path alone, the right probe for a kernel or graph
 change. If you are about to change the scheduler, batching or admission, take
 the baseline with `walnut bench serve` instead — a single stream cannot see
