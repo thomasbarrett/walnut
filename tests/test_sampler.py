@@ -78,3 +78,39 @@ def test_batched_logits_sample_per_row():
     assert out.shape == (2, 1)
     assert out[0].item() == 0
     assert out[1].item() == 1
+
+
+def test_sample_batch_gives_each_row_its_own_params():
+    """Rows of a serving batch belong to different requests, so one row's
+    temperature must not decide another's token."""
+    logits = torch.tensor([[0.0, 0.0, 9.0], [9.0, 0.0, 0.0]])
+    greedy = SamplingParams(temperature=0.0)
+    out = sample.sample_batch(logits, [greedy, greedy])
+    assert out.shape == (2, 1)
+    assert out[0].item() == 2 and out[1].item() == 0
+
+
+def test_sample_batch_matches_sampling_each_row_alone():
+    torch.manual_seed(0)
+    logits = torch.randn(3, 32)
+    params = [
+        SamplingParams(temperature=0.0),
+        SamplingParams(temperature=0.0, top_k=4),
+        SamplingParams(temperature=0.0),
+    ]
+    batched = sample.sample_batch(logits, params)
+    alone = [sample(logits[i : i + 1], p) for i, p in enumerate(params)]
+    assert [t.item() for t in batched] == [t.item() for t in alone]
+
+
+def test_sample_batch_keeps_a_seeded_row_to_itself():
+    """A seeded request draws from its own generator, so it cannot share a
+    `multinomial` call with the rest of the batch."""
+    logits = torch.randn(2, 16).repeat(1, 1)
+    seeded = SamplingParams(temperature=1.0, seed=7)
+    plain = SamplingParams(temperature=1.0)
+    gens = [torch.Generator().manual_seed(7), None]
+    first = sample.sample_batch(logits, [seeded, plain], gens)
+    gens = [torch.Generator().manual_seed(7), None]
+    second = sample.sample_batch(logits, [seeded, plain], gens)
+    assert first[0].item() == second[0].item()

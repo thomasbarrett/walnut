@@ -17,6 +17,7 @@ rather than being built here. Logging is set up in `walnut.telemetry`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -26,12 +27,13 @@ from typing import TYPE_CHECKING
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
 from .engine import Engine, GenerationConfig, Message
+from .scheduler import RequestError
 from .telemetry import configure_logging
 
 if TYPE_CHECKING:  # importing the profiler pulls in torch; keep it off the hot path
@@ -168,7 +170,29 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
     ``profiler`` enables ``/start_profile`` and ``/stop_profile``; without one
     those routes report 404.
     """
-    app = FastAPI(title="walnut", version="0.1.0")
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI):
+        """Shut the engine down with the server.
+
+        Without this the scheduler thread is abandoned mid-batch: it is a
+        daemon, so the process still exits, but whatever it was serving is
+        dropped without the callers being told.
+        """
+        yield
+        engine.close()
+
+    app = FastAPI(title="walnut", version="0.1.0", lifespan=lifespan)
+
+    @app.exception_handler(RequestError)
+    def request_rejected(request: Request, exc: RequestError):
+        """A request the scheduler cannot run is the caller's error, not ours.
+
+        Both paths reach it: `Engine.stream` is called in the handler, before
+        the response is committed, precisely so that a rejection is still a
+        status code rather than a stream that stops without saying why.
+        """
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     # HTTP request metrics + the /metrics endpoint (excluded from its own stats).
     Instrumentator(excluded_handlers=["/metrics"]).instrument(app).expose(
@@ -229,10 +253,13 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
         start = time.perf_counter()
 
         if req.stream:
+            # Pulled here rather than inside the generator: `_stream_chunks` is
+            # a generator, so anything it calls runs after the 200 has been
+            # committed, and a rejection would reach the client as a stream
+            # that stops for no stated reason.
+            pieces = engine.stream(messages, config)
             return StreamingResponse(
-                _stream_chunks(
-                    engine, messages, config, completion_id, created, labels, start
-                ),
+                _stream_chunks(pieces, engine, completion_id, created, labels, start),
                 media_type="text/event-stream",
             )
 
@@ -322,9 +349,8 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
 
 
 def _stream_chunks(
+    pieces: Iterator[str],
     engine: Engine,
-    messages: list[Message],
-    config: GenerationConfig,
     completion_id: str,
     created: int,
     labels: dict[str, str],
@@ -352,7 +378,7 @@ def _stream_chunks(
     previous: float | None = None
     error_type = ""
     try:
-        for piece in engine.stream(messages, config):
+        for piece in pieces:
             if not piece:
                 continue
             now = time.perf_counter()

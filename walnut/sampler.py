@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -48,3 +49,40 @@ class Sampler(nn.Module):
             probs = probs / probs.sum(dim=-1, keepdim=True)
 
         return torch.multinomial(probs, num_samples=1, generator=generator)
+
+    def sample_batch(
+        self,
+        logits: torch.Tensor,
+        params: Sequence[SamplingParams],
+        generators: Sequence[torch.Generator | None] = (),
+    ) -> torch.Tensor:
+        """Draw one token per row of ``logits`` (B, vocab) under per-row params.
+
+        Rows of a serving batch belong to different requests, so temperature,
+        top-p and top-k vary down the batch. Rows that ask for the same thing
+        are sampled together — one call covers the whole batch whenever the
+        requests agree, which is the common case — and only genuinely different
+        settings cost a second pass. A row with its own generator is its own
+        group: `torch.multinomial` draws from one generator per call, so a
+        seeded request cannot share a draw with anything else.
+        """
+        rows = len(params)
+        gens: Sequence[torch.Generator | None] = generators or [None] * rows
+        groups: dict[tuple, list[int]] = {}
+        for row, param in enumerate(params):
+            key = (
+                (row,)
+                if gens[row] is not None
+                else (param.temperature, param.top_p, param.top_k)
+            )
+            groups.setdefault(key, []).append(row)
+
+        if len(groups) == 1:
+            return self(logits, params[0], gens[0])
+
+        out = torch.empty(rows, 1, dtype=torch.long, device=logits.device)
+        for members in groups.values():
+            index = torch.tensor(members, device=logits.device)
+            head = members[0]
+            out[index] = self(logits[index], params[head], gens[head])
+        return out

@@ -103,8 +103,8 @@ class Qwen3_5Attention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cache: KVCache | None = None,
-        input_pos: torch.Tensor | None = None,
+        cache: KVCache,
+        input_pos: torch.Tensor,
     ) -> torch.Tensor:
         bsz, seq, _ = x.shape
 
@@ -173,8 +173,8 @@ class Qwen3_5DecoderLayer(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cache: Cache | None = None,
-        input_pos: torch.Tensor | None = None,
+        cache: Cache,
+        input_pos: torch.Tensor,
     ) -> torch.Tensor:
         normed = self.input_layernorm(x)
         if self.block_type == "full_attention":
@@ -230,7 +230,8 @@ class Qwen3_5TextModel(nn.Module):
         input_ids: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        cache: list[Cache] | None = None,
+        *,
+        cache: list[Cache],
     ) -> torch.Tensor:
         if inputs_embeds is None:
             assert input_ids is not None
@@ -245,7 +246,7 @@ class Qwen3_5TextModel(nn.Module):
                 h,
                 cos,
                 sin,
-                cache[i] if cache is not None else None,
+                cache[i],
                 input_pos=positions,
             )
         return self.norm(h)
@@ -578,7 +579,8 @@ class Qwen3_5Model(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        cache: list[Cache] | None = None,
+        *,
+        cache: list[Cache],
     ) -> torch.Tensor:
         if pixel_values is None:
             return self.language_model(input_ids, positions, cache=cache)
@@ -626,7 +628,8 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
-        cache: list[Cache] | None = None,
+        *,
+        cache: list[Cache],
     ) -> torch.Tensor:
         hidden = self.model(
             input_ids,
@@ -634,9 +637,22 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             pixel_values,
             image_grid_thw,
             mm_token_type_ids,
-            cache,
+            cache=cache,
         )
         return self.lm_head(hidden)
+
+    def make_cache(self, max_batch_size: int, max_seq_len: int) -> list[Cache]:
+        """A decode-state pool: ``max_batch_size`` slots of ``max_seq_len``.
+
+        What `walnut.scheduler.Scheduler` batches over; `iter_generate` builds
+        its own single-slot cache sized to the one request it serves.
+        """
+        return self.model.language_model.make_cache(
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            dtype=self.lm_head.weight.dtype,
+            device=self.lm_head.weight.device,
+        )
 
     @torch.no_grad()
     def iter_generate(
@@ -687,6 +703,10 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             device=input_ids.device,
         )
         positions = torch.arange(seq, device=input_ids.device)
+        # Decode positions carry a batch dim even at batch 1: the cache writes
+        # and the attention mask read one position per row, and a fixed buffer
+        # is what the captured graph copies into.
+        decode_pos = torch.zeros(1, 1, dtype=torch.long, device=input_ids.device)
 
         # Separate functions so a profile can name the phases; inlining either
         # back into the loop leaves a trace that cannot be read per phase.
@@ -703,11 +723,11 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             token: torch.Tensor, position: int
         ) -> tuple[torch.Tensor, int]:
             """Advance one token: replay or forward, then sample."""
+            decode_pos.fill_(position)
             if graph is not None:
-                logits = graph.replay(token, position)
+                logits = graph.replay(token, decode_pos)
             else:
-                pos = torch.tensor([position], device=input_ids.device)
-                logits = decode_forward(token, positions=pos, cache=cache)
+                logits = decode_forward(token, positions=decode_pos, cache=cache)
             next_token = self.sampler(logits[:, -1], params, gen)
             return next_token, int(next_token.item())
 

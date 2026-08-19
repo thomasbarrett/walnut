@@ -6,6 +6,10 @@ Generated from the source docstrings.
 
 ::: walnut.engine
 
+## Scheduler
+
+::: walnut.scheduler
+
 ## Server
 
 ::: walnut.server

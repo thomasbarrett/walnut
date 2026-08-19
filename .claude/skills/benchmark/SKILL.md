@@ -33,15 +33,32 @@ sequence every step — an O(n²) Python cost that shows up as ~4% ITL drift ove
 1024 tokens and is not the engine. That detokenizer is a real serving cost;
 it is just not a decode cost, and conflating them hides both.
 
-**These are single-stream numbers.** walnut serves one request at a time, so
-there is no request rate, concurrency or goodput to sweep, and `tok/s` is
-per-stream output throughput, not system throughput. When walnut gains
-continuous batching this skill needs a load generator and the sweep that goes
-with it.
+**`tok/s` is per-stream output throughput, not system throughput.** Left alone,
+`run` drives the model directly — one request, no scheduler — which is what
+every record taken before continuous batching measured, and what to use for a
+decode-path regression check.
 
-**`tok/s` is a function of `--tokens`** — 553 at 128, ~499 at 512, ~447 at 1024,
-because the KV cache is sized `prompt + max_new_tokens` and attention runs over
-the whole static window. Never quote it without the token count.
+`--concurrency N` switches to the served path: N requests released at once
+through the scheduler, with `--max-batch-size` (defaulting to N) sizing the
+batch they land in. Per-request metrics are then pooled across the streams and
+`system_tok_per_s` reports what the engine produced in total, which is the
+number a batch size is chosen for. `compare` refuses to read a served record
+against a direct one, so the two never get mixed up.
+
+```bash
+uv run python $BENCH run Qwen/Qwen3.5-0.8B --concurrency 8 -o /tmp/c8.json
+```
+
+A sweep over 1, 2, 4, 8 says what concurrency costs a stream and buys the
+engine. Note the streams all arrive together, which is the worst case for TTFT
+— every prefill queues behind the others. This is not a rate-based load
+generator and cannot answer questions about arrival patterns or goodput.
+
+**`tok/s` still falls as `--tokens` rises**, because a longer sequence is more
+KV to read each step — but only by what the sequence has actually reached.
+Attention runs through `varlen_attn`, which takes each row's length as a
+tensor, so a decode step no longer costs the whole allocated window. Quote
+`tok/s` with the token count regardless.
 
 ## Take a baseline
 
