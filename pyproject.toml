@@ -96,7 +96,7 @@ dev = [
     "perfetto>=0.57.0",
 ]
 docs = [
-    "mkdocs-material>=9.7.6",
+    "mkdocs-material>=9.7.7",
     "mkdocs-typer2>=0.4.1",
     "mkdocstrings[python]>=1.0.6",
 ]
