@@ -115,7 +115,7 @@ $ uv run walnut serve Qwen/Qwen3.5-0.8B --no-autotune
 ## Sampling while profiling
 
 `walnut profile` decodes greedily by default (`--temperature 0`), which is what
-the benchmark under `.claude/skills/benchmark/` measures. Matching matters: at
+`walnut bench` measures. Matching matters: at
 `--temperature 1.0` the sampler's softmax over a 248k vocabulary is the largest
 non-graph kernel in the trace, and a greedy run never executes it — so a trace
 taken at a different temperature describes a different workload than the numbers
@@ -126,6 +126,39 @@ Raise it when the sampler is what you are profiling.
 ```console
 $ uv run walnut profile Qwen/Qwen3.5-0.8B --temperature 1.0
 ```
+
+## Benchmarking
+
+`walnut bench` has five subcommands, each answering a different question:
+
+| | drives | answers |
+|---|---|---|
+| `serve` | a running server, over HTTP | what a client gets, under load |
+| `throughput` | the engine in-process, all requests at once | the engine's ceiling |
+| `latency` | the model in-process, one stream | what a kernel change moved |
+| `startup` | engine construction, repeatedly | what a restart costs |
+| `sweep` | `serve`, up a ladder of request rates | where capacity runs out |
+
+`serve` and `sweep` drive a server you start yourself; the other three load the
+model in-process and take the same `--device`, `--dtype`, `--cuda-graph`,
+`--compile` and `--autotune` flags as `walnut serve`.
+
+```console
+$ uv run walnut serve Qwen/Qwen3.5-0.8B --max-batch-size 16 &
+$ uv run walnut bench serve --request-rate 16 --num-prompts 120 \
+    --goodput ttft:250 --goodput tpot:10
+```
+
+Every subcommand takes `--num-iters-warmup`, and every default is non-zero. The
+first pass through a fresh process compiles the decode step, autotunes it and
+captures a CUDA graph; measuring that iteration reports a compile time as a
+latency. `walnut bench startup` is where that cost is the measurement rather
+than the contaminant — each of its iterations builds a whole engine and
+discards it, so the warm-ups absorb the cold compile and what remains is what a
+restart pays.
+
+`-o record.json` writes the full record, including the distributions the
+printed table only digests.
 
 ## Environment variables
 

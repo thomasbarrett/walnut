@@ -37,6 +37,18 @@ Where walnut narrows or diverges from the spec:
 - **Streaming** emits `chat.completion.chunk` events as `text/event-stream`,
   terminated by a `data: [DONE]` sentinel — the same shape the OpenAI SDK
   consumes.
+- **`stream_options: {"include_usage": true}`** appends one final chunk with an
+  empty `choices` and the token counts, as the OpenAI spec describes. Worth
+  asking for: a delta is not always a token — the detokenizer holds a piece
+  back until it completes a character — so counting deltas under-counts, and a
+  client measuring per-token latency from delta counts reads high.
+  Non-streaming responses always carry `usage`.
+- **`seed`** makes sampling reproducible for one request. Ignored at
+  `temperature: 0`, which is already deterministic.
+- **`ignore_eos`** (not in the OpenAI spec; borrowed from vLLM) generates the
+  full `max_tokens` even when the model emits end-of-text. It exists for load
+  generators: requests that stopped at different lengths have latencies that
+  cannot be compared with each other.
 
 ## Quick check
 

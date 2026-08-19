@@ -33,8 +33,8 @@ Cover at minimum:
 
 ## Accuracy
 
-<!-- Does the model still produce the same thing? `bench.py compare` prints an
-`output:` line comparing a hash of greedy output. Paste it.
+<!-- Does the model still produce the same thing? `walnut bench latency` prints
+an `output sha` line hashing its greedy output. Paste it from both runs.
 
 If the output changed, that is not automatically a failure — but it has to be
 explained here, with evidence that the new output is correct, before any
@@ -42,20 +42,19 @@ speedup below is worth reading. -->
 
 ## Benchmark results
 
-<!-- `bench.py compare` output, verbatim. It already carries the configuration
-line (model, GPU, dtype, prompt/output tokens, repeats), so don't restate it.
+<!-- Both tables, verbatim, with the model, GPU, dtype and token counts they
+were taken at.
 
-Include every metric it prints, not the flattering subset. If TTFT regressed
-while TPOT improved, that is the interesting part of the PR. -->
+Include every metric printed, not the flattering subset. If TTFT regressed
+while TPOT improved, that is the interesting part of the PR. Each table carries
+a `cv` column — quote a change only if it clears about twice it. -->
 
 ```
-BENCH=.claude/skills/benchmark/scripts/bench.py
-uv run python $BENCH run <model> --label before -o before.json   # on main
-uv run python $BENCH run <model> --label after  -o after.json    # on this branch
-uv run python $BENCH compare before.json after.json
+uv run walnut bench latency <model> --label before -o before.json  # on main
+uv run walnut bench latency <model> --label after  -o after.json   # on this branch
 ```
 
-<!-- paste the compare table here -->
+<!-- paste both tables here -->
 
 ## Profiling results
 

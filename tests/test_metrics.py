@@ -1,9 +1,8 @@
-from collections.abc import Iterator
-
 from fastapi.testclient import TestClient
 from prometheus_client import REGISTRY
 
 from tests.conftest import StubEngine
+from walnut.engine import Stream
 from walnut.server import create_app
 
 
@@ -14,9 +13,16 @@ class ChunkyEngine(StubEngine):
         super().__init__(model_id)
         self.pieces = pieces
 
-    def stream(self, messages, config) -> Iterator[str]:
-        for index in range(self.pieces):
-            yield f"tok{index} "
+    def stream(self, messages, config) -> Stream:
+        stream = Stream(prompt_tokens=1)
+
+        def pieces():
+            for index in range(self.pieces):
+                stream.completion_tokens = index + 1
+                yield f"tok{index} "
+
+        stream.pieces = pieces()
+        return stream
 
 
 # StubEngine's model id, as both model attributes report it.

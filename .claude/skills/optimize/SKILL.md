@@ -16,13 +16,18 @@ description: >-
 ## 1. Benchmark
 
 ```bash
-BENCH=.claude/skills/benchmark/scripts/bench.py
-uv run python $BENCH run <model> --label baseline -o /tmp/before.json
+uv run walnut bench latency <model> --label baseline -o /tmp/before.json
 ```
 
 Before editing anything — a baseline reconstructed later is worth less and
-costs more. Run it twice on the same build and `compare` the two: that delta is
-the noise floor, and anything smaller later is not a result.
+costs more. Run it twice on the same build, as separate processes: that delta
+is the noise floor, and anything smaller later is not a result.
+
+`latency` is the decode path alone, the right probe for a kernel or graph
+change. If you are about to change the scheduler, batching or admission, take
+the baseline with `walnut bench serve` instead — a single stream cannot see
+queueing, and `latency` reports no change while the tail moves. Sizing a batch
+is `walnut bench throughput`.
 
 ## 2. Trace
 
@@ -63,15 +68,18 @@ code; it's the cheapest way to kill a bad idea. Then implement following
 ## 5. Re-benchmark
 
 ```bash
-uv run ruff format --check && uv run ruff check && uv run ty check && uv run pytest
-uv run python $BENCH run <model> --label <change> -o /tmp/after.json
-uv run python $BENCH compare /tmp/before.json /tmp/after.json
+uvx prek run --all-files --stage pre-push
+uv run walnut bench latency <model> --label <change> -o /tmp/after.json
 ```
 
-`compare` exits non-zero if the two runs measured different things. Read the
-`output:` line first: sampling is greedy, so a changed hash means changed
-numerics. One prompt at one temperature is a weak correctness check, so re-run
-with a second `--prompt` and a longer `--tokens` before believing it.
+Read the `output sha` line first: sampling is greedy, so a changed hash means
+changed numerics, and nothing below it counts until that is explained. One
+prompt at one temperature is a weak correctness check, so re-run with a second
+`--prompt` and a longer `--max-tokens` before believing it.
+
+Both runs have to have measured the same thing — same model, device, dtype,
+prompt, token count and flags — or the difference is not a result. Each table
+prints a `cv` column; a change wants to clear about twice it.
 
 Then capture a second trace and re-run the query that produced the diagnosis —
 the mechanism you named should be the one that moved.
@@ -91,5 +99,5 @@ git push -u origin perf-<change>
 gh pr create --title "perf: ..." --body-file <scratch>/pr.md
 ```
 
-Paste the `compare` table and the before/after trace query output into the body;
-traces are gitignored, so a path helps nobody.
+Paste the before and after tables and the before/after trace query output into
+the body; traces are gitignored, so a path helps nobody.
