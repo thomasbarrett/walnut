@@ -77,6 +77,44 @@ def metrics_table(metrics: dict[str, Any], rows: tuple) -> None:
         print("* rank equals the sample count: this is the maximum, not a tail.")
 
 
+def slo_terms(slos: dict[str, float]) -> str:
+    return ", ".join(f"{key} <= {limit * 1e3:.0f} ms" for key, limit in slos.items())
+
+
+def at_slo(
+    rungs: list[dict[str, Any]], slos: dict[str, float], where: Any = None
+) -> None:
+    """The one figure a deployment is chosen on: system throughput with every
+    request inside the interactivity asked for.
+
+    Quoting either axis alone decides nothing — output tok/s keeps climbing
+    through the load at which goodput collapses, and a latency without a load
+    describes an idle machine. ``where`` names the winning rung when there was
+    a ladder to choose from.
+    """
+    if not slos:
+        print(
+            "\n! no --goodput SLOs, so there is no throughput-at-an-SLO to "
+            "report.\n  Output tok/s alone keeps rising past the point the "
+            "tail stops being servable."
+        )
+        return
+    cleared = [r for r in rungs if (r["goodput_fraction"] or 0.0) >= 1.0]
+    if not cleared:
+        print(
+            f"\n! no rung served every request inside {slo_terms(slos)}. There "
+            "is no throughput to quote\n  at this SLO — loosen it, or measure "
+            "below the lowest load offered here."
+        )
+        return
+    best = max(cleared, key=lambda r: r["output_throughput"])
+    at = f" at {where(best)}" if where else ""
+    print(
+        f"\n{best['output_throughput']:.0f} tok/s{at} with every request "
+        f"inside {slo_terms(slos)}."
+    )
+
+
 # -- serve ------------------------------------------------------------------
 
 
@@ -115,6 +153,7 @@ def report_serve(record: dict[str, Any]) -> None:
         rows += (("queue_wait", "queue wait (ms)"),)
     metrics_table(metrics, rows)
     rule(columns=columns)
+    at_slo([record], record["goodput_slos_seconds"])
     serve_warnings(record)
 
 
@@ -179,7 +218,9 @@ def shortfall(record: dict[str, Any]) -> float:
 # -- sweep ------------------------------------------------------------------
 
 
-def report_sweep(rungs: list[dict[str, Any]], stopped: str) -> None:
+def report_sweep(
+    rungs: list[dict[str, Any]], stopped: str, slos: dict[str, float] | None = None
+) -> None:
     def tail(record: dict[str, Any], key: str) -> float:
         stats = record["metrics"].get(key) or {}
         return stats.get("p99", 0.0)
@@ -206,6 +247,8 @@ def report_sweep(rungs: list[dict[str, Any]], stopped: str) -> None:
             "\nevery rung kept up: the knee is above the highest rate offered. "
             "Extend the --request-rate ladder."
         )
+    if slos is not None:
+        at_slo(rungs, slos, where=lambda r: f"{r['request_rate']:g} req/s")
 
 
 def report_frontier(rungs: list[dict[str, Any]], slos: dict[str, float]) -> None:
@@ -237,27 +280,7 @@ def report_frontier(rungs: list[dict[str, Any]], slos: dict[str, float]) -> None
             f"{'—' if fraction is None else f'{fraction * 100:.0f}%':>8}"
         )
     print("=" * 78)
-
-    if slos:
-        cleared = [r for r in rungs if (r["goodput_fraction"] or 0) >= 1.0]
-        if cleared:
-            best = max(cleared, key=lambda r: r["output_throughput"])
-            terms = ", ".join(f"{k} p100 <= {v * 1e3:.0f} ms" for k, v in slos.items())
-            print(
-                f"\n{best['output_throughput']:.0f} tok/s at "
-                f"concurrency {best['max_concurrency']} — the most throughput "
-                f"on this ladder with every request inside {terms}."
-            )
-        else:
-            print(
-                "\nno rung served every request inside the SLOs. The frontier "
-                "starts below the lowest concurrency offered."
-            )
-    else:
-        print(
-            "\npass --goodput to name the interactivity you need, and the "
-            "throughput at it is read off rather than eyeballed."
-        )
+    at_slo(rungs, slos, where=lambda r: f"concurrency {r['max_concurrency']}")
 
 
 # -- latency ----------------------------------------------------------------

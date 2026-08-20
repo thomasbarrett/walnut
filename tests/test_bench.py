@@ -26,7 +26,11 @@ from walnut.bench.online import (
     run_serve,
     run_sweep,
 )
-from walnut.bench.report import report_frontier, report_sweep, shortfall
+from walnut.bench.report import (
+    at_slo,
+    report_sweep,
+    shortfall,
+)
 from walnut.bench.workload import (
     Shape,
     arrival_delays,
@@ -340,20 +344,37 @@ def _frontier_rung(limit, tok_per_s, tpot_p99, fraction=None):
     }
 
 
-def test_the_frontier_names_the_throughput_at_the_slo(capsys):
-    """The number a deployment is actually chosen on: the most throughput
-    available with every request still inside the interactivity asked for.
-    Reading it off the table by eye is how a rung that missed the SLO gets
-    quoted as capacity."""
+def test_the_slo_headline_takes_the_best_rung_that_cleared_every_request(capsys):
+    """Throughput alone keeps climbing past the load at which the tail stops
+    being servable, so the highest number on the ladder is the wrong one to
+    quote. The figure is the most throughput with *every* request inside the
+    SLO — not the most throughput."""
     rungs = [
         _frontier_rung(1, 600.0, 1.6, 1.0),
         _frontier_rung(8, 1980.0, 4.0, 1.0),
-        _frontier_rung(64, 2400.0, 22.0, 0.4),
+        _frontier_rung(64, 2400.0, 22.0, 0.97),
     ]
-    report_frontier(rungs, {"tpot": 0.010})
+    at_slo(
+        rungs, {"tpot": 0.010}, where=lambda r: f"concurrency {r['max_concurrency']}"
+    )
     out = capsys.readouterr().out
     assert "1980 tok/s at concurrency 8" in out
-    assert "2400" not in out.split("=" * 78)[-1]
+    assert "2400" not in out
+
+
+def test_the_slo_headline_refuses_when_no_rung_cleared(capsys):
+    """Nothing to quote is a result. Falling back to the closest rung would
+    publish a throughput at an SLO it never met."""
+    at_slo([_frontier_rung(8, 1980.0, 40.0, 0.4)], {"tpot": 0.010})
+    out = capsys.readouterr().out
+    assert "no rung served every request" in out
+    assert "1980" not in out
+
+
+def test_the_slo_headline_says_why_it_is_absent_without_goodput(capsys):
+    """Silence would read as "no SLO was missed"."""
+    at_slo([_frontier_rung(8, 1980.0, 4.0)], {})
+    assert "no --goodput" in capsys.readouterr().out
 
 
 def test_sweep_reports_the_rung_it_stopped_on(capsys):
@@ -363,6 +384,16 @@ def test_sweep_reports_the_rung_it_stopped_on(capsys):
     assert "Rate Sweep" in out
     assert "70%" in out
     assert "stopped at 16 req/s" in out
+
+
+def test_a_rate_sweep_quotes_the_same_figure(capsys):
+    """One number, one meaning, whichever axis produced it: a throughput at a
+    stated interactivity reads the same off either ladder."""
+    rungs = [_rung(8.0, 7.9, 1.0), _rung(16.0, 15.9, 0.70)]
+    report_sweep(rungs, "stopped at 16 req/s", {"ttft": 0.25})
+    out = capsys.readouterr().out
+    assert "500 tok/s at 8 req/s" in out
+    assert "ttft <= 250 ms" in out
 
 
 def test_sweep_says_so_when_nothing_ever_broke(capsys):
