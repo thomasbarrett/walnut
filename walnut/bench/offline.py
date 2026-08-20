@@ -43,6 +43,7 @@ class EngineOptions:
     max_batch_size: int = 1
     max_seq_len: int | None = None
     kv_tokens: int | None = None
+    prefix_checkpoints: int = 16
     prefill_chunk: int = 2048
 
     def load(self) -> Any:
@@ -63,6 +64,7 @@ class EngineOptions:
             max_batch_size=self.max_batch_size,
             max_seq_len=self.max_seq_len,
             kv_tokens=self.kv_tokens,
+            prefix_checkpoints=self.prefix_checkpoints,
             prefill_chunk=self.prefill_chunk,
         )
 

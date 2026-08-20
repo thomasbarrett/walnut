@@ -24,6 +24,7 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
+from walnut.cache import PAGE_SIZE, TokenCache
 from walnut.models import resolve_model_class
 from walnut.sampler import SamplingParams
 from walnut.scheduler import Request, Scheduler
@@ -362,6 +363,7 @@ class TorchEngine(Engine):
         max_seq_len: int | None = None,
         prefill_chunk: int = 2048,
         kv_tokens: int | None = None,
+        prefix_checkpoints: int = 16,
     ) -> None:
         self.model_id = model_id
         self.cuda_graph = cuda_graph
@@ -374,6 +376,7 @@ class TorchEngine(Engine):
         self.max_seq_len = resolve_max_seq_len(max_seq_len, config)
         self.prefill_chunk = prefill_chunk
         self.kv_tokens = kv_tokens
+        self.prefix_checkpoints = prefix_checkpoints
         model_class = resolve_model_class(config)
         with _build_on(self.device, self.dtype):
             model: Any = model_class(config)
@@ -388,11 +391,32 @@ class TorchEngine(Engine):
             max_batch_size=max_batch_size,
             max_seq_len=self.max_seq_len,
             kv_tokens=kv_tokens,
+            prefix_checkpoints=prefix_checkpoints,
             cuda_graph=cuda_graph,
             compile=compile,
             autotune=autotune,
             prefill_chunk=prefill_chunk,
         )
+
+    @property
+    def kv_capacity(self) -> int:
+        """Tokens of key/value cache the whole batch shares."""
+        return self.scheduler.pool.pages * PAGE_SIZE
+
+    @property
+    def kv_bytes(self) -> int:
+        """What that pool cost, across every layer holding one."""
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for cache in self.scheduler.pool.caches
+            if isinstance(cache, TokenCache)
+            for tensor in cache.buffers()
+        )
+
+    @property
+    def prefix_bytes(self) -> int:
+        """What the prefix cache's recurrent-state checkpoints cost."""
+        return self.scheduler.prefix.checkpoints.bytes
 
     def start(self) -> None:
         """Compile, capture the decode graphs, and start the scheduler.
@@ -434,8 +458,16 @@ class TorchEngine(Engine):
             stop_ids = frozenset()
         elif not stop_ids and self.model.eos_token_id is not None:
             stop_ids = frozenset({self.model.eos_token_id})
+        prompt = self._encode(messages)
         return self.scheduler.submit(
-            Request(prompt=self._encode(messages), params=params, stop_ids=stop_ids)
+            Request(
+                prompt=prompt,
+                params=params,
+                stop_ids=stop_ids,
+                # Read back here rather than in the scheduler: the loop cannot
+                # wait on the device, and this thread is about to block anyway.
+                ids=prompt[0].tolist(),
+            )
         )
 
     def complete(self, messages: list[Message], config: GenerationConfig) -> Completion:
@@ -504,6 +536,7 @@ def load_model(
     max_seq_len: int | None = None,
     prefill_chunk: int = 2048,
     kv_tokens: int | None = None,
+    prefix_checkpoints: int = 16,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
@@ -523,7 +556,10 @@ def load_model(
     them, so a lower figure serves the same batch whenever prompts are shorter
     than the context allows. ``prefill_chunk`` is how many prompt tokens run
     between decode steps, which bounds the gap a prompt puts in every other
-    request's token stream.
+    request's token stream. ``prefix_checkpoints`` is how many recurrent-state
+    snapshots the prefix cache may hold, which is what decides how many shared
+    prompt prefixes it can actually skip; 0 turns reuse off. See
+    `walnut.cache.radix`.
     """
     return TorchEngine(
         model_id=model,
@@ -536,4 +572,5 @@ def load_model(
         max_seq_len=max_seq_len,
         prefill_chunk=prefill_chunk,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
     )

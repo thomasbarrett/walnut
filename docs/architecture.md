@@ -80,7 +80,17 @@ One background thread runs the loop:
    holds are stepped as well, which is why the pool keeps one scratch page for
    their writes to land in.
 4. **Retire** any sequence that hit a stop token, its token limit, or a client
-   that went away, freeing its row and pages for the next admission.
+   that went away, freeing its row and offering its pages to the prefix trie
+   before what is left goes back to the pool.
+
+Admission goes through
+[`PrefixCache`](reference.md#walnut.cache.radix.PrefixCache) rather than the
+pool directly. It is a trie over 256-token blocks of token ids, one node per
+page, holding what earlier requests left behind; a prompt that matches down it
+borrows those pages and the recurrent-state checkpoint at the deepest matched
+boundary, and prefills only what is left. The checkpoint is the point — see the
+module for why pages alone buy nothing on a model that is three-quarters linear
+attention, and what that costs.
 
 Rows of that batch sit at different points in their own sequences, which is
 what `torch.nn.attention.varlen_attn` is for, and what `walnut.layers.attention`

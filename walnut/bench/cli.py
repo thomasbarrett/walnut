@@ -515,6 +515,15 @@ def throughput(
             "--max-seq-len.",
         ),
     ] = None,
+    prefix_checkpoints: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            envvar="WALNUT_PREFIX_CHECKPOINTS",
+            help="Shared prompt prefixes the cache may keep, as `walnut serve` "
+            "takes it. 0 turns prefix reuse off.",
+        ),
+    ] = 16,
     prefill_chunk: Annotated[
         int,
         typer.Option(
@@ -556,6 +565,7 @@ def throughput(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
         prefill_chunk=prefill_chunk,
     )
     try:
@@ -604,6 +614,15 @@ def startup(
             "--max-seq-len.",
         ),
     ] = None,
+    prefix_checkpoints: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            envvar="WALNUT_PREFIX_CHECKPOINTS",
+            help="Shared prompt prefixes the cache may keep, as `walnut serve` "
+            "takes it. 0 turns prefix reuse off.",
+        ),
+    ] = 16,
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
@@ -632,6 +651,7 @@ def startup(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
     )
     try:
         raise typer.Exit(

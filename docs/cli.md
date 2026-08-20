@@ -77,6 +77,58 @@ batch reaches on the 3072 MiB a fixed slot each would have cost. Held to that
 768 MiB instead, the same 32 rows still reach 7112 tok/s, against the 4621
 tok/s 768 MiB buys as eight fixed slots.
 
+## Prefix cache
+
+A prompt that begins like one the server has already answered starts part way
+in. `--prefix-checkpoints` sets how many such prefixes it can hold, and 0 turns
+reuse off.
+
+The unit is a checkpoint rather than a page because of what this model is. Two
+prompts that agree on their first *n* tokens agree on the key/value pages those
+tokens produce, and the pages are kept for free — but eighteen of Qwen3.5's
+twenty-four layers are linear attention, whose state is one running summary per
+sequence with no cell to hand to a second one. Reusing pages without that state
+saves nothing, because the other eighteen layers still have to be walked from
+the beginning, and walking them means running the whole stack. So what is
+cached is the recurrent state, and the pages come along.
+
+That state is 18.6 MiB on Qwen3.5-0.8B, against 3 MiB for a 256-token page —
+one checkpoint costs about 1600 tokens of cache. It is therefore taken only at
+a prefix a *second* prompt has reached, which makes a shared prefix warm from
+the third request: the first leaves the pages, the second marks the boundary
+and checkpoints its state on the way past, the third and everything after start
+there. Once the store is full it stays full; slots come back when the trie
+evicts the prefix holding them, not by displacing one that may already be
+earning its keep.
+
+Serving a 1500-token system prompt with a different question after it, TTFT
+falls from 57.0 ms to 20.7 ms, and the answers are identical. Across a whole
+batch of 64 chat requests seen a second time, wall-clock falls 10%. On prompts
+that never repeat it costs nothing measurable — the trie holds pages that would
+otherwise be free, and gives them back to any request that needs them.
+
+## Sizing the cache
+
+Both pools come out of the same VRAM, and on Qwen3.5-0.8B they are priced very
+differently: **12 KiB per KV token**, and **18.6 MiB per checkpoint**. An RTX
+5090 has 32 GiB, of which walnut needs about 2.5 GiB standing — weights, plus
+596 MiB of recurrent state for a batch of 32. That leaves roughly 29 GiB:
+
+| | `--kv-tokens` | KV | `--prefix-checkpoints` | checkpoints | free |
+| --- | --- | --- | --- | --- | --- |
+| batch 8, default | 524288 | 6.0 GiB | 32 | 0.6 GiB | 22.4 GiB |
+| batch 32, balanced | 1572864 | 18.0 GiB | 128 | 2.3 GiB | 8.6 GiB |
+| batch 32, KV-heavy | 2097152 | 24.0 GiB | 64 | 1.2 GiB | 3.8 GiB |
+
+Size the KV pool for what has to stay resident, not for what is running: 32
+rows of a 2048-token conversation hold only 0.75 GiB, and everything above that
+is what the prefix cache gets to keep. A pool with no slack cannot cache
+anything — it evicts each conversation long before it comes round again.
+
+Match `--prefix-checkpoints` to the number of *distinct* prefixes in flight. It
+is not a soft limit: a workload with more distinct prefixes than slots simply
+stops checkpointing the surplus.
+
 `walnut profile` takes both flags, defaulting to a batch of 1: it traces one
 generation, and a larger batch would fill the trace with padding rows.
 

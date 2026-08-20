@@ -30,6 +30,11 @@ drawn from one pool shared by every row, and a request takes only as many as
 its prompt and completion need. A request that does not fit *yet* waits at the
 head of the queue until a running one retires; one that could never fit is
 rejected at `Scheduler.submit`, rather than waiting for room that will not come.
+
+Pages outlive the sequence that filled them. A retiring request hands what it
+wrote to `walnut.cache.radix.PrefixCache`, so a later prompt that begins the
+same way starts part way in — see there for why that keeps a checkpoint of the
+recurrent state and not just the pages.
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ from typing import Any
 
 import torch
 
-from walnut.cache import CachePool, pages_for
+from walnut.cache import CachePool, PrefixCache, pages_for
 from walnut.graph import DecodeGraphs, buckets
 from walnut.sampler import SamplingParams
 
@@ -68,6 +73,13 @@ class Request:
     generator: torch.Generator | None = None
     tokens: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    #: The prompt again, as plain ids, which is what the prefix tree matches
+    #: on. Carried rather than derived because deriving it means reading a
+    #: device tensor back, and the loop cannot afford to: a `tolist` waits for
+    #: every kernel already queued, so one on the admission path drains the
+    #: run-ahead that makes a captured decode step cheap. It measured 17% of
+    #: throughput. `Scheduler.submit` fills it in on the caller's thread.
+    ids: list[int] = field(default_factory=list)
 
     def stream(self) -> Any:
         """Yield this request's token ids until it finishes.
@@ -102,9 +114,16 @@ class Sequence:
     #: The position its next token is written at.
     position: int = 0
     #: Prompt tokens prefilled so far. Equal to the prompt length the moment
-    #: the sequence joins the batch.
+    #: the sequence joins the batch, and to whatever the prefix tree handed
+    #: back the moment it is admitted.
     prefilled: int = 0
     produced: int = 0
+    #: Where this sequence should stop a prefill chunk and check its recurrent
+    #: state into the prefix tree, if anywhere. See `PrefixCache.acquire`.
+    checkpoint_at: int | None = None
+    #: The ids this sequence has generated, so that retirement can offer prompt
+    #: *and* completion to the tree: a follow-up turn resends both.
+    generated: list[int] = field(default_factory=list)
 
 
 class Scheduler:
@@ -125,6 +144,7 @@ class Scheduler:
         autotune: bool = True,
         prefill_chunk: int = 2048,
         kv_tokens: int | None = None,
+        prefix_checkpoints: int = 16,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be at least 1")
@@ -141,6 +161,10 @@ class Scheduler:
 
         pages = None if kv_tokens is None else max(1, pages_for(kv_tokens))
         self.pool: CachePool = model.make_cache(max_batch_size, max_seq_len, pages)
+        #: Rows and pages are taken through here rather than from the pool
+        #: directly: it is the pool's allocator with a trie of what earlier
+        #: requests left behind sitting on top of it.
+        self.prefix = PrefixCache(self.pool, prefix_checkpoints)
         # The pool is decoded against from the first step: its rows hold
         # zeros, which is what "no context yet" means to a recurrent state.
         self.pool.prime()
@@ -174,6 +198,13 @@ class Scheduler:
         #: strictly first-come: a short request behind a long one waits for it
         #: rather than overtaking it into the pages it was about to claim.
         self.waiting: Request | None = None
+        #: Whether `waiting` has already been offered to a pool in this state.
+        #: Nothing frees a row or a page except a retirement, so a second
+        #: attempt before the next one can only fail the same way — and it is
+        #: not a cheap failure, because admission matches the prompt against
+        #: the prefix tree before it discovers there is nowhere to put it.
+        #: Retrying it per decode step measured 15% of throughput at batch 32.
+        self._stalled = False
         self.decode_forward: Any = model
         self.graphs: DecodeGraphs | None = None
         self._started = threading.Event()
@@ -262,6 +293,10 @@ class Scheduler:
                 f"{wanted} tokens needs {pages_for(wanted)} pages of key/value "
                 f"cache and the pool holds {self.pool.pages}; raise --kv-tokens"
             )
+        if not request.ids:
+            # Here and not in the loop: this reads the prompt back off the
+            # device, and the loop cannot afford to wait on a kernel queue.
+            request.ids = request.prompt[0].tolist()
         self.incoming.put(request)
         return request
 
@@ -324,14 +359,14 @@ class Scheduler:
         prefilling: chunks and decode steps share the loop, so a second prompt
         would only interleave with the first and make both slower to answer.
 
-        A request the pool cannot fit stays in `waiting` and is retried each
-        time round the loop, which is where it ends up once a running sequence
-        retires and returns its pages. That cannot deadlock: a request only
-        reaches here having passed `CachePool.fits`, so an empty pool always
-        has room for it, and the loop only blocks on the queue while nothing
-        is running — which is exactly when the pool is empty.
+        A request the pool cannot fit stays in `waiting`, and is offered again
+        the next time a sequence retires — the only event that frees anything.
+        That cannot deadlock: a request only reaches here having passed
+        `CachePool.fits`, so an empty pool always has room for it, and the loop
+        only blocks on the queue while nothing is running — which is exactly
+        when the pool is empty.
         """
-        if self.prefilling is not None:
+        if self.prefilling is not None or self._stalled:
             return True
         if self.waiting is None:
             blocking = not self.running
@@ -344,6 +379,8 @@ class Scheduler:
             self.waiting = request
         if self.waiting.cancelled.is_set() or self._begin_prefill(self.waiting):
             self.waiting = None
+        else:
+            self._stalled = True
         return True
 
     def _begin_prefill(self, request: Request) -> bool:
@@ -354,13 +391,21 @@ class Scheduler:
         decoding. That is what makes preemption unnecessary here, and it is
         also what a slot pool was doing implicitly — except that it reserved
         `max_seq_len` for every request rather than what the request asked for.
+
+        What comes back may already be part way through the prompt: the prefix
+        tree lends the pages and the recurrent state of whatever leading run of
+        tokens it has seen before, and `prefilled` starts there.
         """
         wanted = request.prompt.shape[1] + request.params.max_new_tokens
-        row = self.pool.reserve(wanted)
-        if row is None:
+        place = self.prefix.acquire(request.ids, wanted)
+        if place is None:
             return False
-        self.pool.reset(row)
-        self.prefilling = Sequence(request, row)
+        self.prefilling = Sequence(
+            request,
+            place.row,
+            prefilled=place.prefilled,
+            checkpoint_at=place.checkpoint_at,
+        )
         return True
 
     def _prefill_chunk(self) -> None:
@@ -382,11 +427,14 @@ class Scheduler:
             return
         row = sequence.row
         start = sequence.prefilled
-        chunk = request.prompt[:, start : start + self.prefill_chunk]
+        chunk = request.prompt[:, start : start + self._chunk_width(sequence, start)]
         try:
             positions = torch.arange(start, start + chunk.shape[1], device=self.device)
             logits = self.model(chunk, positions=positions, cache=self.row_views[row])
             sequence.prefilled = start + chunk.shape[1]
+            if sequence.prefilled == sequence.checkpoint_at:
+                self.prefix.checkpoint(row, sequence.prefilled)
+                sequence.checkpoint_at = None
             if sequence.prefilled < request.prompt.shape[1]:
                 return
             token = self.model.sampler(logits[:, -1], request.params, request.generator)
@@ -401,10 +449,30 @@ class Scheduler:
         self.running[row] = sequence
         self._deliver(sequence, token_id)
 
+    def _chunk_width(self, sequence: Sequence, start: int) -> int:
+        """Prompt tokens to run next, cut short at a checkpoint boundary.
+
+        A checkpoint belongs at the page boundary it names and not somewhere
+        after it, and the end of a chunk is the only moment the state is still.
+        So the chunk that would run past `Sequence.checkpoint_at` stops there
+        instead. It costs one shorter pass on the request that takes the
+        checkpoint, and nothing at all on any other.
+        """
+        stop = sequence.checkpoint_at
+        if stop is not None and start < stop < start + self.prefill_chunk:
+            return stop - start
+        return self.prefill_chunk
+
     def _abandon(self, sequence: Sequence, error: BaseException | None) -> None:
-        """Drop a part-prefilled sequence, freeing the row it never filled."""
+        """Drop a part-prefilled sequence, freeing the row it never filled.
+
+        Nothing is offered to the prefix tree: this row's pages stop part way
+        through a prompt whose remaining tokens were never run, and half a
+        prefix is not a prefix.
+        """
         self.prefilling = None
-        self.pool.release(sequence.row)
+        self.prefix.release(sequence.row, [])
+        self._stalled = False
         self._close(sequence.request, error)
 
     def _bucket(self) -> int:
@@ -494,6 +562,7 @@ class Scheduler:
         """Hand one token to its caller and retire the sequence if it is done."""
         request = sequence.request
         sequence.produced += 1
+        sequence.generated.append(token_id)
         request.tokens.put(token_id)
         done = (
             token_id in request.stop_ids
@@ -507,7 +576,10 @@ class Scheduler:
         """Free a sequence's row and pages, and close its stream."""
         if self.running.pop(sequence.row, None) is None:
             return
-        self.pool.release(sequence.row)
+        # Prompt and completion both: a follow-up turn resends the answer along
+        # with the question, so the pages holding it are as shareable.
+        self.prefix.release(sequence.row, sequence.request.ids + sequence.generated)
+        self._stalled = False
         self._close(sequence.request, error)
 
     @staticmethod

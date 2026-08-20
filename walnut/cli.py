@@ -122,6 +122,23 @@ KvTokens = Annotated[
         "once; lower it to trade that worst case for the memory back.",
     ),
 ]
+PrefixCheckpoints = Annotated[
+    int,
+    typer.Option(
+        min=0,
+        envvar="WALNUT_PREFIX_CHECKPOINTS",
+        help="Shared prompt prefixes the cache may keep, as recurrent-state "
+        "checkpoints. A prompt beginning like an earlier one starts from the "
+        "deepest checkpointed page they agree on, skipping that much prefill. "
+        "Each checkpoint is every linear-attention layer's state at once — far "
+        "more than the KV pages it lets a request skip — so one is taken only "
+        "at a prefix a second prompt has reached. 0 turns reuse off.",
+    ),
+]
+
+
+def _gib(size: int) -> str:
+    return f"{size / 1024**3:.1f} GiB"
 
 
 @app.command()
@@ -144,6 +161,7 @@ def serve(
     max_batch_size: MaxBatchSize = 8,
     max_seq_len: MaxSeqLen = None,
     kv_tokens: KvTokens = None,
+    prefix_checkpoints: PrefixCheckpoints = 16,
     prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
@@ -169,6 +187,7 @@ def serve(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
         prefill_chunk=prefill_chunk,
     )
     # Compile and capture before the port opens, so the first request meets a
@@ -178,7 +197,9 @@ def serve(
     typer.echo(
         f"Serving '{engine.model_id}' on http://{host}:{port}/v1 "
         f"({engine.device}, {str(engine.dtype).removeprefix('torch.')}, "
-        f"batch {engine.max_batch_size} x {engine.max_seq_len} tokens)"
+        f"batch {engine.max_batch_size}, {_gib(engine.kv_bytes)} of KV for "
+        f"{engine.kv_capacity:,} tokens, "
+        f"{_gib(engine.prefix_bytes)} of prefix checkpoints)"
     )
     run_server(engine, host=host, port=port)
 
@@ -215,6 +236,7 @@ def profile(
     max_batch_size: MaxBatchSize = 1,
     max_seq_len: MaxSeqLen = None,
     kv_tokens: KvTokens = None,
+    prefix_checkpoints: PrefixCheckpoints = 16,
     prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
@@ -243,6 +265,7 @@ def profile(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
         prefill_chunk=prefill_chunk,
     )
     config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
