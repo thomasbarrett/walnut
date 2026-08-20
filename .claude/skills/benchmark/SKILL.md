@@ -23,7 +23,7 @@ is what it is, and this for *what* it is.
 | `throughput` | the engine in-process, all at once | batching, no HTTP, no arrivals | the engine's ceiling |
 | `latency` | the model in-process, one stream | the decode loop, nothing else | what a kernel change moved |
 | `startup` | engine construction, repeatedly | weight load, compile, capture | what a restart costs |
-| `sweep` | `serve`, up a ladder of rates | everything `serve` does, per rate | where capacity runs out |
+| `sweep` | `serve`, up a ladder | everything `serve` does, per rung | where capacity runs out, or what an operating point costs |
 
 **Changed a kernel, a fusion, the CUDA graph, the sampler? → `latency`.**
 **Changed the scheduler, batching, the server, admission? → `serve`.**
@@ -254,8 +254,21 @@ here would be fiction. `serve` is where latency under a batch comes from.
 
 ## sweep
 
+Two axes, and they answer different questions. Pass one.
+
+Both are spelled exactly as `serve` spells them, and either may be given a
+comma-separated ladder. **A comma is the whole signal**: `--request-rate 16`
+means on `sweep` what it means on `serve`, and `--request-rate 8,16,24` sweeps.
+Whichever flag carries the ladder is the axis; exactly one may.
+
+So a single `--max-concurrency` beside a `--request-rate` ladder is a fixed
+gate, exactly as it is on `serve`. One quantity, one name, one meaning
+everywhere.
+
+### a `--request-rate` ladder — open loop, find the knee
+
 ```bash
-walnut bench sweep --shape chat --rates 8,16,24,32 --num-prompts 200 \
+walnut bench sweep --shape chat --request-rate 8,16,24,32 --num-prompts 200 \
   --goodput ttft:250 --goodput tpot:10 -o sweep.json
 ```
 
@@ -278,8 +291,55 @@ server is overloaded** — output tok/s is still climbing where goodput collapse
 
 One record for the whole ladder, so an operating point is chosen from a single
 artifact. The shortfall stop compares time-to-submit against what the schedule
-called for — deliberately not against `--request-rate`, since a finite gamma
+called for — deliberately not against `--request-rate`, since a finite Poisson
 sample has a realized mean of its own.
+
+### a `--max-concurrency` ladder — closed loop, draw the frontier
+
+```bash
+walnut bench sweep --shape chat --max-concurrency 1,2,4,8,16 --num-prompts 200 \
+  --goodput tpot:10 -o frontier.json
+```
+
+The layout, with the columns filled in from the `micro` table further down so
+the shape of the curve is real — the `p99` and goodput columns are sketched:
+
+```
+  conc  out tok/s  tok/s/user  TPOT p50  TPOT p99  ITL p99  E2EL p99  goodput
+     1       602.5       602.5      1.50         .     1.61         .        .
+     2       885.4       442.7      2.05         .     2.29         .        .
+     4      1369.4       342.4      2.57         .    22.27         .        .
+     8      1980.4       247.6      3.73         .    23.72         .        .
+    16      2286.0       142.9      6.59         .    26.56         .        .
+
+1980 tok/s at concurrency 8 — the most throughput on this ladder with every
+request inside tpot p100 <= 10 ms.
+```
+
+**Every rung runs; there is no knee.** A closed loop holds a fixed number of
+requests in flight, so nothing queues without bound and no rung invalidates the
+ones above it. Each is a real operating point, and the curve is the answer.
+
+**The last line is the number to quote.** System throughput at a stated
+interactivity, in one figure, which cannot be repeated without its workload
+attached. Without `--goodput` there is nothing to read it against and the table
+has to be eyeballed.
+
+**`tok/s/user` is throughput over mean concurrency** — the axis the public
+benchmarks plot, printed so a walnut number can sit beside theirs. It is an
+aggregate ratio, so it cannot tell a uniformly slow decode from one starved
+stream; that is the same objection this harness makes to NTPOT. **Read
+`TPOT p99` instead**, and use `tok/s/user` only to compare with somebody else's
+chart.
+
+**Which axis.** The rate ladder is the stronger question here and the only one
+that sees queueing — it is what a serving change is judged on, and it is
+what MLPerf's Server scenario reports (Poisson arrivals at a target QPS, the
+result being the highest QPS still inside its TTFT and TPOT bounds).
+The concurrency ladder is what the hardware-comparison reports use, and is for
+sizing and for quoting: what does a batch of 8 buy, at what per-stream cost. Under offered traffic concurrency is an outcome and not a setting, so the
+interactivity axis does not exist there; under a closed loop nothing ever
+queues, so there is nothing to overload.
 
 ## latency
 
@@ -389,8 +449,9 @@ the mean misses this.
 - **Batch sizing** → `throughput` across `--max-batch-size`.
 - **Prefill cost, chunking, admission** → any `serve` metric across `--shape`.
   `chat` → `agentic` is 16× the prompt work at a quarter of the output.
-- **Capacity, "how many can it take"** → `sweep`. The rung it stops on is the
-  answer.
+- **Capacity, "how many can it take"** → a `sweep` rate ladder. The rung it
+  stops on is the answer.
+- **"How fast is it, in one number"** → throughput at an SLO.
 - **Compilation, autotuning, lazy init** → `startup`.
 - **TTFT alone never justifies a change.** `--no-cuda-graph` *improves* TTFT
   here by 3.7% while TPOT goes 1.48 → 3.37 ms and per-stream throughput falls

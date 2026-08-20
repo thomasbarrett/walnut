@@ -22,7 +22,12 @@ import typer
 from walnut.bench.errors import BenchError
 from walnut.bench.metrics import SLO_METRICS
 from walnut.bench.offline import EngineOptions, run_latency, run_startup, run_throughput
-from walnut.bench.online import ServeOptions, run_serve, run_sweep
+from walnut.bench.online import (
+    ServeOptions,
+    run_frontier,
+    run_serve,
+    run_sweep,
+)
 from walnut.bench.workload import (
     DEFAULT_SHAPE,
     SHAPES,
@@ -167,15 +172,50 @@ def _fail(exc: BenchError) -> None:
     raise typer.Exit(1)
 
 
-def _ladder(value: str) -> list[float]:
+def _ladder(value: str | None) -> str | None:
+    """The value, if it was given as a ladder rather than a single number.
+
+    A comma is the whole signal, so `--request-rate 16` means on `sweep`
+    exactly what it means on `serve`, and only `--request-rate 8,16` sweeps.
+    """
+    return value if value is not None and "," in value else None
+
+
+def _single_limit(value: str | None) -> int | None:
+    """A fixed --max-concurrency: the non-ladder reading of the same flag."""
+    if value is None:
+        return None
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise typer.BadParameter("--max-concurrency takes whole numbers") from exc
+    if limit < 1:
+        raise typer.BadParameter("--max-concurrency takes a positive request count")
+    return limit
+
+
+def _rate_ladder(value: str) -> list[float]:
     """An ascending, comma-separated ladder of finite rates."""
     parsed = [float(v) for v in value.split(",") if v.strip()]
     if not parsed or any(r <= 0 or math.isinf(r) for r in parsed):
-        raise typer.BadParameter("--rates takes positive, finite req/s values")
+        raise typer.BadParameter("--request-rate takes positive, finite req/s values")
     if parsed != sorted(parsed):
         # The sweep stops at the first rung the server cannot absorb, which
         # only finds a knee if the ladder climbs.
-        raise typer.BadParameter("--rates must ascend")
+        raise typer.BadParameter("--request-rate must ascend")
+    return parsed
+
+
+def _concurrency_ladder(value: str) -> list[int]:
+    """An ascending, comma-separated ladder of concurrency limits."""
+    try:
+        parsed = [int(v) for v in value.split(",") if v.strip()]
+    except ValueError as exc:
+        raise typer.BadParameter("--max-concurrency takes whole numbers") from exc
+    if not parsed or any(n < 1 for n in parsed):
+        raise typer.BadParameter("--max-concurrency takes positive request counts")
+    if parsed != sorted(parsed):
+        raise typer.BadParameter("--max-concurrency must ascend")
     return parsed
 
 
@@ -267,16 +307,30 @@ def serve(
 
 @app.command()
 def sweep(
-    rates: Annotated[
-        str,
+    request_rate: Annotated[
+        str | None,
         typer.Option(
-            help="Ascending, comma-separated req/s ladder, e.g. `8,16,24,32`."
+            help="Requests per second, as `serve` takes it — but here a "
+            "comma-separated ladder is allowed, e.g. `8,16,24,32`, and a "
+            "ladder here makes this the swept axis. Open loop: traffic is "
+            "offered on a Poisson arrival process whether or not the server "
+            "keeps up, and the sweep stops at the first rung it cannot absorb.",
         ),
-    ],
+    ] = None,
+    max_concurrency: Annotated[
+        str | None,
+        typer.Option(
+            help="Requests allowed in flight, as `serve` takes it — but here a "
+            "comma-separated ladder is allowed, e.g. `1,2,4,8,16`, and a "
+            "ladder here makes this the swept axis. Closed loop: nothing "
+            "queues, so every rung runs and the result is the throughput / "
+            "per-stream-cost frontier. A single value alongside a "
+            "--request-rate ladder is a fixed gate instead.",
+        ),
+    ] = None,
     base_url: BaseUrl = DEFAULT_BASE_URL,
     model: ServedModel = None,
     num_prompts: NumPrompts = 200,
-    max_concurrency: MaxConcurrency = None,
     shape: ShapeName = DEFAULT_SHAPE,
     tokenizer: Tokenizer = None,
     seed: Annotated[int, typer.Option(help="Seeds the run end to end.")] = 0,
@@ -288,7 +342,8 @@ def sweep(
             min=0.0,
             max=1.0,
             help="Stop when the fraction of requests meeting --goodput falls "
-            "below this. Ignored without --goodput.",
+            "below this. Ignored without --goodput, and on a "
+            "--max-concurrency ladder, which has no knee to stop at.",
         ),
     ] = 0.95,
     timeout: Annotated[float, typer.Option(help="Per request, seconds.")] = 600.0,
@@ -296,19 +351,42 @@ def sweep(
     label: Label = None,
     out: Out = None,
 ) -> None:
-    """Run `serve` up a ladder of rates until the server stops keeping up.
+    """Run `serve` up a ladder, on one of two axes.
 
-    Stops at the first rung it cannot absorb — goodput through the floor, or
-    the client behind its own schedule. Rungs above that measure a queue, not
-    an engine. The rung it stops on is the operating point.
+    Both flags are spelled exactly as `serve` spells them, and either may be
+    given a comma-separated ladder. Whichever one is a ladder is the axis, and
+    exactly one may be.
+
+    A --request-rate ladder is open loop: traffic is offered whether or not the
+    server keeps up, so a queue builds, and the sweep stops at the first rung it
+    cannot absorb. The rung it stops on is where capacity ran out. A single
+    --max-concurrency alongside it is a fixed gate in front of the engine.
+
+    A --max-concurrency ladder is closed loop: a fixed number of requests stay
+    in flight, so there is no queue and no knee, and every rung is a real
+    operating point. What it draws is the frontier — throughput against
+    per-stream cost — from which an operating point is read rather than argued
+    about.
+
+    The two are not substitutes. Under open-loop arrivals concurrency is an
+    outcome and not a setting, so interactivity cannot be an axis there; under a
+    closed loop nothing ever queues, so there is nothing to overload.
     """
-    ladder = _ladder(rates)
+    rate_ladder = _ladder(request_rate)
+    limit_ladder = _ladder(max_concurrency)
+    if rate_ladder and limit_ladder:
+        raise typer.BadParameter(
+            "one axis at a time: give a ladder to --request-rate or to "
+            "--max-concurrency, not both"
+        )
     opts = _serve_options(
         base_url=base_url,
         model=model,
         num_prompts=num_prompts,
         request_rate=float("inf"),
-        max_concurrency=max_concurrency,
+        # On a rate ladder a single value here is a fixed gate; on a
+        # concurrency ladder `run_frontier` sets it per rung.
+        max_concurrency=None if limit_ladder else _single_limit(max_concurrency),
         shape=shape,
         tokenizer=tokenizer,
         seed=seed,
@@ -319,8 +397,17 @@ def sweep(
         label=label,
         out=out,
     )
+    if rate_ladder is not None:
+        run = run_sweep(opts, _rate_ladder(rate_ladder), goodput_floor)
+    elif limit_ladder is not None:
+        run = run_frontier(opts, _concurrency_ladder(limit_ladder))
+    else:
+        raise typer.BadParameter(
+            "nothing to sweep: give --request-rate or --max-concurrency a "
+            "comma-separated ladder, e.g. --request-rate 8,16,24"
+        )
     try:
-        raise typer.Exit(asyncio.run(run_sweep(opts, ladder, goodput_floor)))
+        raise typer.Exit(asyncio.run(run))
     except BenchError as exc:
         _fail(exc)
 

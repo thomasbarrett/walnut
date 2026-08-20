@@ -7,6 +7,7 @@ enough else to drown a 3% kernel win. `walnut.bench.offline` judges those.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import itertools
 import json
 import random
@@ -19,6 +20,7 @@ from typing import Any
 from walnut.bench.errors import BenchError
 from walnut.bench.metrics import METRICS, summarize
 from walnut.bench.report import (
+    report_frontier,
     report_serve,
     report_sweep,
     serve_warnings,
@@ -494,6 +496,7 @@ async def run_serve(opts: ServeOptions) -> int:
 async def run_sweep(
     opts: ServeOptions, ladder: list[float], goodput_floor: float
 ) -> int:
+    """Open loop, up a ladder of offered rates, stopping at the knee."""
     rng = random.Random(opts.seed)
     rungs: list[dict[str, Any]] = []
     stopped = ""
@@ -535,12 +538,56 @@ async def run_sweep(
     write_record(
         {
             "mode": "sweep",
+            # Named for the flag that carried the ladder, so a record says
+            # which knob was turned rather than which word the report used.
+            "axis": "request_rate",
             "label": opts.label,
             "model": rungs[0]["model"],
             "shape": opts.shape.name,
-            "rates": ladder,
+            "ladder": ladder,
             "goodput_floor": goodput_floor,
             "stopped": stopped,
+            "rungs": rungs,
+        },
+        opts.out,
+    )
+    return 0
+
+
+async def run_frontier(opts: ServeOptions, ladder: list[int]) -> int:
+    """Closed loop, up a ladder of concurrency limits.
+
+    `run_sweep` offers traffic and finds the rate the engine stops absorbing;
+    this holds a fixed number of requests in flight and asks what throughput
+    that buys at what per-stream cost. Under open-loop arrivals concurrency is
+    an outcome and not a setting, so that axis does not exist there.
+
+    Every rung runs. A closed loop cannot build an unbounded queue, so no rung
+    invalidates the ones above it — each is an operating point somebody might
+    choose, and the curve is the answer.
+    """
+    rng = random.Random(opts.seed)
+    rungs: list[dict[str, Any]] = []
+
+    async with _client() as client:
+        model, prompts, url, payload = await _prepare(client, opts)
+        for limit in ladder:
+            rung = dataclasses.replace(opts, max_concurrency=limit)
+            record = await serve_once(
+                client, rung, model, prompts, payload, url, float("inf"), rng
+            )
+            serve_warnings(record)
+            rungs.append(record)
+
+    report_frontier(rungs, opts.goodput)
+    write_record(
+        {
+            "mode": "sweep",
+            "axis": "max_concurrency",
+            "label": opts.label,
+            "model": rungs[0]["model"],
+            "shape": opts.shape.name,
+            "ladder": ladder,
             "rungs": rungs,
         },
         opts.out,

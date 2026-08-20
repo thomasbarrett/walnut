@@ -137,7 +137,7 @@ $ uv run walnut profile Qwen/Qwen3.5-0.8B --temperature 1.0
 | `throughput` | the engine in-process, all requests at once | the engine's ceiling |
 | `latency` | the model in-process, one stream | what a kernel change moved |
 | `startup` | engine construction, repeatedly | what a restart costs |
-| `sweep` | `serve`, up a ladder of request rates | where capacity runs out |
+| `sweep` | `serve`, up a ladder of request rates or concurrency limits | where capacity runs out, or what an operating point costs |
 
 `serve` and `sweep` drive a server you start yourself; the other three load the
 model in-process and take the same `--device`, `--dtype`, `--cuda-graph`,

@@ -22,10 +22,11 @@ from walnut.bench.online import (
     ServeOptions,
     meets_slos,
     peak_concurrency,
+    run_frontier,
     run_serve,
     run_sweep,
 )
-from walnut.bench.report import report_sweep, shortfall
+from walnut.bench.report import report_frontier, report_sweep, shortfall
 from walnut.bench.workload import (
     Shape,
     arrival_delays,
@@ -311,7 +312,7 @@ def test_shortfall_is_zero_at_an_unlimited_rate():
 
 
 def test_shortfall_measures_lag_against_the_schedule_not_the_configured_rate():
-    """A finite gamma sample path has a realized rate of its own. Judging the
+    """A finite Poisson sample path has a realized rate of its own. Judging the
     client against `--request-rate` charges it for the sampler's variance and
     reports a bottleneck at small --num-prompts where there is none."""
     assert shortfall(_rung(24.0, 18.0, scheduled=10.0, submitted=10.0)) == 0.0
@@ -323,6 +324,36 @@ def test_shortfall_measures_lag_against_the_schedule_not_the_configured_rate():
 def test_shortfall_never_goes_negative():
     """Submitting ahead of schedule is not a surplus of anything."""
     assert shortfall(_rung(24.0, 30.0, scheduled=12.0, submitted=10.0)) == 0.0
+
+
+def _frontier_rung(limit, tok_per_s, tpot_p99, fraction=None):
+    return {
+        "max_concurrency": limit,
+        "concurrency": float(limit),
+        "output_throughput": tok_per_s,
+        "goodput_fraction": fraction,
+        "metrics": {
+            "tpot": {"p50": tpot_p99 * 0.7, "p99": tpot_p99},
+            "itl": {"p99": tpot_p99 * 1.1},
+            "e2el": {"p99": 200.0},
+        },
+    }
+
+
+def test_the_frontier_names_the_throughput_at_the_slo(capsys):
+    """The number a deployment is actually chosen on: the most throughput
+    available with every request still inside the interactivity asked for.
+    Reading it off the table by eye is how a rung that missed the SLO gets
+    quoted as capacity."""
+    rungs = [
+        _frontier_rung(1, 600.0, 1.6, 1.0),
+        _frontier_rung(8, 1980.0, 4.0, 1.0),
+        _frontier_rung(64, 2400.0, 22.0, 0.4),
+    ]
+    report_frontier(rungs, {"tpot": 0.010})
+    out = capsys.readouterr().out
+    assert "1980 tok/s at concurrency 8" in out
+    assert "2400" not in out.split("=" * 78)[-1]
 
 
 def test_sweep_reports_the_rung_it_stopped_on(capsys):
@@ -346,9 +377,9 @@ def test_rates_must_ascend():
     if the ladder climbs."""
     import typer
 
-    assert bench_cli._ladder("8,16,24") == [8.0, 16.0, 24.0]
+    assert bench_cli._rate_ladder("8,16,24") == [8.0, 16.0, 24.0]
     with pytest.raises(typer.BadParameter, match="ascend"):
-        bench_cli._ladder("24,8")
+        bench_cli._rate_ladder("24,8")
 
 
 def test_sweep_climbs_a_rate_ladder_and_records_every_rung(
@@ -369,6 +400,45 @@ def test_sweep_climbs_a_rate_ladder_and_records_every_rung(
     assert [r["request_rate"] for r in record["rungs"]] == [2.0, 4.0]
     assert all(r["completed"] == 4 for r in record["rungs"])
     assert "Rate Sweep" in capsys.readouterr().out
+
+
+def test_the_frontier_runs_every_rung(live_server, tmp_path, capsys):
+    """A closed loop cannot build an unbounded queue, so there is no rung that
+    invalidates the ones above it — every one is an operating point somebody
+    might choose, and the curve is the answer."""
+    import asyncio
+
+    out = tmp_path / "frontier.json"
+    opts = _serve_options(
+        live_server, num_prompts=4, max_concurrency=None, out=str(out)
+    )
+    assert asyncio.run(run_frontier(opts, [1, 2, 4])) == 0
+
+    record = json.loads(out.read_text())
+    assert record["axis"] == "max_concurrency"
+    assert record["ladder"] == [1, 2, 4]
+    assert [r["max_concurrency"] for r in record["rungs"]] == [1, 2, 4]
+    assert "Concurrency Frontier" in capsys.readouterr().out
+
+
+def test_sweep_takes_one_ladder_or_the_other():
+    """Open and closed loop answer different questions and cannot be combined:
+    under offered traffic concurrency is an outcome, not a setting. Which flag
+    carries the comma is what picks the axis."""
+    both = runner.invoke(
+        app,
+        ["bench", "sweep", "--request-rate", "8,16", "--max-concurrency", "2,4"],
+        env=WIDE,
+    )
+    assert both.exit_code != 0
+    assert runner.invoke(app, ["bench", "sweep"], env=WIDE).exit_code != 0
+    # A comma is the whole signal, so two single values sweep nothing.
+    neither = runner.invoke(
+        app,
+        ["bench", "sweep", "--request-rate", "8", "--max-concurrency", "4"],
+        env=WIDE,
+    )
+    assert neither.exit_code != 0
 
 
 # -- the command surface ----------------------------------------------------
