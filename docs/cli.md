@@ -101,11 +101,26 @@ there. Once the store is full it stays full; slots come back when the trie
 evicts the prefix holding them, not by displacing one that may already be
 earning its keep.
 
-Serving a 1500-token system prompt with a different question after it, TTFT
-falls from 57.0 ms to 20.7 ms, and the answers are identical. Across a whole
-batch of 64 chat requests seen a second time, wall-clock falls 10%. On prompts
-that never repeat it costs nothing measurable — the trie holds pages that would
-otherwise be free, and gives them back to any request that needs them.
+What it is worth depends entirely on how much of the workload was prefill,
+because prefill is all it removes — so the shape decides the answer. On
+`agentic` (16384 in, 256 out), 32 requests take **25.65 s cold with nothing
+shared**. Give them an 8192-token prefix drawn from four groups and the first
+pass falls to 19.89 s; a third pass over the same workload takes **8.84 s**, a
+99.2% hit rate over prompt tokens and **2.9x off the cold baseline**. On `chat`
+(1024 in, 1024 out) the same cache skips 86.5% of prompt tokens and buys 6.8%,
+because that shape is a decode benchmark wearing a prompt. Serving a 1500-token
+system prompt with a different question after it, TTFT falls from 57.0 ms to
+20.7 ms.
+
+The answers do not change: the same prompts against `--prefix-checkpoints 0`
+produce identical text. On prompts that never repeat the cache costs nothing
+measurable — the trie holds pages that would otherwise be free, and gives them
+back to any request that needs them.
+
+Measure it with `--shared-prefix-len` and `--num-prefixes`, and read the hit
+rate the report prints; `--rounds` reruns the workload so the cold pass and the
+warm one are separate numbers. See the `benchmark` skill for why three rounds
+is the minimum and why the shape matters more than anything else.
 
 ## Sizing the cache
 

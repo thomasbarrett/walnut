@@ -77,15 +77,101 @@ nearly all decode, and a regression gate that only guards decode passes changes
 that ruin prefill.
 
 The generated shapes build prompts from random token ids, which share no
-prefix. That is deliberate today and will need revisiting the moment walnut
-caches prefixes: multi-turn chat is nearly all prefix hits, and a no-hit
-workload would understate it systematically.
+prefix. That is the right default — it measures the engine rather than its
+cache — but it is the *control*, not the whole picture, now that walnut caches
+prefixes. See "Measuring prefix reuse" below before quoting any number about it.
 
 The long shapes need room. `agentic` wants `--max-seq-len` past 16k on the
 in-process subcommands, and a server started with enough context.
 
 Prompts are generated from token ids, so every shape needs a tokenizer —
 `--tokenizer`, or the model.
+
+## Measuring prefix reuse
+
+A prefix cache is invisible to every shape above, because prompts built from
+random token ids agree on nothing. `--shared-prefix-len` gives each prompt a
+leading run drawn from one of `--num-prefixes` fixed prefixes — the same axis
+vLLM parameterizes as `prefix_repetition` and SGLang as
+`generated-shared-prefix`.
+
+```console
+$ walnut bench throughput Qwen/Qwen3.5-0.8B --shape agentic \
+    --num-prompts 32 --max-batch-size 8 --max-seq-len 20480 \
+    --kv-tokens 786432 --prefix-checkpoints 64 \
+    --shared-prefix-len 8192 --num-prefixes 4 --rounds 3
+```
+
+**Pick a prefill-heavy shape, and say which one.** This is the whole ballgame
+and the easiest number to overstate or bury. What a prefix cache removes is
+prefill, so what it is worth depends entirely on how much of the run *was*
+prefill — and between `chat` and `agentic` that fraction moves by two orders of
+magnitude. On `chat`, skipping 86.5% of all prompt tokens bought 6.8% of wall
+clock, because 1024 tokens in against 1024 out is a decode benchmark wearing a
+prompt. Quote a prefix-cache speedup from `chat` and you are understating it
+tenfold; quote one from `agentic` without naming the shape and you are
+overstating it just as far. Run both, name both.
+
+TTFT is where the effect is largest and least diluted, because a skipped prefix
+comes off the front of the very first token. `serve` is where that lives;
+`throughput` reports wall clock, which mixes it with decode.
+
+**Round 1 is cold, on purpose.** The warm-up sends the same prompts the
+measurement is about to send, so it would otherwise leave the cache holding
+exactly what the run was supposed to discover — a half-warm number labelled as
+either. `throughput` clears the cache after warm-up, and `--rounds` then reruns
+the whole workload and times each pass separately. Read the rounds, not the
+headline: the headline is the last one.
+
+Walnut's cache warms on the **third** sighting of a prefix, not the second — the
+first leaves the pages, the second checkpoints the recurrent state going past,
+and only then can anything start from it. A two-round run measures the cost and
+none of the benefit. Use three or more.
+
+**Read the hit rate before reading anything else.** A prefix-cache measurement
+fails silently: a run whose cache never hit produces a perfectly ordinary
+throughput number, and nothing about it says the experiment did not happen.
+
+```
+ round  duration (s)  hit rate  tokens saved  checkpoints
+     1         15.48    19.2%        12,288       8/128
+     2         15.89    51.2%        32,768      72/128
+     3         14.43    86.5%        55,296      72/128
+```
+
+Hit rate is over prompt *tokens*, which is what the cache actually skips. A
+zero, or a rate that stops climbing, usually means one of two things and the
+report says which:
+
+- **The pool is too small.** Running sequences hold their pages first and the
+  cache gets only the remainder, so if a prefix is evicted before it comes
+  round again no round is ever warm. `--kv-tokens` has to cover the live batch
+  *plus* what you want kept: 32 rows of a 2048-token conversation is only
+  0.75 GiB, and everything above that is the cache.
+- **`--prefix-checkpoints` is short.** It is a hard limit, not a soft one — a
+  workload with more distinct prefixes than slots stops checkpointing the
+  surplus rather than churning through them.
+
+**The control is `--rounds 1`.** `--shared-prefix-len 0` removes sharing
+*within* a round, but every round sends the same prompts, so rounds after the
+first are exact repeats — the strongest case a prefix cache has, not the
+weakest. Measured on `agentic`, `--shared-prefix-len 0 --rounds 3` went 25.65 s,
+26.16 s, **8.85 s at a 99.0% hit rate**, because by round three every prompt had
+been seen twice. That is a real and quotable number, but it is a claim about
+repeated conversations, not a control.
+
+So there are three distinct measurements and they answer different questions:
+
+| run | what it says |
+| --- | --- |
+| `--rounds 1 --shared-prefix-len 0` | cold, nothing shared: the baseline |
+| `--rounds 1 --shared-prefix-len N` | what sharing inside one batch is worth |
+| `--rounds 3+` | what a returning conversation is worth |
+
+Quote the first beside either of the others. On `agentic`, cold is 25.65 s;
+sharing an 8192-token prefix across four groups within one pass brings the
+first round to 19.89 s, and a third pass over the same workload to 8.84 s —
+**2.9x off the cold baseline**.
 
 ## Reading the table
 

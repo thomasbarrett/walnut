@@ -112,27 +112,115 @@ def load_tokenizer(tokenizer_id: str | None) -> Any:
     return AutoTokenizer.from_pretrained(tokenizer_id)
 
 
+@dataclass(frozen=True)
+class Sharing:
+    """How much of each prompt is a prefix some other prompt also sends.
+
+    Orthogonal to `Shape`, which says how much prompt there is: this says how
+    much of it repeats. A prefix cache is invisible without it, because prompts
+    drawn independently from a vocabulary agree on nothing, and it is the axis
+    the benefit scales along — vLLM's ``prefix_repetition`` dataset and
+    SGLang's ``generated-shared-prefix`` both parameterize exactly this.
+
+    ``groups`` is the number of *distinct* prefixes. One is a single system
+    prompt behind every request; ``count`` of them is a run where nothing is
+    shared, which is the control rather than a separate mode.
+    """
+
+    #: Leading tokens drawn from the group's prefix. 0 disables sharing.
+    prefix_len: int = 0
+    #: Distinct prefixes to draw from.
+    groups: int = 1
+    #: ``zipf`` concentrates requests on the low-numbered groups, which is how
+    #: prefix popularity actually falls: a handful of system prompts carry most
+    #: of the traffic and the tail is cold. ``uniform`` spreads them evenly,
+    #: which is the friendlier and less realistic case.
+    distribution: str = "uniform"
+    #: Exponent for ``zipf``. 1.0 is the classic law; larger is more skewed.
+    alpha: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.distribution not in ("uniform", "zipf"):
+            raise WorkloadError(
+                f"--prefix-distribution takes uniform or zipf; "
+                f"got {self.distribution!r}"
+            )
+        if self.distribution == "zipf" and self.alpha <= 0:
+            raise WorkloadError("--zipf-alpha must be positive")
+        if self.groups < 1:
+            raise WorkloadError("--num-prefixes must be at least 1")
+
+    @property
+    def enabled(self) -> bool:
+        return self.prefix_len > 0
+
+    def group_of(self, index: int, count: int, rng: random.Random) -> int:
+        """Which prefix request ``index`` of ``count`` draws.
+
+        Uniform assigns round-robin rather than at random, so a run of
+        ``count`` requests over ``groups`` prefixes shares each one the same
+        number of times — a random draw would leave some prefix seen once,
+        which for a cache that warms on the second sighting is a different
+        experiment from the one the flags asked for.
+        """
+        if self.distribution == "uniform":
+            return index % self.groups
+        weights = [rank**-self.alpha for rank in range(1, self.groups + 1)]
+        return rng.choices(range(self.groups), weights=weights)[0]
+
+
+def _random_ids(count: int, tokenizer: Any, rng: random.Random) -> list[int]:
+    """``count`` token ids that are not special, drawn uniformly."""
+    special = set(tokenizer.all_special_ids or ())
+    ids: list[int] = []
+    while len(ids) < count:
+        candidate = rng.randrange(tokenizer.vocab_size)
+        if candidate not in special:
+            ids.append(candidate)
+    return ids
+
+
 def build_workload(
-    shape: Shape, count: int, tokenizer: Any, rng: random.Random
+    shape: Shape,
+    count: int,
+    tokenizer: Any,
+    rng: random.Random,
+    sharing: Sharing | None = None,
 ) -> list[str]:
     """The prompts a run will send, and nothing about how they are paced.
 
     Random ids decoded back to text. The round trip is approximate, so records
     report the prompt lengths actually measured rather than the ones asked for.
+
+    With ``sharing``, each prompt is one of `Sharing.groups` fixed prefixes
+    followed by a unique tail. The prefix is built and decoded *once* per group
+    and prepended as text, because a prefix cache matches on the tokens the
+    server sees: decoding two id runs separately and concatenating the strings
+    can retokenize across the seam and leave the shared part not quite shared.
     """
-    vocab = tokenizer.vocab_size
-    special = set(tokenizer.all_special_ids or ())
     lo = max(1, int(shape.input_len * (1 - shape.jitter)))
     hi = max(lo, shape.input_len)
+    if sharing is None or not sharing.enabled:
+        return [
+            tokenizer.decode(_random_ids(rng.randint(lo, hi), tokenizer, rng))
+            for _ in range(count)
+        ]
+
+    if sharing.prefix_len >= lo:
+        raise WorkloadError(
+            f"--shared-prefix-len {sharing.prefix_len} leaves no room in a "
+            f"{shape.name} prompt of {lo}-{hi} tokens; lower it or pick a "
+            f"longer --shape"
+        )
+    prefixes = [
+        tokenizer.decode(_random_ids(sharing.prefix_len, tokenizer, rng))
+        for _ in range(sharing.groups)
+    ]
     prompts = []
-    for _ in range(count):
-        length = rng.randint(lo, hi)
-        ids = []
-        while len(ids) < length:
-            candidate = rng.randrange(vocab)
-            if candidate not in special:
-                ids.append(candidate)
-        prompts.append(tokenizer.decode(ids))
+    for index in range(count):
+        tail = rng.randint(lo, hi) - sharing.prefix_len
+        suffix = tokenizer.decode(_random_ids(tail, tokenizer, rng))
+        prompts.append(prefixes[sharing.group_of(index, count, rng)] + suffix)
     return prompts
 
 

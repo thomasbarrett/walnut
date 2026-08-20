@@ -418,6 +418,23 @@ class TorchEngine(Engine):
         """What the prefix cache's recurrent-state checkpoints cost."""
         return self.scheduler.prefix.checkpoints.bytes
 
+    def prefix_stats(self) -> dict[str, int | float]:
+        """What the prefix cache has done since it was last reset."""
+        return self.scheduler.prefix.stats()
+
+    def reset_prefix_cache(self) -> None:
+        """Forget every cached prefix, and the counters describing them.
+
+        For benchmarks, which must say whether a number was measured against a
+        cold cache or a warm one; see `walnut.cache.radix.PrefixCache.reset`.
+        The name follows vLLM's endpoint of the same purpose.
+        """
+        self.scheduler.prefix.reset()
+
+    def clear_prefix_stats(self) -> None:
+        """Restart the prefix cache's tally, keeping what it has cached."""
+        self.scheduler.prefix.clear_counters()
+
     def start(self) -> None:
         """Compile, capture the decode graphs, and start the scheduler.
 

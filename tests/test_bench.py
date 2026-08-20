@@ -7,6 +7,7 @@ stopping rule, and the warm-up that keeps a compile time out of a latency.
 
 import dataclasses
 import json
+import random
 import re
 import statistics
 
@@ -33,6 +34,8 @@ from walnut.bench.report import (
 )
 from walnut.bench.workload import (
     Shape,
+    Sharing,
+    WorkloadError,
     arrival_delays,
     build_workload,
     goodput_config,
@@ -542,3 +545,60 @@ def test_generated_prompts_vary_below_the_named_length():
 def test_an_unknown_shape_is_refused_by_name():
     with pytest.raises(BenchError, match="chat"):
         resolve_shape("chatbot")
+
+
+# -- shared prefixes ------------------------------------------------------
+
+
+class _Tok:
+    """A tokenizer stand-in: ids round-trip through text unambiguously."""
+
+    vocab_size = 500
+    all_special_ids: list[int] = []
+
+    def decode(self, ids):
+        return " ".join(f"t{i}" for i in ids) + " "
+
+
+def test_a_workload_without_sharing_shares_no_prefix():
+    """The control. Prompts drawn independently agree on nothing, which is what
+    makes them the right measurement of an engine and the wrong one of a
+    cache."""
+    shape = Shape("t", 64, 8, 0.0, "")
+    prompts = build_workload(shape, 8, _Tok(), random.Random(0), Sharing())
+    assert len({p[:40] for p in prompts}) == 8
+
+
+def test_shared_prefixes_are_shared_verbatim():
+    shape = Shape("t", 64, 8, 0.0, "")
+    sharing = Sharing(prefix_len=16, groups=2)
+    prompts = build_workload(shape, 8, _Tok(), random.Random(0), sharing)
+    heads = [p.split(" ")[:16] for p in prompts]
+    # Round-robin over two groups, so alternate prompts agree and neighbours do
+    # not: eight requests give each prefix four sightings, which is what a
+    # cache warming on the third needs.
+    assert heads[0] == heads[2] == heads[4] == heads[6]
+    assert heads[1] == heads[3] == heads[5] == heads[7]
+    assert heads[0] != heads[1]
+
+
+def test_a_prefix_longer_than_the_prompt_is_refused():
+    """Rather than silently producing prompts that are all prefix, which would
+    report a spectacular and meaningless hit rate."""
+    shape = Shape("t", 64, 8, 0.0, "")
+    with pytest.raises(WorkloadError, match="leaves no room"):
+        build_workload(shape, 2, _Tok(), random.Random(0), Sharing(prefix_len=64))
+
+
+def test_zipf_concentrates_requests_on_the_first_prefixes():
+    """Real prefix popularity is skewed: a few system prompts carry the
+    traffic. A uniform draw is the friendly case, not the representative one."""
+    sharing = Sharing(prefix_len=8, groups=8, distribution="zipf", alpha=1.5)
+    rng = random.Random(0)
+    picked = [sharing.group_of(i, 400, rng) for i in range(400)]
+    assert picked.count(0) > picked.count(7) * 4
+
+
+def test_a_bad_distribution_is_refused():
+    with pytest.raises(WorkloadError, match="uniform or zipf"):
+        Sharing(prefix_len=8, distribution="normal")

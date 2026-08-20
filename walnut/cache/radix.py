@@ -220,6 +220,11 @@ class PrefixCache:
         self.nodes = 0
         self.hits = 0
         self.tokens_saved = 0
+        #: Prompts offered and their total length, so a hit rate has a
+        #: denominator. Without one, "16 hits" says nothing about whether the
+        #: cache was working or the workload merely had 16 requests.
+        self.requests = 0
+        self.prompt_tokens = 0
 
     # -- admission ---------------------------------------------------------
 
@@ -235,8 +240,18 @@ class PrefixCache:
         model; the reuse point is the deepest matched node that also holds a
         checkpoint. What matched past it is still worth knowing, because that
         is where the next checkpoint should go.
+
+        The row check comes first because the caller is a loop. A request that
+        does not fit is offered again whenever one retires, and matching the
+        whole prompt into pages before discovering there is nowhere to put it
+        measured 15% of throughput at batch 32. Nothing below here is worth
+        doing for a request that has no row to go in.
         """
+        if not self.pool.free_rows:
+            return None
         self.clock += 1
+        self.requests += 1
+        self.prompt_tokens += len(prompt)
         path = self._match(blocks(prompt))
         for node in path:
             node.hits += 1
@@ -404,12 +419,17 @@ class PrefixCache:
         stale = [node for node in self._leaves() if node.refs == 0]
         if not stale:
             return False
-        victim = min(stale, key=lambda node: node.clock)
-        if victim.checkpoint is not None:
-            self.checkpoints.release(victim.checkpoint)
-        assert victim.parent is not None
-        del victim.parent.children[victim.block]
-        self.pool.free_page(victim.page)
+        self._drop(min(stale, key=lambda node: node.clock))
+        return True
+
+    def _drop(self, node: Node) -> bool:
+        """Unhook one leaf and give its page and checkpoint back."""
+        if node.refs or node.children or node.parent is None:
+            return False
+        if node.checkpoint is not None:
+            self.checkpoints.release(node.checkpoint)
+        del node.parent.children[node.block]
+        self.pool.free_page(node.page)
         self.nodes -= 1
         return True
 
@@ -423,9 +443,61 @@ class PrefixCache:
 
         return walk(self.root)
 
+    def reset(self) -> None:
+        """Forget every prefix, returning the pages to the pool.
+
+        What a benchmark calls between a warm-up and the run it is timing. A
+        warm-up that sent the same prompts leaves the trie holding exactly the
+        prefixes the measurement is about to send, so without this the run
+        reports a half-warm cache under either label — the trap that makes a
+        prefix-cache number meaningless. Rows in flight keep what they borrowed;
+        only what nothing is reading is dropped.
+        """
+        # Round by round, because dropping a leaf makes its parent one. Stops
+        # when a pass drops nothing, which is what a trie pinned down to its
+        # live rows looks like.
+        dropped = True
+        while dropped:
+            dropped = False
+            for node in self._leaves():
+                dropped = self._drop(node) or dropped
+        self.clear_counters()
+
+    def clear_counters(self) -> None:
+        """Zero what the cache has done, without forgetting what it holds.
+
+        The other half of a benchmark's bookkeeping: a run measuring a *warm*
+        cache wants the trie kept and the tally restarted, so that each round
+        reports its own hits rather than every round before it.
+        """
+        self.requests = 0
+        self.prompt_tokens = 0
+        self.hits = 0
+        self.tokens_saved = 0
+
     # -- reporting ---------------------------------------------------------
 
     @property
     def cached_tokens(self) -> int:
         """Tokens the tree is holding cache for, reclaimable but not free."""
         return self.nodes * PAGE_SIZE
+
+    def stats(self) -> dict[str, int | float]:
+        """What the cache did, in the terms a benchmark should be reading.
+
+        ``hit_rate`` is over prompt tokens rather than over requests, because
+        that is what the cache actually saves and what a request feels: half of
+        one long prompt skipped is worth more than the whole of a short one.
+        """
+        return {
+            "requests": self.requests,
+            "hits": self.hits,
+            "prompt_tokens": self.prompt_tokens,
+            "tokens_saved": self.tokens_saved,
+            "hit_rate": (
+                self.tokens_saved / self.prompt_tokens if self.prompt_tokens else 0.0
+            ),
+            "checkpoints": len(self.checkpoints),
+            "checkpoint_capacity": self.checkpoints.capacity,
+            "cached_tokens": self.cached_tokens,
+        }
