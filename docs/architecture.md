@@ -58,9 +58,15 @@ The scheduler owns a pool of `max_batch_size` sequence slots, preallocated for
    batched: a prompt already saturates the GPU, so grouping them would only pad
    to the longest one, and admitting a burst at once would stall every running
    stream at the same moment.
-2. **Decode** one step across every running sequence at once, padded up to the
-   nearest captured batch size.
-3. **Retire** any sequence that hit a stop token, its token limit, or a client
+2. **Prefill** the admitted prompt `--prefill-chunk` tokens at a time, one
+   chunk per iteration. Prefill runs alone, so a whole prompt in one pass is a
+   gap in every stream already decoding — half a second at 16k tokens. The
+   chunk bounds that gap without changing what the prompt costs.
+3. **Decode** one step across every running sequence at once, padded up to the
+   nearest captured batch size. The padding is what makes step 2 need care: a
+   step runs whole buckets, so it steps the slot being prefilled too, and the
+   scheduler puts back the recurrent state that step advanced.
+4. **Retire** any sequence that hit a stop token, its token limit, or a client
    that went away, freeing its slot for the next admission.
 
 Rows of that batch sit at different points in their own sequences, which is

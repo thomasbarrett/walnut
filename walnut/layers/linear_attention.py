@@ -88,6 +88,11 @@ class ConvState(Cache):
         self.conv[index].zero_()
         self.recurrent[index].zero_()
 
+    def carried(self, index: int) -> list[torch.Tensor]:
+        """Both buffers: the conv window and the recurrent state are the
+        sequence's whole history here, and every step rewrites both."""
+        return [self.conv[index], self.recurrent[index]]
+
     def prime(self) -> None:
         self.primed = True
 

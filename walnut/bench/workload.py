@@ -23,10 +23,11 @@ class Shape:
     """How much prompt, and how much generation.
 
     The primary axis of any serving measurement, and the one walnut is most
-    sensitive to: `Scheduler._admit` runs prefill alone, one request at a time
-    and unchunked, so the cost of a prompt is paid by every stream already
-    running. Between `reasoning` and `agentic` the prefill:decode work ratio
-    moves by two orders of magnitude, and no conclusion drawn at one end
+    sensitive to: `Scheduler` prefills one request at a time and alone, so the
+    cost of a prompt is paid by every stream already running — in chunks of
+    ``prefill_chunk`` rather than all at once, which bounds the gap without
+    moving the cost. Between `reasoning` and `agentic` the prefill:decode work
+    ratio moves by two orders of magnitude, and no conclusion drawn at one end
     transfers to the other.
 
     Named rather than assembled from flags so the record says which workload it

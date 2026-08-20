@@ -155,9 +155,10 @@ and exactly 1024 out), `rag`, `reasoning` and `agentic` span 1k to 16k prompt
 tokens, with sizes taken from published benchmarks rather than invented. The
 input figure is a ceiling: prompts are jittered over 80-100% of it, one-sided,
 so a shape's name states a maximum a reader can check. That range matters
-more here than in most engines: walnut prefills one request at a time and
-unchunked, so a long prompt stalls every stream already decoding, and a
-conclusion drawn at one shape does not transfer to another.
+more here than in most engines: walnut prefills one request at a time, so a
+long prompt still interrupts every stream already decoding — in chunks of
+`--prefill-chunk` rather than all at once — and a conclusion drawn at one shape
+does not transfer to another.
 
 Every subcommand takes `--num-iters-warmup`, and every default is non-zero. The
 first pass through a fresh process compiles the decode step, autotunes it and

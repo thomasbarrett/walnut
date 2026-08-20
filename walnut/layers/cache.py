@@ -17,6 +17,11 @@ only as far as its sequence has got however long the slot is.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
 
 class Cache:
     """Opaque per-layer decode state; only the owning mixer knows its shape."""
@@ -32,6 +37,19 @@ class Cache:
     def reset(self, index: int) -> None:
         """Clear slot ``index``, so the next sequence starts from no context."""
         raise NotImplementedError
+
+    def carried(self, index: int) -> list[torch.Tensor]:
+        """Slot ``index``'s tensors that a step advances rather than indexes.
+
+        A decode step runs every row of its batch, live or not, so a slot part
+        way through a chunked prefill is stepped along with the rest. A
+        positional write survives that — the scheduler aims the row at the
+        position its next chunk overwrites — but recurrent state has nowhere to
+        be aimed: a step moves it on, and the prompt's context is gone. These
+        are the tensors the scheduler saves across a step and puts back, and a
+        cache that only writes by position has none.
+        """
+        return []
 
     def prime(self) -> None:
         """Mark this cache as holding state, whatever it currently holds.
