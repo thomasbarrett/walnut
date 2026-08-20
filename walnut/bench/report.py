@@ -204,7 +204,59 @@ def report_sweep(rungs: list[dict[str, Any]], stopped: str) -> None:
     else:
         print(
             "\nevery rung kept up: the knee is above the highest rate offered. "
-            "Extend --rates."
+            "Extend the --request-rate ladder."
+        )
+
+
+def report_frontier(rungs: list[dict[str, Any]], slos: dict[str, float]) -> None:
+    """Throughput against interactivity, one row per concurrency limit.
+
+    `tok/s/user` is throughput over mean concurrency — the axis the public
+    benchmarks plot, so a walnut number can sit beside theirs. It is an
+    aggregate ratio and cannot separate a uniformly slow decode from one
+    starved stream, which is this harness's own objection to NTPOT; `TPOT p99`
+    sits next to it as the one to believe.
+    """
+    print(f"\n{' Concurrency Frontier ':=^78}")
+    print(
+        f"{'conc':>6} {'out tok/s':>10} {'tok/s/user':>11} {'TPOT p50':>9} "
+        f"{'TPOT p99':>9} {'ITL p99':>8} {'E2EL p99':>9} {'goodput':>8}"
+    )
+    for record in rungs:
+        stats = record["metrics"]
+        mean_conc = record["concurrency"] or 1.0
+        fraction = record["goodput_fraction"]
+        print(
+            f"{record['max_concurrency']:>6} "
+            f"{record['output_throughput']:>10.1f} "
+            f"{record['output_throughput'] / mean_conc:>11.1f} "
+            f"{stats['tpot'].get('p50', 0.0):>9.2f} "
+            f"{stats['tpot'].get('p99', 0.0):>9.2f} "
+            f"{stats['itl'].get('p99', 0.0):>8.2f} "
+            f"{stats['e2el'].get('p99', 0.0):>9.1f} "
+            f"{'—' if fraction is None else f'{fraction * 100:.0f}%':>8}"
+        )
+    print("=" * 78)
+
+    if slos:
+        cleared = [r for r in rungs if (r["goodput_fraction"] or 0) >= 1.0]
+        if cleared:
+            best = max(cleared, key=lambda r: r["output_throughput"])
+            terms = ", ".join(f"{k} p100 <= {v * 1e3:.0f} ms" for k, v in slos.items())
+            print(
+                f"\n{best['output_throughput']:.0f} tok/s at "
+                f"concurrency {best['max_concurrency']} — the most throughput "
+                f"on this ladder with every request inside {terms}."
+            )
+        else:
+            print(
+                "\nno rung served every request inside the SLOs. The frontier "
+                "starts below the lowest concurrency offered."
+            )
+    else:
+        print(
+            "\npass --goodput to name the interactivity you need, and the "
+            "throughput at it is read off rather than eyeballed."
         )
 
 
