@@ -12,28 +12,22 @@ import math
 import statistics
 from typing import Any
 
-#: Fixed, not configurable. The table is built around three columns, and a run
-#: reported at other percentiles is comparable with no other run. A knob here
-#: also invites a p99.9 over five samples, which is what `resolves` exists to
-#: catch — the harness should not hand out a way around its own guardrail.
+#: Fixed. A run reported at other percentiles is comparable with no other run,
+#: and a knob here is a way around `resolves` — p99.9 of five samples is the
+#: maximum, every time.
 PERCENTILES = (50.0, 90.0, 99.0)
 
-#: (key, short name, section header).
+#: (key, short name, section header). Every one is printed.
 #:
-#: Every metric here is printed. NTPOT — whole-request latency over token
-#: count — used to be recorded and withheld, because it gives a stalled prefill
-#: and a uniformly slow decode the same value and so cannot show what ITL
-#: exists to show. A number that must never be read is not a measurement; the
-#: reason it was rejected is the part worth keeping, and this is it.
+#: No NTPOT: whole-request latency over token count gives a stalled prefill and
+#: a uniformly slow decode the same value, which is what ITL exists to
+#: distinguish. E2EL earns its row on its tail alone — per request it is
+#: `ttft + tpot * (tokens - 1)` by definition, but p99 E2EL is not recoverable
+#: from the other two, since a request can be bad at one without the other.
 METRICS = (
     ("ttft", "TTFT", "Time to First Token"),
     ("tpot", "TPOT", "Time per Output Token (excl. 1st token)"),
     ("itl", "ITL", "Inter-token Latency"),
-    # Per request this is arithmetic: e2el == ttft + tpot * (tokens - 1), by
-    # the definition of TPOT, and output length is held fixed. Its *tail* is
-    # not — p99 E2EL cannot be recovered from p99 TTFT and p99 TPOT, because a
-    # request can be bad at one without the other. It earns its row as a tail
-    # statistic, and the mean can never disagree with the two rows above it.
     ("e2el", "E2EL", "End-to-end Latency"),
 )
 

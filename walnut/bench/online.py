@@ -275,11 +275,9 @@ async def drive(
 def serve_payload(opts: ServeOptions, model: str) -> dict[str, Any]:
     """Greedy, and every request held to exactly ``max_tokens``.
 
-    Neither is a flag. Sampling costs are only legible with the scheduler and
-    HTTP taken out of the way, which is `walnut bench latency` — here they sit
-    under queueing and batching and cannot be read. And a run where EOS stopped
-    requests at different lengths has latencies that cannot be compared with
-    each other, which this harness already refuses to report.
+    Neither is a flag: sampling cost is only legible with the scheduler and HTTP
+    out of the way (`walnut bench latency`), and ragged output lengths give
+    latencies this harness already refuses to compare.
     """
     return {
         "model": model,

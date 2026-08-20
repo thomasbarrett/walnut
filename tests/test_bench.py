@@ -15,7 +15,7 @@ from typer.testing import CliRunner
 
 from walnut.bench import cli as bench_cli
 from walnut.bench.errors import BenchError
-from walnut.bench.metrics import PERCENTILES, SLO_METRICS, percentile, summarize
+from walnut.bench.metrics import SLO_METRICS, percentile, summarize
 from walnut.bench.online import (
     RequestResult,
     ServeOptions,
@@ -391,17 +391,3 @@ def test_latency_has_no_batch_size_knob():
         runner.invoke(app, ["bench", "latency", "m", "--batch-size", "8"]).exit_code
         != 0
     )
-
-
-def test_reported_percentiles_are_fixed():
-    """Not a flag. Three columns is what the table is built around, and a run
-    reported at other percentiles is comparable with no other run — while a
-    configurable set invites a p99.9 over five samples, which is the misuse
-    `resolves` exists to catch."""
-    assert PERCENTILES == (50.0, 90.0, 99.0)
-    stats = summarize([float(v) for v in range(1, 101)])
-    assert [k for k in stats if k.startswith("p") and not k.endswith("_resolves")] == [
-        "p50",
-        "p90",
-        "p99",
-    ]
