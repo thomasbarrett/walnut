@@ -11,9 +11,9 @@ import threading
 import pytest
 import torch
 
+from walnut.cache import CachePool, StateCache
 from walnut.graph import buckets
 from walnut.layers.attention import Attention
-from walnut.layers.cache import Cache
 from walnut.sampler import Sampler, SamplingParams
 from walnut.scheduler import Request, RequestError, Scheduler
 
@@ -32,7 +32,11 @@ class _StepModel:
         self.crash = False
 
     def make_cache(self, max_batch_size, max_seq_len):
-        return [self.attn.make_cache(max_batch_size, max_seq_len, torch.float32, None)]
+        return CachePool(
+            [self.attn.make_cache(max_batch_size, max_seq_len, torch.float32, None)],
+            max_batch_size,
+            max_seq_len,
+        )
 
     def __call__(self, input_ids, positions, cache):
         if self.crash:
@@ -40,17 +44,14 @@ class _StepModel:
         if self.fail:
             raise RuntimeError("the step broke")
         self.steps += 1
-        batch, seq = input_ids.shape
-        # Write the token into the cache and read it back out of the slot the
-        # positions name, so a mis-slotted write becomes a wrong token.
-        value = input_ids.float()[..., None, None].expand(batch, seq, 1, 8)
-        _, values = cache[0].update(positions, torch.zeros_like(value), value.clone())
-        if positions.ndim == 1:
-            last = values[:, positions[-1], 0, 0]
-        else:
-            rows = torch.arange(batch)
-            last = values[rows, positions[:, 0], 0, 0]
-        logits = torch.zeros(batch, seq, VOCAB)
+        rows, seq = input_ids.shape
+        # Write the token into the cache and read it back out of the cell the
+        # batch names, so a mis-slotted write becomes a wrong token.
+        value = input_ids.float()[..., None, None].expand(rows, seq, 1, 8)
+        batch = cache.batch(positions)
+        cache[0].write(batch, torch.zeros_like(value), value.clone())
+        last = cache[0].v.reshape(-1, 1, 8)[batch.cells[:, -1], 0, 0]
+        logits = torch.zeros(rows, seq, VOCAB)
         logits[:, -1, :] = torch.nn.functional.one_hot(
             (last.long() + 1) % VOCAB, VOCAB
         ).float()
@@ -134,7 +135,7 @@ def test_a_finished_request_frees_its_slot():
     try:
         _drain(scheduler, [_request(5), _request(9)])
         assert scheduler.running == {}
-        assert scheduler.free == list(range(4))
+        assert scheduler.pool.free == tuple(range(4))
     finally:
         scheduler.close()
 
@@ -165,7 +166,7 @@ def test_abandoning_a_stream_frees_the_slot():
         stream.close()
         scheduler.close()
         assert scheduler.running == {}
-        assert scheduler.free == list(range(4))
+        assert scheduler.pool.free == tuple(range(4))
     finally:
         scheduler.close()
 
@@ -250,7 +251,7 @@ def test_a_seeded_request_gets_its_own_generator():
         scheduler.close()
 
 
-class _SumCache(Cache):
+class _SumCache(StateCache):
     """A stand-in for recurrent state: one running total per slot.
 
     `KVCache` cannot show what a chunked prefill risks — its writes are indexed
@@ -262,19 +263,14 @@ class _SumCache(Cache):
     def __init__(self, rows: int) -> None:
         self.total = torch.zeros(rows)
 
+    def buffers(self) -> list:
+        return [self.total]
+
     def view(self, start: int, stop: int) -> "_SumCache":
         cache = _SumCache.__new__(_SumCache)
         cache.total = self.total[start:stop]
+        cache.primed = self.primed
         return cache
-
-    def reset(self, index: int) -> None:
-        self.total[index] = 0
-
-    def carried(self, index: int) -> list:
-        return [self.total[index : index + 1]]
-
-    def prime(self) -> None:
-        pass
 
 
 class _RecurrentModel:
@@ -290,7 +286,7 @@ class _RecurrentModel:
         self.eos_token_id = None
 
     def make_cache(self, max_batch_size, max_seq_len):
-        return [_SumCache(max_batch_size)]
+        return CachePool([_SumCache(max_batch_size)], max_batch_size, max_seq_len)
 
     def __call__(self, input_ids, positions, cache):
         total = cache[0].total
@@ -383,7 +379,7 @@ def test_a_prefill_between_chunks_keeps_the_state_it_has_built():
             stream = neighbour.stream()
             next(stream)  # admitted, and decoding
             streams.append(stream)
-        assert scheduler.free == [3]
+        assert scheduler.pool.free == (3,)
         assert _drain(scheduler, [_prompt(prompt)]) == expected
         for stream in streams:
             stream.close()

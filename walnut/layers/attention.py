@@ -8,20 +8,18 @@ import torch
 from torch import nn
 from torch.nn.attention.varlen import varlen_attn
 
-from walnut.layers.cache import Cache
+from walnut.cache import Batch, TokenCache
 
 
-class KVCache(Cache):
+class KVCache(TokenCache):
     """Static, pre-allocated key/value cache: fixed-size buffers written by
-    slot, so tensor shapes stay identical across prefill and decode steps.
+    cell, so tensor shapes stay identical across prefill and decode steps.
 
-    The batch dimension is a pool of sequence slots (see `Cache`). Writes are
-    positional per row, so a batch whose rows sit at different points in their
-    own sequences still lands in one indexed store.
-
-    Laid out ``(batch, position, head, dim)``: each slot is then a contiguous
-    run of tokens, which is the layout `varlen_attn` reads a cache in, and the
-    layout q/k/v already arrive in.
+    Laid out ``(batch, position, head, dim)`` and written through a flat index
+    into the first two axes together, which is what `Batch.cells` names. A slot
+    pool makes a sequence's cells one contiguous run, which is the layout
+    `varlen_attn` reads and the layout q/k/v already arrive in; a block pool
+    would scatter them, and only the read side would have to change.
     """
 
     def __init__(
@@ -39,17 +37,15 @@ class KVCache(Cache):
         self._index()
 
     def _index(self) -> None:
-        """Row numbers, and the slot boundaries `varlen_attn` reads.
+        """The slot boundaries `varlen_attn` reads.
 
-        Both are built once per view rather than per step: a captured graph
-        replays whatever addresses it recorded, so anything it reads has to
-        outlive the capture.
+        Built once per view rather than per step: a captured graph replays
+        whatever addresses it recorded, so anything it reads has to outlive the
+        capture.
         """
         rows, slot = self.k.shape[0], self.k.shape[1]
-        device = self.k.device
-        self.rows_index = torch.arange(rows, device=device)
         self.cu_seqlens = torch.arange(
-            0, (rows + 1) * slot, slot, dtype=torch.int32, device=device
+            0, (rows + 1) * slot, slot, dtype=torch.int32, device=self.k.device
         )
 
     @classmethod
@@ -59,6 +55,9 @@ class KVCache(Cache):
         cache._index()
         return cache
 
+    def buffers(self) -> list[torch.Tensor]:
+        return [self.k, self.v]
+
     def view(self, start: int, stop: int) -> KVCache:
         """Rows ``[start, stop)``, spanning whole slots.
 
@@ -67,28 +66,27 @@ class KVCache(Cache):
         """
         return KVCache._view(self.k[start:stop], self.v[start:stop])
 
-    def reset(self, index: int) -> None:
-        self.k[index].zero_()
-        self.v[index].zero_()
+    def write(self, batch: Batch, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write ``k``/``v`` (rows, width, H, D) into the cells ``batch`` names.
 
-    def update(
-        self, input_pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Write ``k``/``v`` (B, S, H, D) into the slots ``input_pos`` names;
-        return the full buffers (B, max_seq, H, D).
+        One flat scatter, whatever the pass is: a prompt chunk writing a run of
+        cells and a decode step writing one cell per row differ only in the
+        indices they are handed. Which is the point — a placement this does not
+        have to understand is a placement that can change.
 
-        ``input_pos`` is either (S,) — every row of the batch at the same
-        positions, which is what a lone prefill produces — or (B, S), one
-        position per row, which is what a batch of independent sequences needs.
+        It costs something today. Indexing by ``(row, position)``, as this did
+        while a slot was the only placement there was, let Inductor fuse the
+        two writes into one kernel; indexing by cell does not, so a decode step
+        carries one extra kernel per full-attention layer. Same total GPU time
+        — the kernels do the same work — but a captured graph has more nodes to
+        walk, which measures as 0.7% of TPOT on a 0.8B model. Paging takes it
+        back: a block store holds keys and values in one tensor, and one
+        scatter writes both.
         """
-        if input_pos.ndim == 1:
-            self.k[:, input_pos] = k
-            self.v[:, input_pos] = v
-        else:
-            rows = self.rows_index[:, None]
-            self.k[rows, input_pos] = k
-            self.v[rows, input_pos] = v
-        return self.k, self.v
+        heads, dim = self.k.shape[2], self.k.shape[3]
+        cells = batch.cells.reshape(-1)
+        self.k.view(-1, heads, dim)[cells] = k.reshape(-1, heads, dim)
+        self.v.view(-1, heads, dim)[cells] = v.reshape(-1, heads, dim)
 
 
 @torch._dynamo.disable
@@ -144,6 +142,10 @@ class Attention(nn.Module):
     The cache is not optional. Every attention this model does is part of a
     sequence being generated, so it is always writing its keys and values into
     a slot and reading that slot back; there is no cacheless call to serve.
+
+    Where those cells are, and how long each row's context runs, arrive in a
+    `Batch` the pass computed once. This layer holds the head geometry and the
+    kernel call, and nothing about the layout.
     """
 
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int) -> None:
@@ -170,15 +172,7 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         cache: KVCache,
-        input_pos: torch.Tensor,
+        batch: Batch,
     ) -> torch.Tensor:
-        cache.update(input_pos, k, v)
-        # A row attends through its own last position, so that position plus
-        # one *is* its length.
-        positions = (
-            input_pos.reshape(q.shape[0], -1)
-            if input_pos.ndim > 1
-            else input_pos.expand(q.shape[0], -1)
-        )
-        lengths = (positions[:, -1] + 1).to(torch.int32)
-        return _varlen(q, cache, lengths, self.scaling)
+        cache.write(batch, k, v)
+        return _varlen(q, cache, batch.lengths, self.scaling)

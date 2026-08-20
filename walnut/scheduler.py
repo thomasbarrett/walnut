@@ -39,8 +39,8 @@ from typing import Any
 
 import torch
 
-from walnut.graph import DecodeGraphs, buckets, cache_rows
-from walnut.layers.cache import Cache
+from walnut.cache import CachePool
+from walnut.graph import DecodeGraphs, buckets
 from walnut.sampler import SamplingParams
 
 logger = logging.getLogger("walnut.scheduler")
@@ -133,20 +133,17 @@ class Scheduler:
         self.compile = compile
         self.autotune = autotune
 
-        self.cache: list[Cache] = model.make_cache(max_batch_size, max_seq_len)
+        self.pool: CachePool = model.make_cache(max_batch_size, max_seq_len)
         # The pool is decoded against from the first step: its slots hold
         # zeros, which is what "no context yet" means to a recurrent state.
-        for entry in self.cache:
-            entry.prime()
+        self.pool.prime()
 
         self.sizes = buckets(max_batch_size)
-        self.views = {size: cache_rows(self.cache, size) for size in self.sizes}
+        self.views = {size: self.pool.view(0, size) for size in self.sizes}
         # Built once rather than per prefill: a view allocates its own index
-        # tensors, and rebuilding one per layer per request puts that on the
-        # time-to-first-token path.
-        self.slot_views = [
-            [entry.slot(slot) for entry in self.cache] for slot in range(max_batch_size)
-        ]
+        # tensors, and rebuilding one per request puts that on the time-to-
+        # first-token path.
+        self.slot_views = [self.pool.slot(slot) for slot in range(max_batch_size)]
         self.token = torch.zeros(max_batch_size, 1, dtype=torch.long, device=device)
         self.position = torch.zeros(max_batch_size, 1, dtype=torch.long)
 
@@ -155,10 +152,7 @@ class Scheduler:
         # built once: a prefill chunk is on the time-to-first-token path, and
         # only one prefill is ever in flight, so one copy serves whichever slot
         # holds it.
-        self.carried = [
-            [tensor for entry in self.cache for tensor in entry.carried(slot)]
-            for slot in range(max_batch_size)
-        ]
+        self.carried = [self.pool.carried(slot) for slot in range(max_batch_size)]
         self.saved = [torch.empty_like(tensor) for tensor in self.carried[0]]
 
         self.incoming: queue.Queue[Request | None] = queue.Queue()
@@ -166,7 +160,6 @@ class Scheduler:
         #: The sequence being prefilled, if any. At most one: its chunks run
         #: between decode steps, and a second would only lengthen both.
         self.prefilling: Sequence | None = None
-        self.free = list(range(max_batch_size))
         self.decode_forward: Any = model
         self.graphs: DecodeGraphs | None = None
         self._started = threading.Event()
@@ -224,7 +217,7 @@ class Scheduler:
             # could disturb — and a snapshot would be a second whole pool.
             self.graphs = DecodeGraphs(
                 self.decode_forward,
-                self.cache,
+                self.pool,
                 self.device,
                 self.max_batch_size,
                 restore=False,
@@ -307,7 +300,7 @@ class Scheduler:
         prefilling: chunks and decode steps share the loop, so a second prompt
         would only interleave with the first and make both slower to answer.
         """
-        if self.prefilling is not None or not self.free:
+        if self.prefilling is not None or not self.pool.free:
             return True
         blocking = not self.running
         try:
@@ -322,9 +315,9 @@ class Scheduler:
 
     def _begin_prefill(self, request: Request) -> None:
         """Give ``request`` a fresh slot; its prompt runs from the next chunk."""
-        slot = self.free.pop(0)
-        for entry in self.cache:
-            entry.reset(slot)
+        slot = self.pool.reserve()
+        assert slot is not None  # `_admit` checked it had one
+        self.pool.reset(slot)
         self.prefilling = Sequence(request, slot)
 
     def _prefill_chunk(self) -> None:
@@ -368,8 +361,7 @@ class Scheduler:
     def _abandon(self, sequence: Sequence, error: BaseException | None) -> None:
         """Drop a part-prefilled sequence, freeing the slot it never filled."""
         self.prefilling = None
-        self.free.append(sequence.slot)
-        self.free.sort()
+        self.pool.release(sequence.slot)
         self._close(sequence.request, error)
 
     def _bucket(self) -> int:
@@ -472,8 +464,7 @@ class Scheduler:
         """Free a sequence's slot and close its stream."""
         if self.running.pop(sequence.slot, None) is None:
             return
-        self.free.append(sequence.slot)
-        self.free.sort()  # lowest slot first, so the live set stays dense
+        self.pool.release(sequence.slot)
         self._close(sequence.request, error)
 
     @staticmethod

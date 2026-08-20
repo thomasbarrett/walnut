@@ -4,6 +4,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from walnut.cache import Batch, CacheView
 from walnut.layers.attention import Attention, KVCache
 from walnut.layers.linear_attention import (
     _CHUNK,
@@ -105,7 +106,7 @@ def test_rope_partial_rotary_passes_tail_through():
 #: CUDA-only and built for float16/bfloat16 — and it is the only path there is,
 #: with no cacheless branch left to check it against on CPU. So every test of
 #: attention itself skips on CI's runner. What still runs there is the cache's
-#: own bookkeeping (`KVCache.update`, the slot views) and the scheduler driving
+#: own bookkeeping (`KVCache.write`, the slot views) and the scheduler driving
 #: a stand-in model, which is where the batching logic lives.
 cuda_only = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="attention needs CUDA"
@@ -113,6 +114,11 @@ cuda_only = pytest.mark.skipif(
 
 #: Where and in what precision the kernel exists.
 _HALF: Any = {"device": "cuda", "dtype": torch.bfloat16}
+
+
+def _batch(cache: KVCache, positions: torch.Tensor) -> Batch:
+    """The addressing a pass needs, resolved the way a model resolves it."""
+    return CacheView([cache], cache.k.shape[0], cache.k.shape[1]).batch(positions)
 
 
 def _kv(rows: int, heads: int, length: int, head_dim: int) -> KVCache:
@@ -152,7 +158,8 @@ def test_attention_matches_manual_softmax():
     scores = scores.masked_fill(~torch.tril(ones).bool(), float("-inf"))
     expected = torch.softmax(scores, dim=-1) @ vm
 
-    got = attn(q, k, v, _kv(1, 1, 2, head_dim), torch.arange(2, device="cuda"))
+    cache = _kv(1, 1, 2, head_dim)
+    got = attn(q, k, v, cache, _batch(cache, torch.arange(2, device="cuda")))
     assert torch.allclose(got[0, :, 0].float(), expected, atol=2e-2)
 
 
@@ -168,7 +175,8 @@ def test_attention_incremental_matches_prefill():
     k = torch.randn(1, seq, 2, 64, **_HALF)
     v = torch.randn(1, seq, 2, 64, **_HALF)
 
-    full = attn(q, k, v, _kv(1, 2, seq, 64), torch.arange(seq, device="cuda"))
+    prefill = _kv(1, 2, seq, 64)
+    full = attn(q, k, v, prefill, _batch(prefill, torch.arange(seq, device="cuda")))
 
     cache = _kv(1, 2, seq, 64)
     steps = [
@@ -177,7 +185,7 @@ def test_attention_incremental_matches_prefill():
             k[:, i : i + 1],
             v[:, i : i + 1],
             cache,
-            input_pos=torch.tensor([[i]], device="cuda"),
+            _batch(cache, torch.tensor([[i]], device="cuda")),
         )
         for i in range(seq)
     ]
@@ -285,12 +293,13 @@ def test_attention_is_causal_in_prefill():
     k = torch.randn(1, seq, 2, 64, **_HALF)
     v = torch.randn(1, seq, 2, 64, **_HALF)
 
-    out = attn(q, k, v, _kv(1, 2, seq, 64), positions)
+    one, two = _kv(1, 2, seq, 64), _kv(1, 2, seq, 64)
+    out = attn(q, k, v, one, _batch(one, positions))
     # Perturbing a future key/value must not change an earlier query's output.
     k2, v2 = k.clone(), v.clone()
     k2[:, -1] += 5.0
     v2[:, -1] += 5.0
-    out2 = attn(q, k2, v2, _kv(1, 2, seq, 64), positions)
+    out2 = attn(q, k2, v2, two, _batch(two, positions))
     assert torch.allclose(out[:, 0].float(), out2[:, 0].float(), atol=2e-2)
     assert not torch.allclose(out[:, -1].float(), out2[:, -1].float(), atol=2e-2)
 
@@ -305,7 +314,7 @@ def test_a_slot_view_writes_the_pool_it_came_from():
     pool = _pool()
     view = cast(KVCache, pool.slot(2))
     keys = torch.randn(1, 3, 2, 8)
-    view.update(torch.arange(3), keys, keys)
+    view.write(_batch(view, torch.arange(3)), keys, keys)
     assert torch.equal(pool.k[2, :3], keys[0])
     assert (pool.k[0] == 0).all() and (pool.k[1] == 0).all()
 
@@ -325,7 +334,7 @@ def test_a_batched_update_writes_one_position_per_row():
     positions = torch.tensor([[0], [4], [7]])
     values = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1)
     values = values.expand(3, 1, 2, 8).contiguous()
-    pool.update(positions, values, values)
+    pool.write(_batch(pool, positions), values, values)
     for row, position in enumerate((0, 4, 7)):
         assert (pool.k[row, position] == row).all()
         assert pool.k[row].sum() == pool.k[row, position].sum()

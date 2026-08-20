@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from walnut.cache import Batch, Cache, CachePool, CacheView
 from walnut.graph import DecodeGraph
 from walnut.layers import (
     Attention,
@@ -29,7 +30,6 @@ from walnut.layers import (
     apply_rotary_pos_emb,
 )
 from walnut.layers.attention import KVCache
-from walnut.layers.cache import Cache
 from walnut.layers.linear_attention import ConvState
 from walnut.models.loader import copy_weights
 from walnut.sampler import Sampler, SamplingParams
@@ -104,7 +104,7 @@ class Qwen3_5Attention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: KVCache,
-        input_pos: torch.Tensor,
+        batch: Batch,
     ) -> torch.Tensor:
         bsz, seq, _ = x.shape
 
@@ -125,7 +125,7 @@ class Qwen3_5Attention(nn.Module):
         k = self.k_norm(k)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        attn = self.attn(q, k, v, cache, input_pos).reshape(bsz, seq, -1)
+        attn = self.attn(q, k, v, cache, batch).reshape(bsz, seq, -1)
         if gate is not None:
             attn = attn * torch.sigmoid(gate)
         return self.o_proj(attn)
@@ -174,12 +174,12 @@ class Qwen3_5DecoderLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: Cache,
-        input_pos: torch.Tensor,
+        batch: Batch,
     ) -> torch.Tensor:
         normed = self.input_layernorm(x)
         if self.block_type == "full_attention":
             assert not isinstance(cache, ConvState)
-            x = x + self.self_attn(normed, cos, sin, cache, input_pos)
+            x = x + self.self_attn(normed, cos, sin, cache, batch)
         else:
             assert not isinstance(cache, KVCache)
             x = x + self.linear_attn(normed, cache)
@@ -215,15 +215,25 @@ class Qwen3_5TextModel(nn.Module):
         max_batch_size: int = 1,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
-    ) -> list[Cache]:
+    ) -> CachePool:
         """Build a fresh per-layer cache (static KV for full attention, conv +
-        recurrent state for linear attention), sized for ``max_seq_len`` tokens."""
-        return [
-            cast(Qwen3_5DecoderLayer, layer).make_cache(
-                max_batch_size, max_seq_len, dtype, device
-            )
-            for layer in self.layers
-        ]
+        recurrent state for linear attention), sized for ``max_seq_len`` tokens.
+
+        A pool rather than a bare list: the placement of sequences within it is
+        part of what the cache *is*, and everything above here — a prefill
+        against one slot, a decode against a bucket, a scheduler handing slots
+        out — asks the pool for it rather than working it out again.
+        """
+        return CachePool(
+            [
+                cast(Qwen3_5DecoderLayer, layer).make_cache(
+                    max_batch_size, max_seq_len, dtype, device
+                )
+                for layer in self.layers
+            ],
+            max_batch_size,
+            max_seq_len,
+        )
 
     def forward(
         self,
@@ -231,7 +241,7 @@ class Qwen3_5TextModel(nn.Module):
         positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         *,
-        cache: list[Cache],
+        cache: CacheView,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             assert input_ids is not None
@@ -240,15 +250,13 @@ class Qwen3_5TextModel(nn.Module):
         if positions is None:
             positions = torch.arange(h.shape[1], device=h.device)
 
+        # Rotary reads the positions as given; the cache reads where they land.
+        # One `Batch` for the whole pass, so the layout is resolved once rather
+        # than re-derived from the position tensor by every mixer.
         cos, sin = self.rotary(positions)
+        batch = cache.batch(positions)
         for i, layer in enumerate(self.layers):
-            h = layer(
-                h,
-                cos,
-                sin,
-                cache[i],
-                input_pos=positions,
-            )
+            h = layer(h, cos, sin, cache[i], batch)
         return self.norm(h)
 
 
@@ -580,7 +588,7 @@ class Qwen3_5Model(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         *,
-        cache: list[Cache],
+        cache: CacheView,
     ) -> torch.Tensor:
         if pixel_values is None:
             return self.language_model(input_ids, positions, cache=cache)
@@ -629,7 +637,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         mm_token_type_ids: torch.Tensor | None = None,
         *,
-        cache: list[Cache],
+        cache: CacheView,
     ) -> torch.Tensor:
         hidden = self.model(
             input_ids,
@@ -641,7 +649,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         )
         return self.lm_head(hidden)
 
-    def make_cache(self, max_batch_size: int, max_seq_len: int) -> list[Cache]:
+    def make_cache(self, max_batch_size: int, max_seq_len: int) -> CachePool:
         """A decode-state pool: ``max_batch_size`` slots of ``max_seq_len``.
 
         What `walnut.scheduler.Scheduler` batches over; `iter_generate` builds
