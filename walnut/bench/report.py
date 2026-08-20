@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from walnut.bench.errors import BenchError
-from walnut.bench.metrics import SECTIONS
+from walnut.bench.metrics import PERCENTILES, SECTIONS
 
 
 def write_record(record: dict[str, Any], out: str | None) -> None:
@@ -41,9 +41,7 @@ def rule(title: str = "", columns: int = 2) -> None:
     print(f"{f' {title} ' if title else '':=^{width(columns)}}")
 
 
-def metrics_table(
-    metrics: dict[str, Any], percentiles: list[float], rows: tuple
-) -> None:
+def metrics_table(metrics: dict[str, Any], rows: tuple) -> None:
     """One row per metric, one column per statistic.
 
     A block per metric buries the comparison that matters — whether the TTFT
@@ -57,14 +55,14 @@ def metrics_table(
     it *is* the maximum wearing a tail statistic's name.
     """
     present = [(key, label) for key, label in rows if metrics.get(key)]
-    columns = ["mean", *(f"p{q:g}" for q in percentiles), "max", "std", "n"]
+    columns = ["mean", *(f"p{q:g}" for q in PERCENTILES), "max", "std", "n"]
     print(f"{'':<{LABEL}}" + "".join(f"{c:>{COL}}" for c in columns))
 
     marked = False
     for key, label in present:
         stats = metrics[key]
         cells = [f"{stats['mean']:.2f}"]
-        for q in percentiles:
+        for q in PERCENTILES:
             cell = f"{stats[f'p{q:g}']:.2f}"
             if not stats.get(f"p{q:g}_resolves", True):
                 cell += "*"
@@ -83,7 +81,7 @@ def metrics_table(
 
 
 def report_serve(record: dict[str, Any]) -> None:
-    columns = len(record["percentiles"]) + 4
+    columns = len(PERCENTILES) + 4
     rule("Serving Benchmark Result", columns)
     line("Successful requests:", record["completed"])
     if record["failed"]:
@@ -115,7 +113,7 @@ def report_serve(record: dict[str, Any]) -> None:
     if record["max_concurrency"] is not None:
         metrics["queue_wait"] = record["queue_wait_ms"]
         rows += (("queue_wait", "queue wait (ms)"),)
-    metrics_table(metrics, record["percentiles"], rows)
+    metrics_table(metrics, rows)
     rule(columns=columns)
     serve_warnings(record)
 
@@ -128,25 +126,17 @@ def serve_warnings(record: dict[str, Any]) -> None:
             "from stream deltas.\n  A delta is not always one token; TPOT is an "
             "upper bound. Check the server's version."
         )
-    if record["ignore_eos"] and record["output_tokens_all"] != [record["max_tokens"]]:
-        # With --ignore-eos honored, every request must return exactly
-        # max_tokens. Ragged lengths mean the server ignored the flag or the
-        # streams were cut short, and either way the latencies are not what
-        # they appear to be.
+    if record["output_tokens_all"] != [record["max_tokens"]]:
+        # Every request is sent with ignore_eos, so every one must return
+        # exactly max_tokens. Ragged lengths mean the server ignored the flag
+        # or the streams were cut short, and either way the latencies are not
+        # what they appear to be.
         raise BenchError(
-            f"--ignore-eos was set, but requests returned "
-            f"{record['output_tokens_all'][:6]} tokens rather than "
-            f"{record['max_tokens']}.\n"
+            f"requests returned {record['output_tokens_all'][:6]} tokens "
+            f"rather than {record['max_tokens']}.\n"
             "  Either the server ignored ignore_eos (check its version — an "
             "unknown JSON field is\n  accepted silently) or streams were "
             "truncated. These latencies are not comparable."
-        )
-    if not record["ignore_eos"] and len(record["output_tokens_all"]) > 1:
-        print(
-            f"\n! requests generated different numbers of tokens "
-            f"{record['output_tokens_all'][:6]} because EOS stopped some early.\n"
-            "  Throughput is still valid; per-request latencies are not "
-            "comparable. Re-run with --ignore-eos."
         )
     if shortfall(record) > 0.02:
         print(
@@ -176,8 +166,8 @@ def shortfall(record: dict[str, Any]) -> float:
 
     Separates "the server is slow" from "the harness is slow", and is the rule
     `sweep` stops on. Measured against the schedule, not ``--request-rate``: a
-    finite gamma sample has a realized mean of its own, and charging the client
-    for that reports a bottleneck where there is none.
+    finite Poisson sample has a realized mean of its own, and charging the
+    client for that reports a bottleneck where there is none.
     """
     scheduled = record.get("scheduled_span_s")
     submitted = record.get("submit_span_s")
@@ -224,7 +214,7 @@ def report_sweep(rungs: list[dict[str, Any]], stopped: str) -> None:
 def report_latency(record: dict[str, Any]) -> None:
     """The same table `serve` prints. Here the samples are repeats of one
     measurement, so `std` is the noise floor a change has to clear."""
-    columns = len(record["percentiles"]) + 4
+    columns = len(PERCENTILES) + 4
     rule("Latency Benchmark Result", columns)
     line(
         "Iterations (warm-up):", f"{record['num_iters']} ({record['num_iters_warmup']})"
@@ -236,7 +226,6 @@ def report_latency(record: dict[str, Any]) -> None:
     print()
     metrics_table(
         record["metrics"],
-        record["percentiles"],
         tuple((key, f"{name} (ms)") for key, name, _ in SECTIONS),
     )
     rule(columns=columns)
@@ -290,9 +279,9 @@ def report_throughput(record: dict[str, Any]) -> None:
     if record["output_tokens_all"] != [record["max_tokens"]]:
         print(
             f"\n! requests generated different numbers of tokens "
-            f"{record['output_tokens_all'][:6]}.\n  Throughput is still the "
-            "work the engine did, but it is not the work you asked for — pass "
-            "--ignore-eos\n  to hold every request to --max-tokens."
+            f"{record['output_tokens_all'][:6]}, though every one was sent "
+            "with ignore_eos.\n  Throughput is still the work the engine did, "
+            "but it is not the work you asked for."
         )
 
 

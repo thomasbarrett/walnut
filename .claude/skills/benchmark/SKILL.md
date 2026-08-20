@@ -75,7 +75,9 @@ request's latency wearing a tail statistic's name. Five iterations cannot
 support a p90; the star says so rather than letting the number pass.
 
 **Percentiles are nearest-rank**, so every one printed is a latency something
-actually saw.
+actually saw. **p50/p90/p99, fixed** — not a flag. A run reported at other
+percentiles is comparable with no other run, and a knob here would hand out a
+way around the `*` marker: p99.9 of five samples is the maximum, every time.
 
 ## The metrics
 
@@ -85,7 +87,6 @@ actually saw.
 | **ITL** | gap between consecutive deltas, one sample each | the decode step — and every prefill that interrupted it |
 | **TPOT** | `(e2el − TTFT) / (output_tokens − 1)` | decode, averaged over the request |
 | **E2EL** | request sent → last content delta | the whole request |
-| **NTPOT** | `e2el / output_tokens` | recorded, never printed |
 | **output tok/s** | generated tokens / duration | the engine as a system |
 | **concurrency** | `Σ e2el / duration` — Little's law | how full the engine was kept |
 | **goodput** | requests/s meeting *every* SLO | the tail, which is what users leave over |
@@ -93,8 +94,17 @@ actually saw.
 **TPOT is not `1/ITL`.** TPOT averages the decode phase per request; ITL is the
 per-gap distribution. A prefill that stalls a running stream makes them diverge.
 
-**NTPOT is recorded and never printed.** It divides whole-request latency by
-token count, so a stalled prefill and a uniformly slow decode read the same.
+**E2EL earns its row as a tail statistic and nothing else.** Per request it is
+arithmetic — `e2el = ttft + tpot × (tokens − 1)`, by the definition of TPOT,
+with output length held fixed — so the mean can never disagree with the two
+rows above it. Its p99 *is* new information: a request can be bad at TTFT or at
+TPOT without being bad at both, and only E2EL's tail shows how often they land
+together.
+
+There is no NTPOT. Dividing whole-request latency by token count gives a
+stalled prefill and a uniformly slow decode the same value, which is what ITL
+exists to distinguish. It used to be recorded and withheld; a number that must
+never be read is not a measurement.
 
 **Output token counts come from the server's usage chunk**, never from counting
 deltas. The detokenizer holds a piece back until it completes a character, so
@@ -139,10 +149,15 @@ E2EL (ms)                584.22   609.20   744.71   819.21   830.95  129.925    
 ```
 
 **Rate and concurrency are different knobs.** `--request-rate` is the traffic:
-requests are submitted on a gamma arrival process (`--burstiness 1.0` is
-Poisson) whether or not the server keeps up. This is open-loop, and the only
-mode that builds a queue. Left off it fires everything at once, which measures
-a saturated engine and says nothing about queueing.
+requests are submitted on a Poisson arrival process whether or not the server
+keeps up. This is open-loop, and the only mode that builds a queue. Left off it
+fires everything at once, which measures a saturated engine and says nothing
+about queueing.
+
+Poisson is fixed, not tunable. The general form is a gamma process with a shape
+parameter for how much arrivals clump, and there is no traffic trace here to
+calibrate that shape against — so any value but Poisson would be a number
+picked to produce a result.
 
 `--max-concurrency` is a bottleneck *in front of* the engine. Set it no higher
 than the server's `--max-batch-size` unless queueing is what you are measuring.
@@ -158,15 +173,16 @@ server's `--max-batch-size`, requests were queueing inside the engine.
 **`--goodput ttft:250 --goodput tpot:10`** counts a request only if it cleared
 *every* SLO. A request that answered in 80 ms then stalled for two seconds
 served nobody, and each metric alone scores it a success. Keys: `ttft`, `tpot`,
-`ntpot`, `itl`, `e2el`. An `itl` SLO is held against the request's **worst** gap.
+`itl`, `e2el`. An `itl` SLO is held against the request's **worst** gap.
 
 **Datasets.** `--dataset fixed` (default) sends one prompt every time — cheap,
 reproducible, right for a regression check. `--dataset random --input-len 512
 --range-ratio 0.3` varies prompt length, which is what exercises a mixed batch.
 
-**`--ignore-eos` is on by default** and holds every request to exactly
-`--max-tokens`. A server that does not honour it is a hard error: ragged
-lengths mean the latencies cannot be compared with each other.
+**Every request is held to exactly `--max-tokens`**, and there is no way to
+turn that off. A server that does not honour `ignore_eos` is a hard error:
+ragged lengths mean the latencies cannot be compared with each other, and a
+flag to produce them would only produce numbers this harness already refuses.
 
 **`--profile`** wraps the measured window in `/start_profile` and
 `/stop_profile` (needs `WALNUT_TORCH_PROFILER_DIR` on the server) and prints
@@ -230,6 +246,11 @@ is what makes the output hash a correctness check; it also never runs the
 sampler's softmax path, so raise `--temperature` (with `--seed`) if the sampler
 is what you changed.
 
+**`--temperature` and `--top-p` live here and nowhere else.** They are the only
+place a sampler change is legible: under `serve` the softmax and the nucleus
+sort sit beneath queueing, batching and HTTP, and under `throughput` beneath a
+whole batch. `serve` and `throughput` decode greedily, always.
+
 **Exactly one request is in flight, and there is no batch-size knob** — a batch
 would put the scheduler back in the measurement, which is the thing this
 excludes. Size a batch with `throughput`; get per-request latency under one
@@ -251,6 +272,8 @@ causes: a relative 1e-4 perturbation leaves the hash identical.
 walnut bench startup Qwen/Qwen3.5-0.8B --num-iters 3
 ```
 
+The first request is always timed.
+
 ```
                          median     mean      std        n
 load weights (s)          1.587    1.603    0.023        3
@@ -264,7 +287,7 @@ iteration builds a whole engine and throws it away, so the warm-ups absorb the
 cold compile and what remains is what a restart pays.
 
 A large `first request` means something `start` should have done up front is
-being deferred into a request. `--no-first-request` drops that phase.
+being deferred into a request — which is why it cannot be switched off.
 
 ## Believing a delta
 
@@ -282,6 +305,11 @@ Two runs are only comparable if they measured the same thing — same model,
 device, dtype, prompt, token count and flags. Nothing enforces that; check it.
 
 ## What this machine does
+
+RTX 5090, Qwen3.5-0.8B, the default 7-token prompt at 128 output tokens. Every
+number below is conditioned on that shape — a prompt this short is nearly all
+decode, so none of it describes what a 4k or 32k prefill does to the same
+engine. Read the ratios, not the absolutes.
 
 Closed loop (`--request-rate` unset), `--max-concurrency` swept:
 

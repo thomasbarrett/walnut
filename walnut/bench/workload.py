@@ -19,21 +19,21 @@ class WorkloadError(BenchError):
     """A workload that cannot be built, or SLOs that cannot be parsed."""
 
 
-def arrival_delays(
-    count: int, rate: float, burstiness: float, rng: random.Random
-) -> list[float]:
+def arrival_delays(count: int, rate: float, rng: random.Random) -> list[float]:
     """Gaps between consecutive submissions, in seconds.
 
-    A gamma process with shape ``burstiness`` and mean ``1/rate``; at 1.0 that
-    is Poisson. Below 1.0 arrivals clump, above 1.0 they even out.
+    A Poisson process: exponential gaps with mean ``1/rate``. Fixed, not a
+    knob. The general form is a gamma process whose shape parameter tunes how
+    much arrivals clump, and there is no trace here to calibrate that shape
+    against — so every value but Poisson would be a number chosen to produce a
+    result rather than to describe traffic.
 
     Firing everything at once measures a saturated engine and nothing else.
     Real traffic arrives and queues, and the queueing is most of the tail.
     """
     if rate == float("inf"):
         return [0.0] * count
-    theta = 1.0 / (rate * burstiness)
-    return [rng.gammavariate(burstiness, theta) for _ in range(count)]
+    return [rng.expovariate(rate) for _ in range(count)]
 
 
 def random_prompts(

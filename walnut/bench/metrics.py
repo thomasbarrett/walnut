@@ -3,7 +3,6 @@
 TTFT    request sent -> first content delta
 ITL     gap between consecutive content deltas
 TPOT    (e2el - ttft) / (output_tokens - 1)
-NTPOT   e2el / output_tokens
 E2EL    request sent -> last content delta
 """
 
@@ -13,26 +12,36 @@ import math
 import statistics
 from typing import Any
 
-DEFAULT_PERCENTILES = "50,90,99"
+#: Fixed, not configurable. The table is built around three columns, and a run
+#: reported at other percentiles is comparable with no other run. A knob here
+#: also invites a p99.9 over five samples, which is what `resolves` exists to
+#: catch — the harness should not hand out a way around its own guardrail.
+PERCENTILES = (50.0, 90.0, 99.0)
 
-#: (key, short name, section header, printed).
+#: (key, short name, section header).
 #:
-#: NTPOT is recorded and never printed: dividing the whole request latency by
-#: the token count gives a prefill stall and a uniformly slow decode the same
-#: value, hiding what ITL exists to show.
+#: Every metric here is printed. NTPOT — whole-request latency over token
+#: count — used to be recorded and withheld, because it gives a stalled prefill
+#: and a uniformly slow decode the same value and so cannot show what ITL
+#: exists to show. A number that must never be read is not a measurement; the
+#: reason it was rejected is the part worth keeping, and this is it.
 METRICS = (
-    ("ttft", "TTFT", "Time to First Token", True),
-    ("tpot", "TPOT", "Time per Output Token (excl. 1st token)", True),
-    ("itl", "ITL", "Inter-token Latency", True),
-    ("e2el", "E2EL", "End-to-end Latency", True),
-    ("ntpot", "NTPOT", "Normalized Time per Output Token", False),
+    ("ttft", "TTFT", "Time to First Token"),
+    ("tpot", "TPOT", "Time per Output Token (excl. 1st token)"),
+    ("itl", "ITL", "Inter-token Latency"),
+    # Per request this is arithmetic: e2el == ttft + tpot * (tokens - 1), by
+    # the definition of TPOT, and output length is held fixed. Its *tail* is
+    # not — p99 E2EL cannot be recovered from p99 TTFT and p99 TPOT, because a
+    # request can be bad at one without the other. It earns its row as a tail
+    # statistic, and the mean can never disagree with the two rows above it.
+    ("e2el", "E2EL", "End-to-end Latency"),
 )
 
 #: Metrics ``--goodput`` accepts.
 SLO_METRICS = tuple(key for key, *_ in METRICS)
 
 #: The metrics that get a section in a report.
-SECTIONS = tuple((key, name, header) for key, name, header, shown in METRICS if shown)
+SECTIONS = METRICS
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -54,7 +63,7 @@ def resolves(q: float, n: int) -> bool:
     return math.ceil(q / 100 * n) < n
 
 
-def summarize(values: list[float], percentiles: list[float]) -> dict[str, Any]:
+def summarize(values: list[float]) -> dict[str, Any]:
     """One metric's distribution, in ms.
 
     `std` is the standard deviation, and what it means depends on what the
@@ -77,11 +86,7 @@ def summarize(values: list[float], percentiles: list[float]) -> dict[str, Any]:
         "max": max(values),
         "samples": len(values),
     }
-    for q in percentiles:
+    for q in PERCENTILES:
         out[f"p{q:g}"] = percentile(values, q)
         out[f"p{q:g}_resolves"] = resolves(q, len(values))
     return out
-
-
-def parse_percentiles(value: str) -> list[float]:
-    return [float(p) for p in value.split(",") if p.strip()]
