@@ -20,7 +20,7 @@ from typing import Annotated
 import typer
 
 from walnut.bench.errors import BenchError
-from walnut.bench.metrics import DEFAULT_PERCENTILES, SLO_METRICS, parse_percentiles
+from walnut.bench.metrics import SLO_METRICS
 from walnut.bench.offline import EngineOptions, run_latency, run_startup, run_throughput
 from walnut.bench.online import ServeOptions, run_serve, run_sweep
 from walnut.bench.workload import PROMPT, goodput_config
@@ -100,14 +100,6 @@ ServedModel = Annotated[
     ),
 ]
 NumPrompts = Annotated[int, typer.Option(min=1, help="Requests to send.")]
-Burstiness = Annotated[
-    float,
-    typer.Option(
-        min=0.0,
-        help="Shape of the arrival process. 1.0 is Poisson; below 1.0 clumps "
-        "arrivals, above 1.0 evens them toward a fixed cadence.",
-    ),
-]
 MaxConcurrency = Annotated[
     int | None,
     typer.Option(
@@ -144,17 +136,6 @@ Tokenizer = Annotated[
     str | None,
     typer.Option(help="Tokenizer for --dataset random. Defaults to the model."),
 ]
-IgnoreEos = Annotated[
-    bool,
-    typer.Option(
-        "--ignore-eos/--no-ignore-eos",
-        help="Hold every request to exactly the requested output length. On by "
-        "default: requests that stopped at different lengths have latencies "
-        "that cannot be compared with each other.",
-    ),
-]
-Temperature = Annotated[float, typer.Option(min=0.0, help="Sampling temperature.")]
-TopP = Annotated[float, typer.Option(min=0.0, max=1.0, help="Nucleus sampling p.")]
 Goodput = Annotated[
     list[str] | None,
     typer.Option(
@@ -164,9 +145,6 @@ Goodput = Annotated[
         "--goodput tpot:10`. A request counts only if it cleared every one. "
         "Keys: " + ", ".join(SLO_METRICS) + ".",
     ),
-]
-Percentiles = Annotated[
-    str, typer.Option(help="Comma-separated percentiles to report.")
 ]
 
 
@@ -195,11 +173,7 @@ def _serve_options(**kwargs) -> ServeOptions:
         raise typer.BadParameter(str(exc)) from exc
     if kwargs["dataset"] not in ("fixed", "random"):
         raise typer.BadParameter("--dataset takes 'fixed' or 'random'")
-    return ServeOptions(
-        goodput=goodput,
-        percentiles=parse_percentiles(kwargs.pop("percentiles")),
-        **kwargs,
-    )
+    return ServeOptions(goodput=goodput, **kwargs)
 
 
 # -- serve ------------------------------------------------------------------
@@ -213,12 +187,11 @@ def serve(
     request_rate: Annotated[
         float,
         typer.Option(
-            help="Requests per second, on a gamma arrival process. Unset "
+            help="Requests per second, on a Poisson arrival process. Unset "
             "submits everything at once, which measures a saturated engine "
             "and says nothing about queueing.",
         ),
     ] = float("inf"),
-    burstiness: Burstiness = 1.0,
     max_concurrency: MaxConcurrency = None,
     dataset: Dataset = "fixed",
     prompt: Prompt = PROMPT,
@@ -226,19 +199,15 @@ def serve(
     range_ratio: RangeRatio = 0.3,
     tokenizer: Tokenizer = None,
     max_tokens: Annotated[int, typer.Option(min=1, help="Output tokens.")] = 128,
-    ignore_eos: IgnoreEos = True,
-    temperature: Temperature = 0.0,
-    top_p: TopP = 1.0,
     seed: Annotated[
         int,
         typer.Option(
-            help="Seeds the arrival process, the prompt generation and the "
-            "server's sampler, so a run reproduces end to end.",
+            help="Seeds the arrival process and the prompt generation, so a "
+            "run reproduces end to end.",
         ),
     ] = 0,
     num_iters_warmup: NumItersWarmup = 1,
     goodput: Goodput = None,
-    percentiles: Percentiles = DEFAULT_PERCENTILES,
     timeout: Annotated[float, typer.Option(help="Per request, seconds.")] = 600.0,
     ready_timeout: Annotated[float, typer.Option(help="Seconds.")] = 600.0,
     profile: Annotated[
@@ -257,6 +226,9 @@ def serve(
 
     The number a serving change is judged on, and the only one that sees
     queueing. Start the server first, sized for the load you intend to offer.
+
+    Arrivals are Poisson, generation is greedy, and every request is held to
+    exactly --max-tokens. None of the three is a knob: see `walnut.bench`.
     """
     if request_rate <= 0:
         raise typer.BadParameter("--request-rate must be positive")
@@ -265,7 +237,6 @@ def serve(
         model=model,
         num_prompts=num_prompts,
         request_rate=request_rate,
-        burstiness=burstiness,
         max_concurrency=max_concurrency,
         dataset=dataset,
         prompt=prompt,
@@ -273,13 +244,9 @@ def serve(
         range_ratio=range_ratio,
         tokenizer=tokenizer,
         max_tokens=max_tokens,
-        ignore_eos=ignore_eos,
-        temperature=temperature,
-        top_p=top_p,
         seed=seed,
         warmups=num_iters_warmup,
         goodput=goodput,
-        percentiles=percentiles,
         timeout=timeout,
         ready_timeout=ready_timeout,
         label=label,
@@ -306,7 +273,6 @@ def sweep(
     base_url: BaseUrl = DEFAULT_BASE_URL,
     model: ServedModel = None,
     num_prompts: NumPrompts = 200,
-    burstiness: Burstiness = 1.0,
     max_concurrency: MaxConcurrency = None,
     dataset: Dataset = "fixed",
     prompt: Prompt = PROMPT,
@@ -314,9 +280,6 @@ def sweep(
     range_ratio: RangeRatio = 0.3,
     tokenizer: Tokenizer = None,
     max_tokens: Annotated[int, typer.Option(min=1, help="Output tokens.")] = 128,
-    ignore_eos: IgnoreEos = True,
-    temperature: Temperature = 0.0,
-    top_p: TopP = 1.0,
     seed: Annotated[int, typer.Option(help="Seeds the run end to end.")] = 0,
     num_iters_warmup: NumItersWarmup = 1,
     goodput: Goodput = None,
@@ -329,7 +292,6 @@ def sweep(
             "below this. Ignored without --goodput.",
         ),
     ] = 0.95,
-    percentiles: Percentiles = DEFAULT_PERCENTILES,
     timeout: Annotated[float, typer.Option(help="Per request, seconds.")] = 600.0,
     ready_timeout: Annotated[float, typer.Option(help="Seconds.")] = 600.0,
     label: Label = None,
@@ -347,7 +309,6 @@ def sweep(
         model=model,
         num_prompts=num_prompts,
         request_rate=float("inf"),
-        burstiness=burstiness,
         max_concurrency=max_concurrency,
         dataset=dataset,
         prompt=prompt,
@@ -355,13 +316,9 @@ def sweep(
         range_ratio=range_ratio,
         tokenizer=tokenizer,
         max_tokens=max_tokens,
-        ignore_eos=ignore_eos,
-        temperature=temperature,
-        top_p=top_p,
         seed=seed,
         warmups=num_iters_warmup,
         goodput=goodput,
-        percentiles=percentiles,
         timeout=timeout,
         ready_timeout=ready_timeout,
         label=label,
@@ -392,8 +349,17 @@ def latency(
             "path — raise this, with --seed, if the sampler is what changed.",
         ),
     ] = 0.0,
+    top_p: Annotated[
+        float,
+        typer.Option(
+            min=0.0,
+            max=1.0,
+            help="Nucleus sampling p. Only meaningful above --temperature 0, "
+            "and only measurable here: the sort it adds is visible with the "
+            "scheduler and HTTP out of the way, and nowhere else.",
+        ),
+    ] = 1.0,
     seed: Annotated[int | None, typer.Option(help="Seed for sampled runs.")] = None,
-    percentiles: Percentiles = DEFAULT_PERCENTILES,
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
@@ -429,8 +395,8 @@ def latency(
                 num_iters=num_iters,
                 num_iters_warmup=num_iters_warmup,
                 temperature=temperature,
+                top_p=top_p,
                 seed=seed,
-                percentiles=percentiles,
                 label=label,
                 out=out,
             )
@@ -466,10 +432,7 @@ def throughput(
         int | None, typer.Option(min=1, help="Context each batch slot holds.")
     ] = None,
     num_iters_warmup: NumItersWarmup = 1,
-    temperature: Temperature = 0.0,
-    top_p: TopP = 1.0,
-    ignore_eos: IgnoreEos = True,
-    seed: Annotated[int, typer.Option(help="Seeds prompts and sampling.")] = 0,
+    seed: Annotated[int, typer.Option(help="Seeds prompt generation.")] = 0,
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
@@ -486,6 +449,8 @@ def throughput(
     Throughput only. Streams are drained one after another, so a token's read
     time is not its produce time and per-request latency here would be
     fiction; `serve` is where latency under a batch comes from.
+
+    Greedy, and every request held to exactly --max-tokens.
     """
     opts = EngineOptions(
         model=model,
@@ -511,9 +476,6 @@ def throughput(
                 tokenizer=tokenizer,
                 max_tokens=max_tokens,
                 num_iters_warmup=num_iters_warmup,
-                temperature=temperature,
-                top_p=top_p,
-                ignore_eos=ignore_eos,
                 seed=seed,
                 label=label,
                 out=out,
@@ -531,15 +493,6 @@ def startup(
     model: Model,
     num_iters: NumIters = 3,
     num_iters_warmup: NumItersWarmup = 1,
-    first_request: Annotated[
-        bool,
-        typer.Option(
-            "--first-request/--no-first-request",
-            help="Also time one short generation after the engine is up. It "
-            "should be small; if it is not, something `start` ought to have "
-            "done is being deferred to the first request.",
-        ),
-    ] = True,
     max_batch_size: Annotated[
         int,
         typer.Option(
@@ -565,6 +518,10 @@ def startup(
     Three phases: weights off disk, compile-and-capture, then whatever the
     first request still has to do. Each iteration builds a whole engine and
     throws it away, so --num-iters-warmup absorbs the cold compile.
+
+    The first request is always timed. It should be small; if it is not,
+    something `start` ought to have done is being deferred into a request, and
+    that is a diagnostic there is no reason to be able to switch off.
     """
     opts = EngineOptions(
         model=model,
@@ -582,7 +539,6 @@ def startup(
                 opts,
                 num_iters=num_iters,
                 num_iters_warmup=num_iters_warmup,
-                first_request=first_request,
                 label=label,
                 out=out,
             )

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from walnut.bench.errors import BenchError
-from walnut.bench.metrics import parse_percentiles, summarize
+from walnut.bench.metrics import summarize
 from walnut.bench.report import (
     report_latency,
     report_startup,
@@ -137,8 +137,8 @@ def run_latency(
     num_iters: int,
     num_iters_warmup: int,
     temperature: float,
+    top_p: float,
     seed: int | None,
-    percentiles: str,
     label: str | None,
     out: str | None,
 ) -> int:
@@ -147,7 +147,7 @@ def run_latency(
 
     engine = opts.load()
     params = SamplingParams(
-        max_new_tokens=max_tokens, temperature=temperature, seed=seed
+        max_new_tokens=max_tokens, temperature=temperature, top_p=top_p, seed=seed
     )
 
     # Discarded: the opening iteration compiles, autotunes and captures, which
@@ -162,19 +162,17 @@ def run_latency(
     counts = sorted({r["tokens_out"] for r in runs})
     tokens_out = counts[-1]
 
-    quantiles = parse_percentiles(percentiles)
     samples = {
         "ttft": [r["ttft_ms"] for r in runs],
         "tpot": [
             (r["e2e_ms"] - r["ttft_ms"]) / max(1, r["tokens_out"] - 1) for r in runs
         ],
-        "ntpot": [r["e2e_ms"] / max(1, r["tokens_out"]) for r in runs],
         "itl": [gap for r in runs for gap in r["itl_ms"]],
         "e2el": [r["e2e_ms"] for r in runs],
     }
     # One sample per iteration for everything but ITL, which pools every gap of
     # every iteration and so describes the workload rather than the run.
-    metrics = {k: summarize(v, quantiles) for k, v in samples.items()}
+    metrics = {k: summarize(v) for k, v in samples.items()}
 
     record = {
         "mode": "latency",
@@ -185,6 +183,7 @@ def run_latency(
             engine._encode([Message(role="user", content=prompt)]).shape[1]
         ),
         "temperature": temperature,
+        "top_p": top_p,
         "seed": seed,
         "max_tokens": max_tokens,
         "tokens_out": tokens_out,
@@ -192,7 +191,6 @@ def run_latency(
         "hit_eos": tokens_out < max_tokens,
         "num_iters_warmup": num_iters_warmup,
         "num_iters": num_iters,
-        "percentiles": quantiles,
         "metrics": metrics,
         "tok_per_s": 1e3 / metrics["tpot"]["median"],
         "output_sha": hashes[0] if len(hashes) == 1 else "|".join(hashes),
@@ -247,9 +245,6 @@ def run_throughput(
     tokenizer: str | None,
     max_tokens: int,
     num_iters_warmup: int,
-    temperature: float,
-    top_p: float,
-    ignore_eos: bool,
     seed: int,
     label: str | None,
     out: str | None,
@@ -257,12 +252,15 @@ def run_throughput(
     from walnut.engine import GenerationConfig
 
     engine = opts.load()
+    # Greedy, and every request held to exactly max_tokens. Neither is a flag:
+    # sampling cost is only legible with the scheduler out of the way, which is
+    # `latency`, and requests that stopped at different lengths do not describe
+    # a batch anyone asked for.
     config = GenerationConfig(
         max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=top_p,
+        temperature=0.0,
         seed=seed,
-        ignore_eos=ignore_eos,
+        ignore_eos=True,
     )
     prompts = build_workload(
         dataset,
@@ -302,10 +300,7 @@ def run_throughput(
         "range_ratio": range_ratio if dataset == "random" else None,
         "num_prompts": num_prompts,
         "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
         "seed": seed,
-        "ignore_eos": ignore_eos,
         "num_iters_warmup": num_iters_warmup,
         "completed": len(completed),
         "failed": len(streams) - len(completed),
@@ -334,12 +329,14 @@ def run_throughput(
 # ===========================================================================
 
 
-def one_startup(opts: EngineOptions, first_request: bool) -> dict[str, float | None]:
+def one_startup(opts: EngineOptions) -> dict[str, float]:
     """Build an engine from nothing and time each phase.
 
     Three phases, paid at different times and fixed by different work: weights
     off disk, `start` compiling and capturing, then whatever the first request
-    still has to do.
+    still has to do. The last is always timed — it should be small, and if it
+    is not, something `start` ought to have done is being deferred into a
+    request. A flag to skip that is a flag to skip a diagnostic.
     """
     from walnut.engine import GenerationConfig
 
@@ -351,18 +348,16 @@ def one_startup(opts: EngineOptions, first_request: bool) -> dict[str, float | N
     engine.start()
     prepare_s = time.perf_counter() - prepare_start
 
-    request_s = None
-    if first_request:
-        request_start = time.perf_counter()
-        engine.generate([_user("Hello.")], GenerationConfig(max_tokens=8))
-        request_s = time.perf_counter() - request_start
+    request_start = time.perf_counter()
+    engine.generate([_user("Hello.")], GenerationConfig(max_tokens=8))
+    request_s = time.perf_counter() - request_start
 
     engine.close()
     return {
         "load_s": load_s,
         "prepare_s": prepare_s,
         "first_request_s": request_s,
-        "total_s": load_s + prepare_s + (request_s or 0.0),
+        "total_s": load_s + prepare_s + request_s,
     }
 
 
@@ -370,7 +365,6 @@ def run_startup(
     opts: EngineOptions,
     num_iters: int,
     num_iters_warmup: int,
-    first_request: bool,
     label: str | None,
     out: str | None,
 ) -> int:
@@ -380,16 +374,14 @@ def run_startup(
     iterations absorb the cold compile and what is left is what a restart costs.
     """
     for _ in range(num_iters_warmup):
-        one_startup(opts, first_request)
-    runs = [one_startup(opts, first_request) for _ in range(num_iters)]
+        one_startup(opts)
+    runs = [one_startup(opts) for _ in range(num_iters)]
 
     # Every phase is a repeat of the same measurement, so its `std` is a noise
     # floor rather than a description of a workload.
     phases = {}
     for phase in ("load_s", "prepare_s", "first_request_s", "total_s"):
-        values = [v for r in runs if (v := r[phase]) is not None]
-        if values:
-            phases[phase] = summarize(values, [])
+        phases[phase] = summarize([r[phase] for r in runs])
 
     record = {
         "mode": "startup",
@@ -399,7 +391,6 @@ def run_startup(
         "max_batch_size": opts.max_batch_size,
         "num_iters_warmup": num_iters_warmup,
         "num_iters": num_iters,
-        "first_request_included": first_request,
         "phases": phases,
         "iterations": runs,
     }

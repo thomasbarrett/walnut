@@ -57,7 +57,7 @@ def test_percentile_returns_a_value_that_was_actually_measured():
 def test_summarize_carries_its_own_dispersion():
     """`std` travels in the record so no caller can print a value without the
     dispersion it has to be read against."""
-    stats = summarize([10.0, 10.0, 12.0], [99.0])
+    stats = summarize([10.0, 10.0, 12.0])
     assert stats["median"] == 10.0
     assert stats["std"] == pytest.approx(0.9428, abs=1e-4)
     assert stats["samples"] == 3
@@ -85,8 +85,8 @@ def test_std_does_not_grow_with_sample_count():
     for _ in range(40):
         small = [rng.gauss(100.0, 2.0) for _ in range(20)]
         large = [rng.gauss(100.0, 2.0) for _ in range(400)]
-        small_std.append(summarize(small, [])["std"])
-        large_std.append(summarize(large, [])["std"])
+        small_std.append(summarize(small)["std"])
+        large_std.append(summarize(large)["std"])
         small_widest.append(widest(small))
         large_widest.append(widest(large))
 
@@ -104,24 +104,23 @@ def test_std_does_not_grow_with_sample_count():
 def test_arrival_delays_are_zero_at_an_unlimited_rate():
     import random
 
-    assert arrival_delays(5, float("inf"), 1.0, random.Random(0)) == [0.0] * 5
+    assert arrival_delays(5, float("inf"), random.Random(0)) == [0.0] * 5
 
 
 def test_arrival_delays_average_to_the_configured_rate():
     import random
 
-    delays = arrival_delays(20_000, 4.0, 1.0, random.Random(0))
+    delays = arrival_delays(20_000, 4.0, random.Random(0))
     assert sum(delays) / len(delays) == pytest.approx(0.25, rel=0.05)
 
 
-def test_burstiness_above_one_evens_arrivals_out():
-    """The knob's whole purpose: same mean rate, different clumping."""
+def test_arrivals_are_poisson_not_evenly_paced():
+    """Exponential gaps, so the standard deviation equals the mean. Evenly
+    spaced arrivals never queue, and the queueing is most of the tail."""
     import random
 
-    bursty = arrival_delays(20_000, 4.0, 0.2, random.Random(0))
-    smooth = arrival_delays(20_000, 4.0, 5.0, random.Random(0))
-    mean = 0.25
-    assert sum(abs(d - mean) for d in bursty) > sum(abs(d - mean) for d in smooth)
+    delays = arrival_delays(20_000, 4.0, random.Random(0))
+    assert statistics.pstdev(delays) == pytest.approx(0.25, rel=0.05)
 
 
 # -- goodput ----------------------------------------------------------------
@@ -139,7 +138,7 @@ def test_goodput_config_accepts_one_value_or_many():
 
 
 def test_goodput_config_accepts_every_slo_metric():
-    assert set(SLO_METRICS) == {"ttft", "tpot", "ntpot", "itl", "e2el"}
+    assert set(SLO_METRICS) == {"ttft", "tpot", "itl", "e2el"}
 
 
 def test_goodput_config_rejects_an_unknown_metric():
@@ -193,14 +192,6 @@ def test_tpot_excludes_the_first_token():
     assert _result(ttft=0.1, latency=1.1, output_tokens=101).tpot == pytest.approx(0.01)
 
 
-def test_ntpot_includes_the_first_token_and_tpot_does_not():
-    """The two differ by exactly the prefill, which is why NTPOT is recorded
-    and never printed: it cannot tell a stalled prefill from a slow decode."""
-    result = _result(ttft=0.5, latency=1.0, output_tokens=100)
-    assert result.ntpot == pytest.approx(0.01)
-    assert result.tpot == pytest.approx(0.5 / 99)
-
-
 def test_tpot_is_zero_for_a_single_token_response():
     """There is no inter-token gap to average, and dividing by zero tokens is
     how other harnesses end up reporting TPOT as TTFT."""
@@ -216,7 +207,6 @@ def _serve_options(base_url: str, **overrides) -> ServeOptions:
         model=None,
         num_prompts=6,
         request_rate=50.0,
-        burstiness=1.0,
         max_concurrency=2,
         dataset="fixed",
         prompt=PROMPT,
@@ -226,13 +216,9 @@ def _serve_options(base_url: str, **overrides) -> ServeOptions:
         # The stub echoes six words whatever it is asked for, and --ignore-eos
         # is on: a mismatch here is a hard error by design.
         max_tokens=6,
-        ignore_eos=True,
-        temperature=0.0,
-        top_p=1.0,
         seed=0,
         warmups=1,
         goodput={},
-        percentiles=[50.0, 99.0],
         timeout=30.0,
         ready_timeout=10.0,
         label="smoke",

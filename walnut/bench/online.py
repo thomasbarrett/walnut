@@ -36,7 +36,6 @@ class ServeOptions:
     model: str | None
     num_prompts: int
     request_rate: float
-    burstiness: float
     max_concurrency: int | None
     dataset: str
     prompt: str
@@ -44,13 +43,9 @@ class ServeOptions:
     range_ratio: float
     tokenizer: str | None
     max_tokens: int
-    ignore_eos: bool
-    temperature: float
-    top_p: float
     seed: int
     warmups: int
     goodput: dict[str, float]
-    percentiles: list[float]
     timeout: float
     ready_timeout: float
     label: str | None
@@ -88,12 +83,6 @@ class RequestResult:
             return 0.0
         return (self.latency - self.ttft) / (self.output_tokens - 1)
 
-    @property
-    def ntpot(self) -> float:
-        if self.output_tokens < 1:
-            return 0.0
-        return self.latency / self.output_tokens
-
 
 def request_metrics(result: RequestResult) -> dict[str, float]:
     """One request's value for every metric, in seconds.
@@ -104,7 +93,6 @@ def request_metrics(result: RequestResult) -> dict[str, float]:
     return {
         "ttft": result.ttft,
         "tpot": result.tpot,
-        "ntpot": result.ntpot,
         "itl": max(result.itl) if result.itl else 0.0,
         "e2el": result.latency,
     }
@@ -237,7 +225,6 @@ async def drive(
     prompts: list[str],
     payload: dict[str, Any],
     rate: float,
-    burstiness: float,
     max_concurrency: int | None,
     timeout: float,
     rng: random.Random,
@@ -272,9 +259,7 @@ async def drive(
         result.queue_wait = result.start - arrived
         return result
 
-    schedule = list(
-        itertools.accumulate(arrival_delays(len(prompts), rate, burstiness, rng))
-    )
+    schedule = list(itertools.accumulate(arrival_delays(len(prompts), rate, rng)))
     tasks = []
     start = time.perf_counter()
     for prompt, at in zip(prompts, schedule, strict=True):
@@ -288,15 +273,20 @@ async def drive(
 
 
 def serve_payload(opts: ServeOptions, model: str) -> dict[str, Any]:
+    """Greedy, and every request held to exactly ``max_tokens``.
+
+    Neither is a flag: sampling cost is only legible with the scheduler and HTTP
+    out of the way (`walnut bench latency`), and ragged output lengths give
+    latencies this harness already refuses to compare.
+    """
     return {
         "model": model,
         "max_tokens": opts.max_tokens,
-        "temperature": opts.temperature,
-        "top_p": opts.top_p,
+        "temperature": 0.0,
         "seed": opts.seed,
         "stream": True,
         "stream_options": {"include_usage": True},
-        "ignore_eos": opts.ignore_eos,
+        "ignore_eos": True,
     }
 
 
@@ -346,8 +336,8 @@ def build_serve_record(
     for key, *_ in METRICS:
         if key == "itl":
             continue
-        # TPOT and NTPOT are undefined for a response too short to have a
-        # decode phase; including a zero there drags the median down.
+        # TPOT is undefined for a response too short to have a decode phase;
+        # including a zero there drags the median down.
         floor = 2 if key == "tpot" else 1
         samples[key] = [
             m[key] * 1e3
@@ -368,13 +358,9 @@ def build_serve_record(
         "range_ratio": opts.range_ratio if opts.dataset == "random" else None,
         "num_prompts": opts.num_prompts,
         "request_rate": rate,
-        "burstiness": opts.burstiness,
         "max_concurrency": opts.max_concurrency,
         "max_tokens": opts.max_tokens,
-        "temperature": opts.temperature,
-        "top_p": opts.top_p,
         "seed": opts.seed,
-        "ignore_eos": opts.ignore_eos,
         "warmups": opts.warmups,
         "completed": len(ok),
         "failed": len(failed),
@@ -408,13 +394,12 @@ def build_serve_record(
         # internally, which the mean smooths away.
         "concurrency": sum(r.latency for r in ok) / duration,
         "peak_concurrency": peak_concurrency(ok),
-        "queue_wait_ms": summarize([r.queue_wait * 1e3 for r in ok], opts.percentiles),
+        "queue_wait_ms": summarize([r.queue_wait * 1e3 for r in ok]),
         "truncated": sum(1 for r in results if r.truncated),
         "goodput_slos": {k: v * 1e3 for k, v in slos.items()} or None,
         "goodput": (good / duration) if good is not None else None,
         "goodput_fraction": (good / len(ok)) if good is not None else None,
-        "percentiles": opts.percentiles,
-        "metrics": {k: summarize(v, opts.percentiles) for k, v in samples.items()},
+        "metrics": {k: summarize(v) for k, v in samples.items()},
         "output_head": ok[-1].text[:80],
     }
 
@@ -433,7 +418,7 @@ async def serve_once(
     print(
         f"{len(prompts)} prompts at "
         f"{'unlimited' if rate == float('inf') else rate}"
-        f" req/s (burstiness {opts.burstiness}), "
+        f" req/s (Poisson), "
         f"max concurrency {opts.max_concurrency or 'unlimited'}",
         file=sys.stderr,
     )
@@ -443,7 +428,6 @@ async def serve_once(
         prompts,
         payload,
         rate,
-        opts.burstiness,
         opts.max_concurrency,
         opts.timeout,
         rng,
