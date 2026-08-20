@@ -32,6 +32,8 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,14 +63,6 @@ class Request:
     generator: torch.Generator | None = None
     tokens: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
     cancelled: threading.Event = field(default_factory=threading.Event)
-    #: Assigned on admission: the cache slot, and the position its next token
-    #: is written at.
-    slot: int = -1
-    position: int = 0
-    produced: int = 0
-    #: Prompt tokens prefilled so far, while this request is the one being
-    #: admitted. Equal to the prompt length the moment it joins the batch.
-    prefilled: int = 0
 
     def stream(self) -> Any:
         """Yield this request's token ids until it finishes.
@@ -86,6 +80,26 @@ class Request:
                 yield item
         finally:
             self.cancelled.set()
+
+
+@dataclass
+class Sequence:
+    """A request that holds a slot: what the loop advances, one step at a time.
+
+    Split from `Request` because none of it means anything until admission — a
+    request still in the queue has no slot to name and no position to be at.
+    The loop deals in sequences; a caller only ever sees its request.
+    """
+
+    request: Request
+    #: The cache slot this sequence owns, until it retires.
+    slot: int
+    #: The position its next token is written at.
+    position: int = 0
+    #: Prompt tokens prefilled so far. Equal to the prompt length the moment
+    #: the sequence joins the batch.
+    prefilled: int = 0
+    produced: int = 0
 
 
 class Scheduler:
@@ -148,10 +162,10 @@ class Scheduler:
         self.saved = [torch.empty_like(tensor) for tensor in self.carried[0]]
 
         self.incoming: queue.Queue[Request | None] = queue.Queue()
-        self.running: dict[int, Request] = {}
-        #: The request being prefilled, if any. At most one: its chunks run
+        self.running: dict[int, Sequence] = {}
+        #: The sequence being prefilled, if any. At most one: its chunks run
         #: between decode steps, and a second would only lengthen both.
-        self.prefilling: Request | None = None
+        self.prefilling: Sequence | None = None
         self.free = list(range(max_batch_size))
         self.decode_forward: Any = model
         self.graphs: DecodeGraphs | None = None
@@ -239,13 +253,18 @@ class Scheduler:
 
     # -- the loop ----------------------------------------------------------
 
+    @property
+    def _idle(self) -> bool:
+        """Nothing in flight: no sequence decoding, no prompt part-prefilled."""
+        return not self.running and self.prefilling is None
+
     @torch.no_grad()
     def _run(self) -> None:
         self._started.set()
         error: BaseException | None = None
         stopping = False
         try:
-            while not (stopping and not self.running and self.prefilling is None):
+            while not (stopping and self._idle):
                 if not self._admit():
                     stopping = True
                 if self.prefilling is not None:
@@ -271,16 +290,15 @@ class Scheduler:
         self._stopped = reason
         if self.prefilling is not None:
             self._abandon(self.prefilling, reason)
-        for request in list(self.running.values()):
-            self._retire(request, error)
+        for sequence in list(self.running.values()):
+            self._retire(sequence, error)
         while True:
             try:
                 waiting = self.incoming.get_nowait()
             except queue.Empty:
                 break
             if waiting is not None:
-                waiting.tokens.put(reason)
-                waiting.tokens.put(_DONE)
+                self._close(waiting, reason)
 
     def _admit(self) -> bool:
         """Take at most one waiting request into the batch; False to stop.
@@ -307,10 +325,7 @@ class Scheduler:
         slot = self.free.pop(0)
         for entry in self.cache:
             entry.reset(slot)
-        request.slot = slot
-        request.prefilled = 0
-        request.position = 0
-        self.prefilling = request
+        self.prefilling = Sequence(request, slot)
 
     def _prefill_chunk(self) -> None:
         """Run the next ``prefill_chunk`` of the admitted prompt.
@@ -321,121 +336,149 @@ class Scheduler:
         written before it, which is the same arithmetic the whole prompt in one
         pass does, and at 2048 it measures the same too.
         """
-        request = self.prefilling
-        assert request is not None
+        sequence = self.prefilling
+        assert sequence is not None
+        request = sequence.request
         if request.cancelled.is_set():
             # A client that left mid-prefill frees its slot now rather than
             # after the remaining chunks it will not read.
-            self._abandon(request, None)
+            self._abandon(sequence, None)
             return
-        slot = request.slot
-        start = request.prefilled
+        slot = sequence.slot
+        start = sequence.prefilled
         chunk = request.prompt[:, start : start + self.prefill_chunk]
         try:
             positions = torch.arange(start, start + chunk.shape[1], device=self.device)
             logits = self.model(chunk, positions=positions, cache=self.slot_views[slot])
-            request.prefilled = start + chunk.shape[1]
-            if request.prefilled < request.prompt.shape[1]:
+            sequence.prefilled = start + chunk.shape[1]
+            if sequence.prefilled < request.prompt.shape[1]:
                 return
             token = self.model.sampler(logits[:, -1], request.params, request.generator)
             self.token[slot].copy_(token[0])
             token_id = int(token.item())
         except Exception as exc:  # deliver the failure to its own caller only
-            self._abandon(request, exc)
+            self._abandon(sequence, exc)
             return
 
         self.prefilling = None
-        request.position = request.prefilled
-        self.running[slot] = request
-        self._deliver(request, token_id)
+        sequence.position = sequence.prefilled
+        self.running[slot] = sequence
+        self._deliver(sequence, token_id)
 
-    def _abandon(self, request: Request, error: BaseException | None) -> None:
-        """Drop a part-prefilled request, freeing the slot it never filled."""
+    def _abandon(self, sequence: Sequence, error: BaseException | None) -> None:
+        """Drop a part-prefilled sequence, freeing the slot it never filled."""
         self.prefilling = None
-        self.free.append(request.slot)
+        self.free.append(sequence.slot)
         self.free.sort()
-        if error is not None:
-            request.tokens.put(error)
-        request.tokens.put(_DONE)
+        self._close(sequence.request, error)
 
-    def _step(self) -> None:
-        """One decode step over every running sequence.
+    def _bucket(self) -> int:
+        """The smallest captured batch size covering every live slot.
 
-        A step runs whole buckets, so rows that hold no sequence run too. That
-        is free for a free slot and not for the one part way through a prefill:
-        the step writes a token into it. Its positional writes are aimed at the
-        position the next chunk overwrites, and what is left — the recurrent
-        state, which a step advances wherever it is pointed — is saved here and
-        put back. Two `_foreach_copy_` calls, and only while a prefill is in
+        Rows above the live set run too: free for a slot nobody holds, and
+        paid for by `_holding` for one part way through a prefill.
+        """
+        return min(size for size in self.sizes if size > max(self.running))
+
+    @contextmanager
+    def _holding(self, sequence: Sequence | None) -> Iterator[None]:
+        """Keep a part-prefilled row's recurrent state across a decode step.
+
+        A step runs whole buckets, so a row part way through a prefill is
+        stepped along with the rest. A positional write survives that — the
+        row is aimed at the position its next chunk overwrites — but recurrent
+        state has nowhere to be aimed: a step advances it wherever it is
+        pointed, and the prompt's context is gone. So it is saved here and put
+        back. Two `_foreach_copy_` calls, and only while a prefill is in
         flight.
         """
-        size = min(s for s in self.sizes if s > max(self.running))
+        # Nothing in flight, or nothing to hold: a cache that writes only by
+        # position has no state a stray step can carry off.
+        if sequence is None or not self.saved:
+            yield
+            return
+        torch._foreach_copy_(self.saved, self.carried[sequence.slot])
+        try:
+            yield
+        finally:
+            torch._foreach_copy_(self.carried[sequence.slot], self.saved)
+
+    def _forward(self, size: int) -> list[int]:
+        """Decode ``size`` rows from `position` and `token`, one token each."""
+        rows = self.position[:size]
+        if self.graphs is not None:
+            logits = self.graphs.replay(self.token[:size], rows)
+        else:
+            positions = rows.to(self.device)
+            logits = self.decode_forward(
+                self.token[:size], positions=positions, cache=self.views[size]
+            )
+        # Padding rows sample under a live row's settings, so a batch whose
+        # requests agree stays a single sampling call. They take no generator:
+        # a seeded draw belongs to the one request that asked for it.
+        spare = next(iter(self.running.values())).request.params
+        params = []
+        gens = []
+        for slot in range(size):
+            sequence = self.running.get(slot)
+            params.append(sequence.request.params if sequence else spare)
+            gens.append(sequence.request.generator if sequence else None)
+        sampled = self.model.sampler.sample_batch(logits[:, -1], params, gens)
+        self.token[:size].copy_(sampled)
+        return sampled[:, 0].tolist()
+
+    def _step(self) -> None:
+        """One decode step over every running sequence."""
+        size = self._bucket()
         self.position[:size].zero_()
-        for slot, request in self.running.items():
-            self.position[slot] = request.position
+        for slot, sequence in self.running.items():
+            self.position[slot] = sequence.position
 
         held = self.prefilling
         held = held if held is not None and held.slot < size else None
         if held is not None:
+            # The step writes a token into the prefilling row too. Aim it at
+            # the position the next chunk overwrites, so the write is undone.
             self.position[held.slot] = held.prefilled
-            if self.saved:  # nothing to hold, in a model that writes by position
-                torch._foreach_copy_(self.saved, self.carried[held.slot])
 
-        rows = self.position[:size]
         try:
-            if self.graphs is not None:
-                logits = self.graphs.replay(self.token[:size], rows)
-            else:
-                positions = rows.to(self.device)
-                logits = self.decode_forward(
-                    self.token[:size], positions=positions, cache=self.views[size]
-                )
-            # Padding rows sample under a live row's settings, so a batch whose
-            # requests agree stays a single sampling call.
-            spare = next(iter(self.running.values())).params
-            params = [
-                self.running[slot].params if slot in self.running else spare
-                for slot in range(size)
-            ]
-            gens = [
-                self.running[slot].generator if slot in self.running else None
-                for slot in range(size)
-            ]
-            sampled = self.model.sampler.sample_batch(logits[:, -1], params, gens)
-            self.token[:size].copy_(sampled)
-            ids = sampled[:, 0].tolist()
+            with self._holding(held):
+                ids = self._forward(size)
         except Exception as exc:
-            for request in list(self.running.values()):
-                self._retire(request, exc)
+            for sequence in list(self.running.values()):
+                self._retire(sequence, exc)
             return
-        finally:
-            if held is not None and self.saved:
-                torch._foreach_copy_(self.carried[held.slot], self.saved)
 
-        for slot, request in list(self.running.items()):
-            request.position += 1
-            self._deliver(request, int(ids[slot]))
+        for slot, sequence in list(self.running.items()):
+            sequence.position += 1
+            self._deliver(sequence, int(ids[slot]))
 
     # -- delivery ----------------------------------------------------------
 
-    def _deliver(self, request: Request, token_id: int) -> None:
-        """Hand one token to its caller and retire the request if it is done."""
-        request.produced += 1
+    def _deliver(self, sequence: Sequence, token_id: int) -> None:
+        """Hand one token to its caller and retire the sequence if it is done."""
+        request = sequence.request
+        sequence.produced += 1
         request.tokens.put(token_id)
         done = (
             token_id in request.stop_ids
-            or request.produced >= request.params.max_new_tokens
+            or sequence.produced >= request.params.max_new_tokens
             or request.cancelled.is_set()
         )
         if done:
-            self._retire(request)
+            self._retire(sequence)
 
-    def _retire(self, request: Request, error: BaseException | None = None) -> None:
-        """Free a request's slot and close its stream."""
-        if self.running.pop(request.slot, None) is None:
+    def _retire(self, sequence: Sequence, error: BaseException | None = None) -> None:
+        """Free a sequence's slot and close its stream."""
+        if self.running.pop(sequence.slot, None) is None:
             return
-        self.free.append(request.slot)
+        self.free.append(sequence.slot)
         self.free.sort()  # lowest slot first, so the live set stays dense
+        self._close(sequence.request, error)
+
+    @staticmethod
+    def _close(request: Request, error: BaseException | None) -> None:
+        """End a request's stream, with the reason if there was one."""
         if error is not None:
             request.tokens.put(error)
         request.tokens.put(_DONE)
