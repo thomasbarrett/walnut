@@ -145,9 +145,19 @@ model in-process and take the same `--device`, `--dtype`, `--cuda-graph`,
 
 ```console
 $ uv run walnut serve Qwen/Qwen3.5-0.8B --max-batch-size 16 &
-$ uv run walnut bench serve --request-rate 16 --num-prompts 120 \
+$ uv run walnut bench serve --shape chat --request-rate 16 --num-prompts 120 \
     --goodput ttft:250 --goodput tpot:10
 ```
+
+`--shape` picks the workload — how much prompt against how much generation —
+in one flag, because those are one decision. `chat` (the default, up to 1024 in
+and exactly 1024 out), `rag`, `reasoning` and `agentic` span 1k to 16k prompt
+tokens, with sizes taken from published benchmarks rather than invented. The
+input figure is a ceiling: prompts are jittered over 80-100% of it, one-sided,
+so a shape's name states a maximum a reader can check. That range matters
+more here than in most engines: walnut prefills one request at a time and
+unchunked, so a long prompt stalls every stream already decoding, and a
+conclusion drawn at one shape does not transfer to another.
 
 Every subcommand takes `--num-iters-warmup`, and every default is non-zero. The
 first pass through a fresh process compiles the decode step, autotunes it and
