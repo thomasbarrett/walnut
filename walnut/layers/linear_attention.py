@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from walnut.layers.cache import Cache
+from walnut.cache import StateCache
 from walnut.layers.linear import FusedLinear
 
 #: Positions per chunk in `_chunked_gated_delta_rule`. The chunk's cost is
@@ -31,8 +31,14 @@ def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
-class ConvState(Cache):
+class ConvState(StateCache):
     """Static, pre-allocated conv window + delta-rule recurrent state.
+
+    A fixed summary of the whole sequence rather than a cell per token, which
+    is what `StateCache` names: it cannot be split into blocks, and two
+    sequences sharing a prompt cannot share it — the state after n tokens is
+    the same for both, but there is nowhere to point a second sequence at it
+    without also giving it the right to advance it.
 
     Written in place, like `KVCache`, so the buffers keep one address for the
     life of the sequence.
@@ -64,42 +70,19 @@ class ConvState(Cache):
         )
         self.primed = False
 
-    @classmethod
-    def _view(
-        cls, conv: torch.Tensor, recurrent: torch.Tensor, primed: bool
-    ) -> ConvState:
-        state = cls.__new__(cls)
-        state.conv, state.recurrent = conv, recurrent
-        state.primed = primed
-        return state
+    def buffers(self) -> list[torch.Tensor]:
+        return [self.conv, self.recurrent]
 
     def view(self, start: int, stop: int) -> ConvState:
         """A view inherits ``primed``: it names the same buffers, so a view that
         called itself empty would take the prefill branch over state the
         sequence had already built and silently start it over.
         """
-        return ConvState._view(
-            self.conv[start:stop], self.recurrent[start:stop], self.primed
-        )
-
-    def reset(self, index: int) -> None:
-        """Zero a slot. Zeroed state is what "no context yet" means here, so a
-        reset slot decodes as a fresh sequence without unpriming the pool."""
-        self.conv[index].zero_()
-        self.recurrent[index].zero_()
-
-    def carried(self, index: int) -> list[torch.Tensor]:
-        """Both buffers: the conv window and the recurrent state are the
-        sequence's whole history here, and every step rewrites both."""
-        return [self.conv[index], self.recurrent[index]]
-
-    def prime(self) -> None:
-        self.primed = True
-
-    @property
-    def empty(self) -> bool:
-        """True until a forward pass has written state into the buffers."""
-        return not self.primed
+        state = ConvState.__new__(ConvState)
+        state.conv = self.conv[start:stop]
+        state.recurrent = self.recurrent[start:stop]
+        state.primed = self.primed
+        return state
 
 
 def _recurrent_gated_delta_rule(

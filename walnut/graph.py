@@ -27,25 +27,7 @@ from typing import Any
 
 import torch
 
-from walnut.layers.attention import KVCache
-from walnut.layers.cache import Cache
-from walnut.layers.linear_attention import ConvState
-
-
-def _buffers(cache: list[Cache]) -> list[torch.Tensor]:
-    """Every mutable state tensor across a per-layer cache list."""
-    tensors: list[torch.Tensor] = []
-    for entry in cache:
-        if isinstance(entry, KVCache):
-            tensors += [entry.k, entry.v]
-        elif isinstance(entry, ConvState):
-            tensors += [entry.conv, entry.recurrent]
-    return tensors
-
-
-def cache_rows(cache: list[Cache], batch_size: int) -> list[Cache]:
-    """The first ``batch_size`` slots of every layer's cache, as views."""
-    return [entry.view(0, batch_size) for entry in cache]
+from walnut.cache import CacheView
 
 
 class DecodeGraph:
@@ -61,7 +43,7 @@ class DecodeGraph:
     def __init__(
         self,
         model: Any,
-        cache: list[Cache],
+        cache: CacheView,
         device: torch.device,
         batch_size: int = 1,
         warmup: int = 3,
@@ -73,7 +55,7 @@ class DecodeGraph:
         self.position = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         # Views, so a graph over a bucket touches only the slots and positions
         # it covers while still writing the pool every other bucket reads.
-        self.cache = cache_rows(cache, batch_size)
+        self.cache = cache.view(0, batch_size)
         self.capture(model, warmup)
 
     def capture(self, model: Any, warmup: int = 3) -> None:
@@ -89,7 +71,7 @@ class DecodeGraph:
         and resets a slot before assigning it, and cloning a whole pool per
         bucket would put peak memory at twice the cache it just allocated.
         """
-        buffers = _buffers(self.cache) if self.restore else []
+        buffers = self.cache.buffers() if self.restore else []
         saved = [buffer.clone() for buffer in buffers]
 
         with torch.no_grad():
@@ -151,7 +133,7 @@ class DecodeGraphs:
     def __init__(
         self,
         model: Any,
-        cache: list[Cache],
+        cache: CacheView,
         device: torch.device,
         max_batch_size: int,
         warmup: int = 3,
