@@ -81,9 +81,10 @@ MaxBatchSize = Annotated[
         min=1,
         envvar="WALNUT_MAX_BATCH_SIZE",
         help="Requests decoded as one batch. Sequences join and leave the "
-        "batch as they arrive and finish; this is the number of slots, and "
-        "the ceiling on concurrency. Each slot preallocates its own KV cache, "
-        "so raising it costs memory whether or not the requests arrive.",
+        "batch as they arrive and finish; this is the number of rows, and "
+        "the ceiling on concurrency. A row costs its recurrent state up "
+        "front; its KV comes from the shared pool --kv-tokens sizes, per "
+        "request and only as much as the request asked for.",
     ),
 ]
 PrefillChunk = Annotated[
@@ -103,9 +104,22 @@ MaxSeqLen = Annotated[
     typer.Option(
         min=1,
         envvar="WALNUT_MAX_SEQ_LEN",
-        help="Context length each batch slot is preallocated for, prompt plus "
-        "completion. A longer request is rejected. Defaults to the "
-        "checkpoint's own limit, capped at 8192.",
+        help="Longest single sequence, prompt plus completion. A longer "
+        "request is rejected. Defaults to the checkpoint's own limit, capped "
+        "at 8192.",
+    ),
+]
+KvTokens = Annotated[
+    int | None,
+    typer.Option(
+        min=1,
+        envvar="WALNUT_KV_TOKENS",
+        help="Tokens of key/value cache the whole batch shares, rounded up to "
+        "a 256-token page. Requests take pages as they need them and give "
+        "them back when they finish, so this bounds total context in flight "
+        "rather than any one request. Defaults to --max-batch-size times "
+        "--max-seq-len, where every request could run to the full context at "
+        "once; lower it to trade that worst case for the memory back.",
     ),
 ]
 
@@ -129,6 +143,7 @@ def serve(
     autotune: Autotune = True,
     max_batch_size: MaxBatchSize = 8,
     max_seq_len: MaxSeqLen = None,
+    kv_tokens: KvTokens = None,
     prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
@@ -153,6 +168,7 @@ def serve(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        kv_tokens=kv_tokens,
         prefill_chunk=prefill_chunk,
     )
     # Compile and capture before the port opens, so the first request meets a
@@ -198,6 +214,7 @@ def profile(
     autotune: Autotune = True,
     max_batch_size: MaxBatchSize = 1,
     max_seq_len: MaxSeqLen = None,
+    kv_tokens: KvTokens = None,
     prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
@@ -225,6 +242,7 @@ def profile(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        kv_tokens=kv_tokens,
         prefill_chunk=prefill_chunk,
     )
     config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)

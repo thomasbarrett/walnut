@@ -135,7 +135,11 @@ class _ScriptedModel:
         self.forwards = 0
         self.lm_head = SimpleNamespace(weight=torch.zeros(1))
         self.model = SimpleNamespace(
-            language_model=SimpleNamespace(make_cache=lambda **kwargs: None)
+            language_model=SimpleNamespace(
+                # A pool stands in far enough to be reserved against: `iter_generate`
+                # takes a row's worth of pages before it runs anything.
+                make_cache=lambda **kwargs: SimpleNamespace(reserve=lambda tokens: 0)
+            )
         )
 
     def __call__(self, input_ids, positions, cache):

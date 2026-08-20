@@ -35,7 +35,7 @@ devices that cannot do bf16.
 
 `--max-batch-size` is how many requests the server decodes as one batch,
 defaulting to 8. It is the same knob as vLLM's `--max-num-seqs` and SGLang's
-`--max-running-requests`: the number of sequence slots, and so the ceiling on
+`--max-running-requests`: the number of sequence rows, and so the ceiling on
 concurrency.
 
 ```console
@@ -43,22 +43,39 @@ $ uv run walnut serve Qwen/Qwen3.5-0.8B --max-batch-size 16
 ```
 
 The batch is continuous. A request joins at the next decode step rather than
-waiting for the current group to finish, and a finished sequence frees its slot
+waiting for the current group to finish, and a finished sequence frees its row
 the step it stops — so a slow request never holds a fast one behind it. Prefill
-runs on its own, one request at a time, into the slot the request was given.
+runs on its own, one request at a time, into the row the request was given.
 
 Batching trades a stream's own latency for the engine's throughput. On an RTX
 5090 serving Qwen3.5-0.8B, eight streams at once cost each of them 63% more
 time per output token than a stream running alone, and produce 4.1× the tokens
 per second overall.
 
-Each slot preallocates its own KV cache, so the memory a batch costs is
-`--max-batch-size` times `--max-seq-len`, whether or not the requests ever
-arrive. `--max-seq-len` is the context each slot is allocated for — prompt plus
-completion — and defaults to the checkpoint's own limit capped at 8192; a
-request that does not fit is rejected with a 400 rather than allowed to displace
-a running one. Decode reads only as far as each sequence has actually got, so a
-long `--max-seq-len` costs memory but not time.
+## KV cache
+
+The KV cache is paged. One pool of 256-token pages is shared by every row, and
+a request draws only as many as its prompt and completion need, giving them
+back when it finishes. `--kv-tokens` sizes that pool, defaulting to
+`--max-batch-size` times `--max-seq-len` — the point at which every row could
+run to the full context at once, which is what the cache cost before it was
+paged.
+
+`--max-seq-len` is now a bound on one sequence rather than on the pool: prompt
+plus completion, defaulting to the checkpoint's own limit capped at 8192. A
+request longer than that is rejected with a 400, as is one that could not fit
+the pool even empty. A request that does not fit *yet* waits at the head of the
+queue for a running one to retire, rather than displacing it. Decode reads only
+as far as each sequence has actually got, so a long `--max-seq-len` costs
+nothing on its own.
+
+What paging buys is concurrency at a fixed memory budget, because a request
+asking for 200 tokens no longer reserves the same cache as one asking for 8192.
+On an RTX 5090 serving Qwen3.5-0.8B at a 1024-in/1024-out chat shape, 32 rows
+reach 8255 tok/s on a 1152 MiB pool — within 1% of the 8328 tok/s the same
+batch reaches on the 3072 MiB a fixed slot each would have cost. Held to that
+768 MiB instead, the same 32 rows still reach 7112 tok/s, against the 4621
+tok/s 768 MiB buys as eight fixed slots.
 
 `walnut profile` takes both flags, defaulting to a batch of 1: it traces one
 generation, and a larger batch would fill the trace with padding rows.

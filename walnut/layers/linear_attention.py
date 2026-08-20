@@ -35,10 +35,11 @@ class ConvState(StateCache):
     """Static, pre-allocated conv window + delta-rule recurrent state.
 
     A fixed summary of the whole sequence rather than a cell per token, which
-    is what `StateCache` names: it cannot be split into blocks, and two
-    sequences sharing a prompt cannot share it — the state after n tokens is
-    the same for both, but there is nowhere to point a second sequence at it
-    without also giving it the right to advance it.
+    is what `StateCache` names: it cannot be split into pages, and two
+    sequences sharing a prompt cannot point at one copy of it — the state
+    after n tokens is the same for both, but a pointer would also hand the
+    second one the right to advance it. Hence the row per sequence, where
+    `KVCache` needs none.
 
     Written in place, like `KVCache`, so the buffers keep one address for the
     life of the sequence.
@@ -46,7 +47,7 @@ class ConvState(StateCache):
 
     def __init__(
         self,
-        max_batch_size: int,
+        rows: int,
         conv_dim: int,
         conv_kernel_size: int,
         num_value_heads: int,
@@ -57,11 +58,11 @@ class ConvState(StateCache):
     ) -> None:
         # Last conv_kernel-1 conv inputs, so decode convs stay causal.
         self.conv = torch.zeros(
-            max_batch_size, conv_dim, conv_kernel_size - 1, dtype=dtype, device=device
+            rows, conv_dim, conv_kernel_size - 1, dtype=dtype, device=device
         )
         # The delta rule accumulates in float32.
         self.recurrent = torch.zeros(
-            max_batch_size,
+            rows,
             num_value_heads,
             key_head_dim,
             value_head_dim,
@@ -301,15 +302,18 @@ class GatedDeltaNet(nn.Module):
 
     def make_cache(
         self,
-        max_batch_size: int,
-        max_seq_len: int,
+        rows: int,
         dtype: torch.dtype,
         device: torch.device | str | None,
     ) -> ConvState:
-        """Fresh recurrent state; conv/state are already fixed-size, so
-        ``max_seq_len`` is ignored."""
+        """Fresh recurrent state, one row per sequence in flight.
+
+        No page count and no context length: this state is a fixed summary
+        however long the sequence runs, which is the whole reason it cannot be
+        paged.
+        """
         return ConvState(
-            max_batch_size,
+            rows,
             self.conv_dim,
             self.conv_kernel_size,
             self.num_v_heads,

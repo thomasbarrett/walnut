@@ -4,7 +4,7 @@ from typing import Any, cast
 import pytest
 import torch
 
-from walnut.cache import Batch, CacheView
+from walnut.cache import PAGE_SIZE, CachePool, pages_for
 from walnut.layers.attention import Attention, KVCache
 from walnut.layers.linear_attention import (
     _CHUNK,
@@ -116,20 +116,35 @@ cuda_only = pytest.mark.skipif(
 _HALF: Any = {"device": "cuda", "dtype": torch.bfloat16}
 
 
-def _batch(cache: KVCache, positions: torch.Tensor) -> Batch:
-    """The addressing a pass needs, resolved the way a model resolves it."""
-    return CacheView([cache], cache.k.shape[0], cache.k.shape[1]).batch(positions)
+def _pool(
+    rows: int,
+    heads: int,
+    length: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str | None = None,
+) -> CachePool:
+    """A one-layer paged pool with every row reserved for ``length`` tokens.
+
+    Reserved rather than hand-built, so the block table these tests address
+    through is the one `CachePool.reserve` writes — which is what makes the
+    scattered-page cases below real rather than staged.
+    """
+    pages = rows * pages_for(length)
+    kv = KVCache(pages + 1, heads, head_dim, dtype, device)
+    pool = CachePool([kv], rows, length, pages)
+    for _ in range(rows):
+        assert pool.reserve(length) is not None
+    return pool
 
 
-def _kv(rows: int, heads: int, length: int, head_dim: int) -> KVCache:
-    return KVCache(
-        max_batch_size=rows,
-        n_kv_heads=heads,
-        max_seq_len=length,
-        head_dim=head_dim,
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+def _kv(pool: CachePool) -> KVCache:
+    """The pool's one layer, as the cache a pass writes."""
+    return cast(KVCache, pool[0])
+
+
+def _cuda_pool(rows: int, heads: int, length: int, head_dim: int) -> CachePool:
+    return _pool(rows, heads, length, head_dim, torch.bfloat16, "cuda")
 
 
 @cuda_only
@@ -158,8 +173,8 @@ def test_attention_matches_manual_softmax():
     scores = scores.masked_fill(~torch.tril(ones).bool(), float("-inf"))
     expected = torch.softmax(scores, dim=-1) @ vm
 
-    cache = _kv(1, 1, 2, head_dim)
-    got = attn(q, k, v, cache, _batch(cache, torch.arange(2, device="cuda")))
+    pool = _cuda_pool(1, 1, 2, head_dim)
+    got = attn(q, k, v, _kv(pool), pool.batch(torch.arange(2, device="cuda")))
     assert torch.allclose(got[0, :, 0].float(), expected, atol=2e-2)
 
 
@@ -175,17 +190,17 @@ def test_attention_incremental_matches_prefill():
     k = torch.randn(1, seq, 2, 64, **_HALF)
     v = torch.randn(1, seq, 2, 64, **_HALF)
 
-    prefill = _kv(1, 2, seq, 64)
-    full = attn(q, k, v, prefill, _batch(prefill, torch.arange(seq, device="cuda")))
+    prefill = _cuda_pool(1, 2, seq, 64)
+    full = attn(q, k, v, _kv(prefill), prefill.batch(torch.arange(seq, device="cuda")))
 
-    cache = _kv(1, 2, seq, 64)
+    pool = _cuda_pool(1, 2, seq, 64)
     steps = [
         attn(
             q[:, i : i + 1],
             k[:, i : i + 1],
             v[:, i : i + 1],
-            cache,
-            _batch(cache, torch.tensor([[i]], device="cuda")),
+            _kv(pool),
+            pool.batch(torch.tensor([[i]], device="cuda")),
         )
         for i in range(seq)
     ]
@@ -213,7 +228,7 @@ def test_gated_delta_net_incremental_matches_prefill():
 
     full = net(x)
 
-    cache = net.make_cache(1, seq, torch.float32, None)
+    cache = net.make_cache(1, torch.float32, None)
     steps = [net(x[:, i : i + 1], cache) for i in range(seq)]
     incremental = torch.cat(steps, dim=1)
 
@@ -270,7 +285,7 @@ def test_gated_delta_net_writes_cache_buffers_in_place():
     # A captured CUDA graph replays into the buffers it recorded, so the state
     # must stay at one address rather than being rebound to a fresh tensor.
     net = _delta_net()
-    cache = net.make_cache(1, 8, torch.float32, None)
+    cache = net.make_cache(1, torch.float32, None)
     conv, recurrent = cache.conv, cache.recurrent
 
     assert cache.empty
@@ -293,51 +308,121 @@ def test_attention_is_causal_in_prefill():
     k = torch.randn(1, seq, 2, 64, **_HALF)
     v = torch.randn(1, seq, 2, 64, **_HALF)
 
-    one, two = _kv(1, 2, seq, 64), _kv(1, 2, seq, 64)
-    out = attn(q, k, v, one, _batch(one, positions))
+    one, two = _cuda_pool(1, 2, seq, 64), _cuda_pool(1, 2, seq, 64)
+    out = attn(q, k, v, _kv(one), one.batch(positions))
     # Perturbing a future key/value must not change an earlier query's output.
     k2, v2 = k.clone(), v.clone()
     k2[:, -1] += 5.0
     v2[:, -1] += 5.0
-    out2 = attn(q, k2, v2, two, _batch(two, positions))
+    out2 = attn(q, k2, v2, _kv(two), two.batch(positions))
     assert torch.allclose(out[:, 0].float(), out2[:, 0].float(), atol=2e-2)
     assert not torch.allclose(out[:, -1].float(), out2[:, -1].float(), atol=2e-2)
 
 
-def _pool(rows: int = 4, length: int = 8) -> KVCache:
-    return KVCache(max_batch_size=rows, n_kv_heads=2, max_seq_len=length, head_dim=8)
-
-
-def test_a_slot_view_writes_the_pool_it_came_from():
-    """A prefill runs batch-1 against a view; the batched decode reads the
-    pool. If the view were a copy, the sequence would decode from nothing."""
-    pool = _pool()
-    view = cast(KVCache, pool.slot(2))
+def test_a_row_view_writes_the_pool_it_came_from():
+    """A prefill runs batch-1 against a row's view; the batched decode reads
+    the pool. If the view were a copy, the sequence would decode from
+    nothing."""
+    pool = _pool(rows=4, heads=2, length=8, head_dim=8)
+    view = pool.row(2)
     keys = torch.randn(1, 3, 2, 8)
-    view.write(_batch(view, torch.arange(3)), keys, keys)
-    assert torch.equal(pool.k[2, :3], keys[0])
-    assert (pool.k[0] == 0).all() and (pool.k[1] == 0).all()
+    cast(KVCache, view[0]).write(view.batch(torch.arange(3)), keys, keys)
+
+    page = int(pool.block_table[2, 0])
+    kv = _kv(pool)
+    assert torch.equal(kv.k[page, :3], keys[0])
+    # Every other row got its own page, and none of them were touched.
+    others = {int(pool.block_table[row, 0]) for row in (0, 1, 3)}
+    assert page not in others
+    assert all((kv.k[other] == 0).all() for other in others)
 
 
-def test_resetting_a_slot_leaves_the_others_alone():
-    pool = _pool()
-    pool.k.fill_(1.0)
-    pool.reset(1)
-    assert (pool.k[1] == 0).all()
-    assert (pool.k[0] == 1).all() and (pool.k[2] == 1).all()
+def test_two_rows_never_share_a_page():
+    """The invariant the free list exists for. A page handed out twice would
+    have one sequence reading the other's keys, which no length or block table
+    downstream could catch."""
+    pool = _pool(rows=4, heads=2, length=3 * PAGE_SIZE, head_dim=8)
+    held = [{int(page) for page in pool.block_table[row].tolist()} for row in range(4)]
+    assert all(len(pages) == 3 for pages in held)
+    assert len(set().union(*held)) == 12
+
+
+def test_a_released_row_hands_its_pages_back():
+    """And the next sequence gets them, which is the whole of what paging
+    buys: memory returns to the pool at the granularity it was taken."""
+    pool = _pool(rows=2, heads=2, length=PAGE_SIZE, head_dim=8)
+    assert pool.free_pages == 0 and pool.free_rows == 0
+    pool.release(0)
+    assert pool.free_pages == 1 and pool.free_rows == 1
+    assert pool.reserve(PAGE_SIZE) == 0
+    assert pool.free_pages == 0
+
+
+def test_reserving_more_than_the_pool_holds_is_refused():
+    """Refused rather than partly served: a sequence half of whose pages exist
+    would run into another's the moment it passed them."""
+    pool = _pool(rows=2, heads=2, length=PAGE_SIZE, head_dim=8)
+    pool.release(0)
+    assert pool.reserve(2 * PAGE_SIZE) is None
+    # And the failed attempt gave nothing away.
+    assert pool.free_pages == 1 and pool.free_rows == 1
+
+
+def test_an_idle_row_writes_to_scratch_and_not_to_a_live_page():
+    """The bug this guards, which cost a real run its determinism: a decode
+    step runs every row of its bucket, and a row holding no sequence has a
+    zeroed block table. Addressing page 0, every idle row in the batch wrote a
+    key over the *first token* of whichever sequence held that page — visible
+    only to that sequence's own attention, and only sometimes, depending on
+    who the free list had handed page 0 to."""
+    pool = _pool(rows=4, heads=2, length=8, head_dim=8)
+    for row in range(1, 4):
+        pool.release(row)
+
+    kv = _kv(pool)
+    live = int(pool.block_table[0, 0])
+    assert live != CachePool.SCRATCH
+    kv.k[live, 0] = 7.0
+
+    # One decode step over the whole bucket: row 0 live at position 1, and
+    # three rows nobody holds, all of them sitting at position 0.
+    positions = torch.tensor([[1], [0], [0], [0]])
+    kv.write(pool.batch(positions), torch.ones(4, 1, 2, 8), torch.ones(4, 1, 2, 8))
+
+    assert (kv.k[live, 0] == 7.0).all()
+    assert (kv.k[CachePool.SCRATCH, 0] == 1.0).all()
 
 
 def test_a_batched_update_writes_one_position_per_row():
     """The bug this guards: rows of a decode batch sit at different positions,
-    and a shared-position write would put every row's token in one slot."""
-    pool = _pool(rows=3, length=8)
+    and a shared-position write would put every row's token in one cell."""
+    pool = _pool(rows=3, heads=2, length=8, head_dim=8)
     positions = torch.tensor([[0], [4], [7]])
     values = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1)
     values = values.expand(3, 1, 2, 8).contiguous()
-    pool.write(_batch(pool, positions), values, values)
+    _kv(pool).write(pool.batch(positions), values, values)
+
+    kv = _kv(pool)
     for row, position in enumerate((0, 4, 7)):
-        assert (pool.k[row, position] == row).all()
-        assert pool.k[row].sum() == pool.k[row, position].sum()
+        page = int(pool.block_table[row, 0])
+        assert (kv.k[page, position] == row).all()
+        assert kv.k[page].sum() == kv.k[page, position].sum()
+
+
+def test_a_row_spanning_pages_writes_across_them():
+    """A position past the first page must land in the row's *second* page,
+    wherever the free list put it -- which is the one thing a stride could not
+    express."""
+    pool = _pool(rows=2, heads=2, length=2 * PAGE_SIZE, head_dim=8)
+    positions = torch.tensor([[PAGE_SIZE - 1, PAGE_SIZE]])
+    values = torch.ones(1, 2, 2, 8)
+    view = pool.row(1)
+    cast(KVCache, view[0]).write(view.batch(positions), values, values)
+
+    kv, first, second = _kv(pool), *pool.block_table[1].tolist()
+    assert (kv.k[int(first), PAGE_SIZE - 1] == 1).all()
+    assert (kv.k[int(second), 0] == 1).all()
+    assert kv.k.sum() == 2 * 2 * 8
 
 
 def test_a_conv_state_view_stays_primed():
@@ -346,7 +431,7 @@ def test_a_conv_state_view_stays_primed():
     from walnut.layers.linear_attention import ConvState
 
     state = ConvState(
-        max_batch_size=2,
+        rows=2,
         conv_dim=4,
         conv_kernel_size=3,
         num_value_heads=2,

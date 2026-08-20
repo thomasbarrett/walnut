@@ -2,8 +2,8 @@
 
 The stand-in generates ``token + 1`` per step out of a real `KVCache`, so a
 sequence's output is a function of its own prompt and nothing else: a row that
-read another row's slot, or its own at the wrong position, shows up as a wrong
-token rather than as a wrong number.
+read another row's pages, or its own at the wrong position, shows up as a
+wrong token rather than as a wrong number.
 """
 
 import threading
@@ -11,7 +11,7 @@ import threading
 import pytest
 import torch
 
-from walnut.cache import CachePool, StateCache
+from walnut.cache import PAGE_SIZE, CachePool, StateCache, pages_for
 from walnut.graph import buckets
 from walnut.layers.attention import Attention
 from walnut.sampler import Sampler, SamplingParams
@@ -31,11 +31,13 @@ class _StepModel:
         self.fail = False
         self.crash = False
 
-    def make_cache(self, max_batch_size, max_seq_len):
+    def make_cache(self, max_batch_size, max_seq_len, pages=None):
+        pages = max_batch_size * pages_for(max_seq_len) if pages is None else pages
         return CachePool(
-            [self.attn.make_cache(max_batch_size, max_seq_len, torch.float32, None)],
+            [self.attn.make_cache(pages + 1, torch.float32, None)],
             max_batch_size,
             max_seq_len,
+            pages,
         )
 
     def __call__(self, input_ids, positions, cache):
@@ -46,7 +48,7 @@ class _StepModel:
         self.steps += 1
         rows, seq = input_ids.shape
         # Write the token into the cache and read it back out of the cell the
-        # batch names, so a mis-slotted write becomes a wrong token.
+        # batch names, so a mis-paged write becomes a wrong token.
         value = input_ids.float()[..., None, None].expand(rows, seq, 1, 8)
         batch = cache.batch(positions)
         cache[0].write(batch, torch.zeros_like(value), value.clone())
@@ -58,7 +60,9 @@ class _StepModel:
         return logits
 
 
-def _scheduler(max_batch_size=4, max_seq_len=64, model=None, prefill_chunk=2048):
+def _scheduler(
+    max_batch_size=4, max_seq_len=64, model=None, prefill_chunk=2048, kv_tokens=None
+):
     return Scheduler(
         model or _StepModel(),
         torch.device("cpu"),
@@ -67,6 +71,7 @@ def _scheduler(max_batch_size=4, max_seq_len=64, model=None, prefill_chunk=2048)
         cuda_graph=False,
         compile=False,
         prefill_chunk=prefill_chunk,
+        kv_tokens=kv_tokens,
     )
 
 
@@ -108,9 +113,9 @@ def test_a_lone_request_generates_its_own_sequence():
         scheduler.close()
 
 
-def test_batched_requests_do_not_read_each_others_slots():
+def test_batched_requests_do_not_read_each_others_pages():
     """The bug this guards: a row indexing the pool by anything but its own
-    slot, which a uniform batch would hide."""
+    pages, which a uniform batch would hide."""
     scheduler = _scheduler()
     starts = [3, 17, 41, 58]
     try:
@@ -120,7 +125,7 @@ def test_batched_requests_do_not_read_each_others_slots():
     assert got == [_expected(s) for s in starts]
 
 
-def test_more_requests_than_slots_still_all_run():
+def test_more_requests_than_rows_still_all_run():
     scheduler = _scheduler(max_batch_size=2)
     starts = [1, 2, 3, 4, 5, 6]
     try:
@@ -130,12 +135,55 @@ def test_more_requests_than_slots_still_all_run():
     assert got == [_expected(s) for s in starts]
 
 
-def test_a_finished_request_frees_its_slot():
+def test_more_requests_than_pages_still_all_run():
+    """Rows are not the only thing a request waits for now. Two pages of
+    key/value serve two sequences at a time, and the rest queue behind them —
+    on a scheduler with four rows standing idle, so it is the pages doing it.
+    """
+    scheduler = _scheduler(max_batch_size=4, kv_tokens=2 * PAGE_SIZE)
+    assert scheduler.pool.pages == 2
+    starts = [1, 2, 3, 4, 5, 6]
+    try:
+        got = _drain(scheduler, [_request(s) for s in starts])
+    finally:
+        scheduler.close()
+    assert got == [_expected(s) for s in starts]
+
+
+def test_a_request_larger_than_the_whole_pool_is_refused():
+    """Refused at submit rather than queued: no sequence retiring will ever
+    make room for it, so waiting would be waiting forever."""
+    scheduler = _scheduler(max_seq_len=4096, kv_tokens=PAGE_SIZE)
+    try:
+        with pytest.raises(RequestError, match="pages of key/value"):
+            scheduler.submit(_request(5, tokens=2 * PAGE_SIZE))
+    finally:
+        scheduler.close()
+
+
+def test_a_request_takes_only_the_pages_it_asked_for():
+    """The whole of what paging buys. A request for five tokens holds one page,
+    where a slot pool gave it the full context every other request might have
+    needed."""
+    scheduler = _scheduler(max_seq_len=4096, kv_tokens=64 * PAGE_SIZE)
+    request = _request(5, tokens=4)
+    try:
+        scheduler.submit(request)
+        stream = request.stream()
+        next(stream)
+        assert scheduler.pool.free_pages == 63
+        stream.close()
+    finally:
+        scheduler.close()
+
+
+def test_a_finished_request_frees_its_row_and_pages():
     scheduler = _scheduler()
     try:
         _drain(scheduler, [_request(5), _request(9)])
         assert scheduler.running == {}
-        assert scheduler.pool.free == tuple(range(4))
+        assert scheduler.pool.free_rows == 4
+        assert scheduler.pool.free_pages == scheduler.pool.pages
     finally:
         scheduler.close()
 
@@ -154,8 +202,8 @@ def test_a_stop_token_ends_the_stream_after_yielding_it():
         scheduler.close()
 
 
-def test_abandoning_a_stream_frees_the_slot():
-    """A disconnected client must stop occupying a slot, not decode to its
+def test_abandoning_a_stream_frees_the_row():
+    """A disconnected client must stop occupying a row, not decode to its
     token limit with nowhere to put the tokens."""
     scheduler = _scheduler()
     request = _request(5, tokens=32)
@@ -166,7 +214,8 @@ def test_abandoning_a_stream_frees_the_slot():
         stream.close()
         scheduler.close()
         assert scheduler.running == {}
-        assert scheduler.pool.free == tuple(range(4))
+        assert scheduler.pool.free_rows == 4
+        assert scheduler.pool.free_pages == scheduler.pool.pages
     finally:
         scheduler.close()
 
@@ -285,8 +334,10 @@ class _RecurrentModel:
         self.sampler = Sampler()
         self.eos_token_id = None
 
-    def make_cache(self, max_batch_size, max_seq_len):
-        return CachePool([_SumCache(max_batch_size)], max_batch_size, max_seq_len)
+    def make_cache(self, max_batch_size, max_seq_len, pages=None):
+        return CachePool(
+            [_SumCache(max_batch_size)], max_batch_size, max_seq_len, pages
+        )
 
     def __call__(self, input_ids, positions, cache):
         total = cache[0].total
@@ -379,7 +430,7 @@ def test_a_prefill_between_chunks_keeps_the_state_it_has_built():
             stream = neighbour.stream()
             next(stream)  # admitted, and decoding
             streams.append(stream)
-        assert scheduler.pool.free == (3,)
+        assert scheduler.pool.free_rows == 1
         assert _drain(scheduler, [_prompt(prompt)]) == expected
         for stream in streams:
             stream.close()

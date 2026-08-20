@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from walnut.cache import Batch, Cache, CachePool, CacheView
+from walnut.cache import Batch, Cache, CachePool, CacheView, pages_for
 from walnut.graph import DecodeGraph
 from walnut.layers import (
     Attention,
@@ -91,12 +91,11 @@ class Qwen3_5Attention(nn.Module):
 
     def make_cache(
         self,
-        max_batch_size: int,
-        max_seq_len: int,
+        pages: int,
         dtype: torch.dtype,
         device: torch.device | str | None,
     ) -> KVCache:
-        return self.attn.make_cache(max_batch_size, max_seq_len, dtype, device)
+        return self.attn.make_cache(pages, dtype, device)
 
     def forward(
         self,
@@ -158,15 +157,21 @@ class Qwen3_5DecoderLayer(nn.Module):
 
     def make_cache(
         self,
-        max_batch_size: int,
-        max_seq_len: int,
+        rows: int,
+        pages: int,
         dtype: torch.dtype,
         device: torch.device | str | None,
     ) -> Cache:
-        mixer = (
-            self.self_attn if self.block_type == "full_attention" else self.linear_attn
-        )
-        return mixer.make_cache(max_batch_size, max_seq_len, dtype, device)
+        """This layer's share of the pool.
+
+        Two sizes because the two mixers hold two kinds of state: full
+        attention takes ``pages`` of the shared key/value pool and no row at
+        all, and linear attention takes a row of recurrent state per sequence
+        and no pages. See `walnut.cache.state`.
+        """
+        if self.block_type == "full_attention":
+            return self.self_attn.make_cache(pages, dtype, device)
+        return self.linear_attn.make_cache(rows, dtype, device)
 
     def forward(
         self,
@@ -215,24 +220,35 @@ class Qwen3_5TextModel(nn.Module):
         max_batch_size: int = 1,
         dtype: torch.dtype = torch.float32,
         device: torch.device | str | None = None,
+        pages: int | None = None,
     ) -> CachePool:
-        """Build a fresh per-layer cache (static KV for full attention, conv +
-        recurrent state for linear attention), sized for ``max_seq_len`` tokens.
+        """Build a fresh per-layer cache (paged KV for full attention, conv +
+        recurrent state for linear attention).
+
+        ``max_batch_size`` sets the rows — how many sequences can be in flight
+        — and ``pages`` the key/value pool they draw from, defaulting to the
+        parity figure where every row could run to ``max_seq_len`` at once.
+        ``max_seq_len`` remains the longest single sequence, because it is what
+        a row's block table can address.
 
         A pool rather than a bare list: the placement of sequences within it is
         part of what the cache *is*, and everything above here — a prefill
-        against one slot, a decode against a bucket, a scheduler handing slots
+        against one row, a decode against a bucket, a scheduler handing rows
         out — asks the pool for it rather than working it out again.
         """
+        pages = max_batch_size * pages_for(max_seq_len) if pages is None else pages
         return CachePool(
             [
+                # One page more than the pool hands out: `CachePool.SCRATCH`,
+                # which idle rows write into and no sequence can hold.
                 cast(Qwen3_5DecoderLayer, layer).make_cache(
-                    max_batch_size, max_seq_len, dtype, device
+                    max_batch_size, pages + 1, dtype, device
                 )
                 for layer in self.layers
             ],
             max_batch_size,
             max_seq_len,
+            pages,
         )
 
     def forward(
@@ -649,17 +665,20 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         )
         return self.lm_head(hidden)
 
-    def make_cache(self, max_batch_size: int, max_seq_len: int) -> CachePool:
-        """A decode-state pool: ``max_batch_size`` slots of ``max_seq_len``.
+    def make_cache(
+        self, max_batch_size: int, max_seq_len: int, pages: int | None = None
+    ) -> CachePool:
+        """A decode-state pool: ``max_batch_size`` rows over ``pages`` of KV.
 
         What `walnut.scheduler.Scheduler` batches over; `iter_generate` builds
-        its own single-slot cache sized to the one request it serves.
+        its own single-row cache sized to the one request it serves.
         """
         return self.model.language_model.make_cache(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             dtype=self.lm_head.weight.dtype,
             device=self.lm_head.weight.device,
+            pages=pages,
         )
 
     @torch.no_grad()
@@ -704,12 +723,19 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             gen = torch.Generator(device=input_ids.device).manual_seed(params.seed)
 
         seq = input_ids.shape[1]
+        wanted = seq + params.max_new_tokens
         cache = self.model.language_model.make_cache(
-            max_seq_len=seq + params.max_new_tokens,
+            max_seq_len=wanted,
             max_batch_size=input_ids.shape[0],
             dtype=self.lm_head.weight.dtype,
             device=input_ids.device,
         )
+        # Reserved, not merely allocated. A pool hands out pages through
+        # `reserve`, and a row that never asked for any addresses `SCRATCH` for
+        # every position it reaches — which reads as one page of cache silently
+        # wrapping under the whole sequence, not as an error.
+        for _ in range(input_ids.shape[0]):
+            assert cache.reserve(wanted) is not None
         positions = torch.arange(seq, device=input_ids.device)
         # Decode positions carry a batch dim even at batch 1: the cache writes
         # and the attention mask read one position per row, and a fixed buffer

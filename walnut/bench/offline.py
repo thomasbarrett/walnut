@@ -42,6 +42,7 @@ class EngineOptions:
     autotune: bool = True
     max_batch_size: int = 1
     max_seq_len: int | None = None
+    kv_tokens: int | None = None
     prefill_chunk: int = 2048
 
     def load(self) -> Any:
@@ -61,6 +62,7 @@ class EngineOptions:
             autotune=self.autotune,
             max_batch_size=self.max_batch_size,
             max_seq_len=self.max_seq_len,
+            kv_tokens=self.kv_tokens,
             prefill_chunk=self.prefill_chunk,
         )
 

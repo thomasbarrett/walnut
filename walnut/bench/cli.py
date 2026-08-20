@@ -503,7 +503,17 @@ def throughput(
         ),
     ] = 8,
     max_seq_len: Annotated[
-        int | None, typer.Option(min=1, help="Context each batch slot holds.")
+        int | None, typer.Option(min=1, help="Longest single sequence.")
+    ] = None,
+    kv_tokens: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            envvar="WALNUT_KV_TOKENS",
+            help="Tokens of key/value cache the whole batch shares, as "
+            "`walnut serve` takes it. Defaults to --max-batch-size times "
+            "--max-seq-len.",
+        ),
     ] = None,
     prefill_chunk: Annotated[
         int,
@@ -545,6 +555,7 @@ def throughput(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        kv_tokens=kv_tokens,
         prefill_chunk=prefill_chunk,
     )
     try:
@@ -581,7 +592,17 @@ def startup(
         ),
     ] = 8,
     max_seq_len: Annotated[
-        int | None, typer.Option(min=1, help="Context each batch slot holds.")
+        int | None, typer.Option(min=1, help="Longest single sequence.")
+    ] = None,
+    kv_tokens: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            envvar="WALNUT_KV_TOKENS",
+            help="Tokens of key/value cache the whole batch shares, as "
+            "`walnut serve` takes it. Defaults to --max-batch-size times "
+            "--max-seq-len.",
+        ),
     ] = None,
     device: Device = "auto",
     dtype: Dtype = "auto",
@@ -610,6 +631,7 @@ def startup(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        kv_tokens=kv_tokens,
     )
     try:
         raise typer.Exit(
