@@ -396,6 +396,8 @@ def build_serve_record(
         "queue_wait_ms": summarize([r.queue_wait * 1e3 for r in ok]),
         "truncated": sum(1 for r in results if r.truncated),
         "goodput_slos": {k: v * 1e3 for k, v in slos.items()} or None,
+        # In seconds too: what `at_slo` reads back, undivided.
+        "goodput_slos_seconds": dict(slos),
         "goodput": (good / duration) if good is not None else None,
         "goodput_fraction": (good / len(ok)) if good is not None else None,
         "metrics": {k: summarize(v) for k, v in samples.items()},
@@ -534,7 +536,7 @@ async def run_sweep(
                 )
                 break
 
-    report_sweep(rungs, stopped)
+    report_sweep(rungs, stopped, opts.goodput)
     write_record(
         {
             "mode": "sweep",

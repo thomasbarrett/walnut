@@ -129,6 +129,32 @@ actually saw. **p50/p90/p99, fixed** — not a flag. A run reported at other
 percentiles is comparable with no other run, and a knob here would hand out a
 way around the `*` marker: p99.9 of five samples is the maximum, every time.
 
+## Throughput at an SLO
+
+The one figure a deployment is chosen on, printed by `serve` and by `sweep` on
+either ladder, whenever `--goodput` is set:
+
+```
+1980 tok/s at concurrency 8 with every request inside tpot <= 10 ms.
+```
+
+**Neither axis decides anything alone.** Output tok/s keeps climbing through
+the load at which goodput collapses — the rate sweep's own example has
+throughput still rising at the rung where 90% of requests miss. A latency
+without a load describes an idle machine. This collapses both into one number,
+and by construction it cannot be repeated without naming the workload.
+
+**"Every request", not the goodput floor.** `--goodput-floor` (0.95) decides
+where a rate sweep *stops*; this decides what may be *claimed*, and there it is
+100% or nothing. A rung at 97% is a fine operating point and still cannot be
+quoted as throughput at that SLO.
+
+**No rung clearing is a result**, and it is printed as one. Falling back to the
+closest rung would publish a throughput at an SLO it never met.
+
+Without `--goodput` the line is replaced by a warning saying why it is absent.
+Silence would read as nothing having been missed.
+
 ## The metrics
 
 | | definition | what moves it |
@@ -320,10 +346,7 @@ request inside tpot p100 <= 10 ms.
 requests in flight, so nothing queues without bound and no rung invalidates the
 ones above it. Each is a real operating point, and the curve is the answer.
 
-**The last line is the number to quote.** System throughput at a stated
-interactivity, in one figure, which cannot be repeated without its workload
-attached. Without `--goodput` there is nothing to read it against and the table
-has to be eyeballed.
+**The last line is the number to quote** — see *Throughput at an SLO* below.
 
 **`tok/s/user` is throughput over mean concurrency** — the axis the public
 benchmarks plot, printed so a walnut number can sit beside theirs. It is an
@@ -451,7 +474,8 @@ the mean misses this.
   `chat` → `agentic` is 16× the prompt work at a quarter of the output.
 - **Capacity, "how many can it take"** → a `sweep` rate ladder. The rung it
   stops on is the answer.
-- **"How fast is it, in one number"** → throughput at an SLO.
+- **"How fast is it, in one number"** → throughput at an SLO, from any of the
+  three. Never output tok/s on its own.
 - **Compilation, autotuning, lazy init** → `startup`.
 - **TTFT alone never justifies a change.** `--no-cuda-graph` *improves* TTFT
   here by 3.7% while TPOT goes 1.48 → 3.37 ms and per-stream throughput falls
