@@ -42,6 +42,7 @@ class EngineOptions:
     autotune: bool = True
     max_batch_size: int = 1
     max_seq_len: int | None = None
+    prefill_chunk: int = 2048
 
     def load(self) -> Any:
         from walnut.engine import load_model, parse_dtype, resolve_device
@@ -60,6 +61,7 @@ class EngineOptions:
             autotune=self.autotune,
             max_batch_size=self.max_batch_size,
             max_seq_len=self.max_seq_len,
+            prefill_chunk=self.prefill_chunk,
         )
 
     def as_flags(self) -> dict[str, Any]:

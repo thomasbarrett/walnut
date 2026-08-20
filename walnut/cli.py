@@ -86,6 +86,18 @@ MaxBatchSize = Annotated[
         "so raising it costs memory whether or not the requests arrive.",
     ),
 ]
+PrefillChunk = Annotated[
+    int,
+    typer.Option(
+        min=1,
+        envvar="WALNUT_PREFILL_CHUNK",
+        help="Prompt tokens run per prefill pass. Prefill runs alone, so a "
+        "whole prompt at once is a gap in every stream already decoding — "
+        "half a second at 16k tokens. A chunk bounds that gap at no measured "
+        "cost to the prompt itself down to about 2048; below that, prefill "
+        "starts to pay for the passes. Set it past --max-seq-len for one pass.",
+    ),
+]
 MaxSeqLen = Annotated[
     int | None,
     typer.Option(
@@ -117,6 +129,7 @@ def serve(
     autotune: Autotune = True,
     max_batch_size: MaxBatchSize = 8,
     max_seq_len: MaxSeqLen = None,
+    prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
     from .engine import load_model, parse_dtype, resolve_device
@@ -140,6 +153,7 @@ def serve(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        prefill_chunk=prefill_chunk,
     )
     # Compile and capture before the port opens, so the first request meets a
     # warm engine rather than paying for everyone else's.
@@ -184,6 +198,7 @@ def profile(
     autotune: Autotune = True,
     max_batch_size: MaxBatchSize = 1,
     max_seq_len: MaxSeqLen = None,
+    prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
 
@@ -210,6 +225,7 @@ def profile(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        prefill_chunk=prefill_chunk,
     )
     config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)
     messages = [Message(role="user", content=prompt)]

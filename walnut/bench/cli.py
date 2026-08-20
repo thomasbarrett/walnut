@@ -135,9 +135,10 @@ ShapeName = Annotated[
         "--shape",
         help="Workload shape — how much prompt against how much generation. "
         + "; ".join(f"{s.name} ({_sizes(s)}) {s.what}" for s in SHAPES.values())
-        + ". This is the axis walnut is most sensitive to: prefill runs alone "
-        "and unchunked, so a long prompt stalls every stream already running. "
-        "A conclusion drawn at one shape does not transfer to another.",
+        + ". This is the axis walnut is most sensitive to: prefill runs alone, "
+        "so a long prompt interrupts every stream already running — a chunk at "
+        "a time, not all at once. A conclusion drawn at one shape does not "
+        "transfer to another.",
     ),
 ]
 Tokenizer = Annotated[
@@ -504,6 +505,16 @@ def throughput(
     max_seq_len: Annotated[
         int | None, typer.Option(min=1, help="Context each batch slot holds.")
     ] = None,
+    prefill_chunk: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            envvar="WALNUT_PREFILL_CHUNK",
+            help="Prompt tokens run per prefill pass, as `walnut serve` takes "
+            "it. Prefill runs alone, so this bounds the gap a prompt puts in "
+            "every stream already decoding.",
+        ),
+    ] = 2048,
     num_iters_warmup: NumItersWarmup = 1,
     seed: Annotated[int, typer.Option(help="Seeds prompt generation.")] = 0,
     device: Device = "auto",
@@ -534,6 +545,7 @@ def throughput(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        prefill_chunk=prefill_chunk,
     )
     try:
         raise typer.Exit(

@@ -13,6 +13,7 @@ import torch
 
 from walnut.graph import buckets
 from walnut.layers.attention import Attention
+from walnut.layers.cache import Cache
 from walnut.sampler import Sampler, SamplingParams
 from walnut.scheduler import Request, RequestError, Scheduler
 
@@ -56,14 +57,15 @@ class _StepModel:
         return logits
 
 
-def _scheduler(max_batch_size=4, max_seq_len=64):
+def _scheduler(max_batch_size=4, max_seq_len=64, model=None, prefill_chunk=2048):
     return Scheduler(
-        _StepModel(),
+        model or _StepModel(),
         torch.device("cpu"),
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         cuda_graph=False,
         compile=False,
+        prefill_chunk=prefill_chunk,
     )
 
 
@@ -246,3 +248,182 @@ def test_a_seeded_request_gets_its_own_generator():
         list(request.stream())
     finally:
         scheduler.close()
+
+
+class _SumCache(Cache):
+    """A stand-in for recurrent state: one running total per slot.
+
+    `KVCache` cannot show what a chunked prefill risks — its writes are indexed
+    by position, so a stray step lands where the next chunk writes anyway. This
+    is the other kind of state: a total that only moves forward, where a step
+    the sequence did not ask for cannot be undone by writing over it.
+    """
+
+    def __init__(self, rows: int) -> None:
+        self.total = torch.zeros(rows)
+
+    def view(self, start: int, stop: int) -> "_SumCache":
+        cache = _SumCache.__new__(_SumCache)
+        cache.total = self.total[start:stop]
+        return cache
+
+    def reset(self, index: int) -> None:
+        self.total[index] = 0
+
+    def carried(self, index: int) -> list:
+        return [self.total[index : index + 1]]
+
+    def prime(self) -> None:
+        pass
+
+
+class _RecurrentModel:
+    """Emits ``(state + 1) % VOCAB`` from state no position can repair.
+
+    Every call advances the state, by its own tokens and by one for having run
+    at all — so a step taken on a row in the middle of its prefill shows up in
+    that row's next token.
+    """
+
+    def __init__(self) -> None:
+        self.sampler = Sampler()
+        self.eos_token_id = None
+
+    def make_cache(self, max_batch_size, max_seq_len):
+        return [_SumCache(max_batch_size)]
+
+    def __call__(self, input_ids, positions, cache):
+        total = cache[0].total
+        total += input_ids.float().sum(-1) + 1
+        batch, _ = input_ids.shape
+        logits = torch.zeros(batch, 1, VOCAB)
+        return logits.scatter(2, ((total.long() + 1) % VOCAB)[:, None, None], 1.0)
+
+
+def _prompt(values, tokens=4):
+    return Request(
+        prompt=torch.tensor([values]),
+        params=SamplingParams(max_new_tokens=tokens, temperature=0.0),
+        stop_ids=frozenset(),
+    )
+
+
+def test_a_chunked_prefill_generates_what_one_pass_generates():
+    """The chunk is a scheduling decision, not an arithmetic one: the prompt
+    attends over everything written before it either way."""
+    prompt = [(i * 7) % VOCAB for i in range(10)]
+    whole = _scheduler(prefill_chunk=64)
+    try:
+        expected = _drain(whole, [_prompt(prompt)])
+    finally:
+        whole.close()
+    for chunk in (1, 3, 4, 9):
+        scheduler = _scheduler(prefill_chunk=chunk)
+        try:
+            assert _drain(scheduler, [_prompt(prompt)]) == expected
+        finally:
+            scheduler.close()
+
+
+class _Recording(_StepModel):
+    """`_StepModel`, keeping the width of every forward it is asked for: a
+    prompt chunk is as wide as the chunk, a decode step is one token."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.widths: list[int] = []
+        self.positions: list[torch.Tensor] = []
+
+    def __call__(self, input_ids, positions, cache):
+        self.widths.append(input_ids.shape[1])
+        self.positions.append(positions.clone())
+        return super().__call__(input_ids, positions=positions, cache=cache)
+
+
+def test_a_long_prefill_lets_the_batch_decode_between_its_chunks():
+    """The point of the chunk. Unchunked, every running sequence waits out the
+    whole prompt, and sees the wait as one gap between two of its tokens."""
+    model = _Recording()
+    scheduler = _scheduler(model=model, prefill_chunk=2)
+    running = _request(5, tokens=48)
+    try:
+        scheduler.submit(running)
+        stream = running.stream()
+        next(stream)  # the batch is decoding before the long prompt arrives
+        _drain(scheduler, [_prompt([(i * 5) % VOCAB for i in range(12)], tokens=2)])
+        stream.close()
+    finally:
+        scheduler.close()
+    chunks = [i for i, width in enumerate(model.widths) if width > 1]
+    assert len(chunks) == 6  # 12 prompt tokens, 2 at a time
+    assert any(model.widths[i] == 1 for i in range(chunks[0], chunks[-1]))
+
+
+def test_a_prefill_between_chunks_keeps_the_state_it_has_built():
+    """A step runs whole buckets, so a bucket wide enough to reach the slot
+    being prefilled steps that slot too. What it advances has to be put back.
+
+    Three neighbours, because that is what it takes: a decode step rounds its
+    batch up to a bucket, and only the round-up reaches a slot no sequence is
+    running in yet.
+    """
+    prompt = [(i * 3) % VOCAB for i in range(8)]
+    alone = _scheduler(model=_RecurrentModel(), prefill_chunk=2)
+    try:
+        expected = _drain(alone, [_prompt(prompt)])
+    finally:
+        alone.close()
+
+    scheduler = _scheduler(model=_RecurrentModel(), prefill_chunk=2)
+    neighbours = [_prompt([i], tokens=48) for i in range(3)]
+    streams = []
+    try:
+        for neighbour in neighbours:
+            scheduler.submit(neighbour)
+            stream = neighbour.stream()
+            next(stream)  # admitted, and decoding
+            streams.append(stream)
+        assert scheduler.free == [3]
+        assert _drain(scheduler, [_prompt(prompt)]) == expected
+        for stream in streams:
+            stream.close()
+    finally:
+        scheduler.close()
+
+
+def test_a_stepped_prefill_row_writes_where_its_next_chunk_writes():
+    """The other half of the guard. A step writes a token into the row being
+    prefilled, and a positional cache keeps whatever it is given: pointed at
+    the start of the sequence it would overwrite the prompt, so it is pointed
+    at the position the next chunk covers instead.
+    """
+    model = _Recording()
+    scheduler = _scheduler(model=model, prefill_chunk=2)
+    neighbours = [_request(i + 1, tokens=48) for i in range(3)]
+    streams = []
+    try:
+        for neighbour in neighbours:
+            scheduler.submit(neighbour)
+            stream = neighbour.stream()
+            next(stream)
+            streams.append(stream)
+        _drain(scheduler, [_prompt([(i * 3) % VOCAB for i in range(8)], tokens=2)])
+        for stream in streams:
+            stream.close()
+    finally:
+        scheduler.close()
+
+    prefilled = 0
+    steps = 0
+    for width, positions in zip(model.widths, model.positions, strict=True):
+        if width > 1:
+            prefilled += width
+        elif 0 < prefilled < 8:  # a step taken mid-prompt, slot 3 not yet live
+            assert int(positions[3]) == prefilled
+            steps += 1
+    assert steps  # the bucket did reach the prefilling row
+
+
+def test_a_prefill_chunk_of_zero_is_rejected():
+    with pytest.raises(ValueError, match="prefill_chunk"):
+        _scheduler(prefill_chunk=0)

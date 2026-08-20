@@ -16,6 +16,12 @@ would mean padding to the longest prompt in the group and paying attention over
 the padding; a prompt already saturates the GPU on its own, so there is nothing
 to win there and a stall to lose. Decode is where the batch is.
 
+It runs a chunk at a time, though, with a decode step between chunks
+(``prefill_chunk``). Alone and unchunked, a prompt stalls every sequence
+already decoding for as long as it takes — half a second at 16k tokens, which
+each of those streams sees as a half-second gap between two of its tokens. The
+chunk bounds that gap without changing what prefill costs in total.
+
 The pool is preallocated: `max_batch_size` slots of `max_seq_len` tokens each,
 allocated once at start. A request whose prompt and completion do not fit is
 rejected rather than allowed to displace a running one.
@@ -60,6 +66,9 @@ class Request:
     slot: int = -1
     position: int = 0
     produced: int = 0
+    #: Prompt tokens prefilled so far, while this request is the one being
+    #: admitted. Equal to the prompt length the moment it joins the batch.
+    prefilled: int = 0
 
     def stream(self) -> Any:
         """Yield this request's token ids until it finishes.
@@ -95,13 +104,17 @@ class Scheduler:
         cuda_graph: bool = True,
         compile: bool = True,
         autotune: bool = True,
+        prefill_chunk: int = 2048,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be at least 1")
+        if prefill_chunk < 1:
+            raise ValueError("prefill_chunk must be at least 1")
         self.model = model
         self.device = device
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
+        self.prefill_chunk = prefill_chunk
         self.cuda_graph = cuda_graph and device.type == "cuda"
         self.compile = compile
         self.autotune = autotune
@@ -123,8 +136,22 @@ class Scheduler:
         self.token = torch.zeros(max_batch_size, 1, dtype=torch.long, device=device)
         self.position = torch.zeros(max_batch_size, 1, dtype=torch.long)
 
+        # The recurrent state a decode step would advance under a chunked
+        # prefill, per slot, alongside one scratch copy to hold it in. Both are
+        # built once: a prefill chunk is on the time-to-first-token path, and
+        # only one prefill is ever in flight, so one copy serves whichever slot
+        # holds it.
+        self.carried = [
+            [tensor for entry in self.cache for tensor in entry.carried(slot)]
+            for slot in range(max_batch_size)
+        ]
+        self.saved = [torch.empty_like(tensor) for tensor in self.carried[0]]
+
         self.incoming: queue.Queue[Request | None] = queue.Queue()
         self.running: dict[int, Request] = {}
+        #: The request being prefilled, if any. At most one: its chunks run
+        #: between decode steps, and a second would only lengthen both.
+        self.prefilling: Request | None = None
         self.free = list(range(max_batch_size))
         self.decode_forward: Any = model
         self.graphs: DecodeGraphs | None = None
@@ -218,9 +245,11 @@ class Scheduler:
         error: BaseException | None = None
         stopping = False
         try:
-            while not (stopping and not self.running):
+            while not (stopping and not self.running and self.prefilling is None):
                 if not self._admit():
                     stopping = True
+                if self.prefilling is not None:
+                    self._prefill_chunk()
                 if self.running:
                     self._step()
         except BaseException as exc:  # noqa: BLE001 — re-raised by `_drain`
@@ -240,6 +269,8 @@ class Scheduler:
         """
         reason = error or RequestError("the scheduler has stopped")
         self._stopped = reason
+        if self.prefilling is not None:
+            self._abandon(self.prefilling, reason)
         for request in list(self.running.values()):
             self._retire(request, error)
         while True:
@@ -254,11 +285,11 @@ class Scheduler:
     def _admit(self) -> bool:
         """Take at most one waiting request into the batch; False to stop.
 
-        One per iteration on purpose: a prefill stalls every running sequence
-        for its duration, so admitting a burst all at once would show up as a
-        gap in each of their token streams.
+        One at a time on purpose, and none at all while another is still
+        prefilling: chunks and decode steps share the loop, so a second prompt
+        would only interleave with the first and make both slower to answer.
         """
-        if not self.free:
+        if self.prefilling is not None or not self.free:
             return True
         blocking = not self.running
         try:
@@ -268,41 +299,87 @@ class Scheduler:
         if request is None:
             return False
         if not request.cancelled.is_set():
-            self._prefill(request)
+            self._begin_prefill(request)
         return True
 
-    def _prefill(self, request: Request) -> None:
-        """Run a prompt into a fresh slot and deliver its first token."""
+    def _begin_prefill(self, request: Request) -> None:
+        """Give ``request`` a fresh slot; its prompt runs from the next chunk."""
         slot = self.free.pop(0)
+        for entry in self.cache:
+            entry.reset(slot)
+        request.slot = slot
+        request.prefilled = 0
+        request.position = 0
+        self.prefilling = request
+
+    def _prefill_chunk(self) -> None:
+        """Run the next ``prefill_chunk`` of the admitted prompt.
+
+        Returns to the loop between chunks, so every sequence already decoding
+        gets a token in the gap. The prompt's own cost does not change: the
+        chunk carries the recurrent state forward and attends over everything
+        written before it, which is the same arithmetic the whole prompt in one
+        pass does, and at 2048 it measures the same too.
+        """
+        request = self.prefilling
+        assert request is not None
+        if request.cancelled.is_set():
+            # A client that left mid-prefill frees its slot now rather than
+            # after the remaining chunks it will not read.
+            self._abandon(request, None)
+            return
+        slot = request.slot
+        start = request.prefilled
+        chunk = request.prompt[:, start : start + self.prefill_chunk]
         try:
-            for entry in self.cache:
-                entry.reset(slot)
-            length = request.prompt.shape[1]
-            positions = torch.arange(length, device=self.device)
-            logits = self.model(
-                request.prompt, positions=positions, cache=self.slot_views[slot]
-            )
+            positions = torch.arange(start, start + chunk.shape[1], device=self.device)
+            logits = self.model(chunk, positions=positions, cache=self.slot_views[slot])
+            request.prefilled = start + chunk.shape[1]
+            if request.prefilled < request.prompt.shape[1]:
+                return
             token = self.model.sampler(logits[:, -1], request.params, request.generator)
             self.token[slot].copy_(token[0])
             token_id = int(token.item())
         except Exception as exc:  # deliver the failure to its own caller only
-            self.free.append(slot)
-            self.free.sort()
-            request.tokens.put(exc)
-            request.tokens.put(_DONE)
+            self._abandon(request, exc)
             return
 
-        request.slot = slot
-        request.position = length
+        self.prefilling = None
+        request.position = request.prefilled
         self.running[slot] = request
         self._deliver(request, token_id)
 
+    def _abandon(self, request: Request, error: BaseException | None) -> None:
+        """Drop a part-prefilled request, freeing the slot it never filled."""
+        self.prefilling = None
+        self.free.append(request.slot)
+        self.free.sort()
+        if error is not None:
+            request.tokens.put(error)
+        request.tokens.put(_DONE)
+
     def _step(self) -> None:
-        """One decode step over every running sequence."""
+        """One decode step over every running sequence.
+
+        A step runs whole buckets, so rows that hold no sequence run too. That
+        is free for a free slot and not for the one part way through a prefill:
+        the step writes a token into it. Its positional writes are aimed at the
+        position the next chunk overwrites, and what is left — the recurrent
+        state, which a step advances wherever it is pointed — is saved here and
+        put back. Two `_foreach_copy_` calls, and only while a prefill is in
+        flight.
+        """
         size = min(s for s in self.sizes if s > max(self.running))
         self.position[:size].zero_()
         for slot, request in self.running.items():
             self.position[slot] = request.position
+
+        held = self.prefilling
+        held = held if held is not None and held.slot < size else None
+        if held is not None:
+            self.position[held.slot] = held.prefilled
+            if self.saved:  # nothing to hold, in a model that writes by position
+                torch._foreach_copy_(self.saved, self.carried[held.slot])
 
         rows = self.position[:size]
         try:
@@ -331,6 +408,9 @@ class Scheduler:
             for request in list(self.running.values()):
                 self._retire(request, exc)
             return
+        finally:
+            if held is not None and self.saved:
+                torch._foreach_copy_(self.carried[held.slot], self.saved)
 
         for slot, request in list(self.running.items()):
             request.position += 1

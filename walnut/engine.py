@@ -359,6 +359,7 @@ class TorchEngine(Engine):
         autotune: bool = True,
         max_batch_size: int = 8,
         max_seq_len: int | None = None,
+        prefill_chunk: int = 2048,
     ) -> None:
         self.model_id = model_id
         self.cuda_graph = cuda_graph
@@ -369,6 +370,7 @@ class TorchEngine(Engine):
         self.dtype = resolve_dtype(dtype, config, self.device)
         self.max_batch_size = max_batch_size
         self.max_seq_len = resolve_max_seq_len(max_seq_len, config)
+        self.prefill_chunk = prefill_chunk
         model_class = resolve_model_class(config)
         with _build_on(self.device, self.dtype):
             model: Any = model_class(config)
@@ -385,6 +387,7 @@ class TorchEngine(Engine):
             cuda_graph=cuda_graph,
             compile=compile,
             autotune=autotune,
+            prefill_chunk=prefill_chunk,
         )
 
     def start(self) -> None:
@@ -495,6 +498,7 @@ def load_model(
     autotune: bool = True,
     max_batch_size: int = 8,
     max_seq_len: int | None = None,
+    prefill_chunk: int = 2048,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
@@ -507,7 +511,9 @@ def load_model(
 
     ``max_batch_size`` is how many requests the scheduler decodes as one batch,
     and ``max_seq_len`` the context each of its slots is preallocated for; see
-    `walnut.scheduler.Scheduler` and `resolve_max_seq_len`.
+    `walnut.scheduler.Scheduler` and `resolve_max_seq_len`. ``prefill_chunk``
+    is how many prompt tokens run between decode steps, which bounds the gap a
+    prompt puts in every other request's token stream.
     """
     return TorchEngine(
         model_id=model,
@@ -518,4 +524,5 @@ def load_model(
         autotune=autotune,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
+        prefill_chunk=prefill_chunk,
     )

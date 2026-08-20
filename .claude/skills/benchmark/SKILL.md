@@ -63,9 +63,11 @@ chat, one long-output case for reasoning, short outputs on the prefill-heavy
 shapes so generation cost cannot mask prompt cost, and a little jitter on input
 so a batch is mixed rather than uniform.
 
-**This is the axis walnut is most sensitive to.** `Scheduler._admit` runs
-prefill alone, one request at a time, unchunked — so a prompt's cost is paid by
-every stream already decoding. Between `reasoning` and `agentic` the
+**This is the axis walnut is most sensitive to.** `Scheduler` runs prefill
+alone, one request at a time — so a prompt's cost is paid by every stream
+already decoding. It runs it `--prefill-chunk` tokens at a time with a decode
+step between chunks, which bounds how much of that cost lands in any one gap
+without moving the cost itself. Between `reasoning` and `agentic` the
 prefill:decode work ratio moves by two orders of magnitude, and **no conclusion
 drawn at one shape transfers to another**.
 
@@ -456,9 +458,12 @@ conc  out tok/s  TPOT med  ITL p99  TTFT med  TTFT p99  E2EL med
 Batching buys 3.8× system throughput for 4.4× each stream's TPOT. **The ITL p99
 cliff between 2 and 4 is not noise** — median barely moves while p99 goes
 2.3 → 22.3 ms. The cause is admission: a prefill stalls every running sequence
-for its duration (`walnut/scheduler.py`, `Scheduler._admit`), so once requests
-arrive mid-batch each running stream eats a ~20 ms gap. Anything reading only
-the mean misses this.
+for its duration (`walnut/scheduler.py`, `Scheduler._prefill_chunk`), so once
+requests arrive mid-batch each running stream eats a ~20 ms gap.
+`--prefill-chunk` caps that gap at one chunk rather than one whole prompt — at
+`agentic` it takes ITL p99 from 499 to 79 ms — but it cannot remove it, and
+these 1024-token prompts fit inside one chunk anyway. Anything reading only the
+mean misses this.
 
 ## Which number leads
 
