@@ -23,7 +23,12 @@ from walnut.bench.errors import BenchError
 from walnut.bench.metrics import SLO_METRICS
 from walnut.bench.offline import EngineOptions, run_latency, run_startup, run_throughput
 from walnut.bench.online import ServeOptions, run_serve, run_sweep
-from walnut.bench.workload import PROMPT, goodput_config
+from walnut.bench.workload import (
+    DEFAULT_SHAPE,
+    SHAPES,
+    goodput_config,
+    resolve_shape,
+)
 
 app = typer.Typer(
     help="Measure walnut: latency, throughput, capacity and start-up.",
@@ -31,6 +36,12 @@ app = typer.Typer(
 )
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/v1"
+
+
+def _sizes(shape) -> str:
+    if shape.input_len is None:
+        return f"fixed prompt, {shape.output_len} out"
+    return f"{shape.input_len} in / {shape.output_len} out"
 
 
 # -- shared option types ----------------------------------------------------
@@ -110,31 +121,26 @@ MaxConcurrency = Annotated[
         "queueing is the thing you are measuring.",
     ),
 ]
-Dataset = Annotated[
+#: One flag for prompt length, generation length and their spread, because
+#: those three are one decision. The record carries the name, so two runs can
+#: be checked for comparability instead of trusted.
+ShapeName = Annotated[
     str,
     typer.Option(
-        help="'fixed' sends one prompt every time — cheap, and the right "
-        "choice for a regression check. 'random' builds prompts of varying "
-        "token length, which is what exercises a mixed batch.",
-    ),
-]
-Prompt = Annotated[str, typer.Option(help="The prompt, for --dataset fixed.")]
-InputLen = Annotated[
-    int, typer.Option(min=1, help="Prompt tokens, for --dataset random.")
-]
-RangeRatio = Annotated[
-    float,
-    typer.Option(
-        min=0.0,
-        max=1.0,
-        help="Spread of prompt lengths around --input-len, for --dataset "
-        "random: 0.3 gives lengths in [0.7x, 1.3x]. Set 0 for a uniform "
-        "length, which is reproducible but never pads a batch.",
+        "--shape",
+        help="Workload shape — how much prompt against how much generation. "
+        + "; ".join(f"{s.name} ({_sizes(s)}) {s.what}" for s in SHAPES.values())
+        + ". This is the axis walnut is most sensitive to: prefill runs alone "
+        "and unchunked, so a long prompt stalls every stream already running. "
+        "A conclusion drawn at one shape does not transfer to another.",
     ),
 ]
 Tokenizer = Annotated[
     str | None,
-    typer.Option(help="Tokenizer for --dataset random. Defaults to the model."),
+    typer.Option(
+        help="Tokenizer used to build prompts for the generated shapes. "
+        "Defaults to the model."
+    ),
 ]
 Goodput = Annotated[
     list[str] | None,
@@ -146,6 +152,13 @@ Goodput = Annotated[
         "Keys: " + ", ".join(SLO_METRICS) + ".",
     ),
 ]
+
+
+def _shape(name: str):
+    try:
+        return resolve_shape(name)
+    except BenchError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _fail(exc: BenchError) -> None:
@@ -171,9 +184,7 @@ def _serve_options(**kwargs) -> ServeOptions:
         goodput = goodput_config(kwargs.pop("goodput"))
     except BenchError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if kwargs["dataset"] not in ("fixed", "random"):
-        raise typer.BadParameter("--dataset takes 'fixed' or 'random'")
-    return ServeOptions(goodput=goodput, **kwargs)
+    return ServeOptions(goodput=goodput, shape=_shape(kwargs.pop("shape")), **kwargs)
 
 
 # -- serve ------------------------------------------------------------------
@@ -193,12 +204,8 @@ def serve(
         ),
     ] = float("inf"),
     max_concurrency: MaxConcurrency = None,
-    dataset: Dataset = "fixed",
-    prompt: Prompt = PROMPT,
-    input_len: InputLen = 512,
-    range_ratio: RangeRatio = 0.3,
+    shape: ShapeName = DEFAULT_SHAPE,
     tokenizer: Tokenizer = None,
-    max_tokens: Annotated[int, typer.Option(min=1, help="Output tokens.")] = 128,
     seed: Annotated[
         int,
         typer.Option(
@@ -227,8 +234,8 @@ def serve(
     The number a serving change is judged on, and the only one that sees
     queueing. Start the server first, sized for the load you intend to offer.
 
-    Arrivals are Poisson, generation is greedy, and every request is held to
-    exactly --max-tokens. None of the three is a knob: see `walnut.bench`.
+    Arrivals are Poisson, generation is greedy, and every request generates
+    exactly the shape's output length. None of the three is a knob.
     """
     if request_rate <= 0:
         raise typer.BadParameter("--request-rate must be positive")
@@ -238,12 +245,8 @@ def serve(
         num_prompts=num_prompts,
         request_rate=request_rate,
         max_concurrency=max_concurrency,
-        dataset=dataset,
-        prompt=prompt,
-        input_len=input_len,
-        range_ratio=range_ratio,
+        shape=shape,
         tokenizer=tokenizer,
-        max_tokens=max_tokens,
         seed=seed,
         warmups=num_iters_warmup,
         goodput=goodput,
@@ -274,12 +277,8 @@ def sweep(
     model: ServedModel = None,
     num_prompts: NumPrompts = 200,
     max_concurrency: MaxConcurrency = None,
-    dataset: Dataset = "fixed",
-    prompt: Prompt = PROMPT,
-    input_len: InputLen = 512,
-    range_ratio: RangeRatio = 0.3,
+    shape: ShapeName = DEFAULT_SHAPE,
     tokenizer: Tokenizer = None,
-    max_tokens: Annotated[int, typer.Option(min=1, help="Output tokens.")] = 128,
     seed: Annotated[int, typer.Option(help="Seeds the run end to end.")] = 0,
     num_iters_warmup: NumItersWarmup = 1,
     goodput: Goodput = None,
@@ -310,12 +309,8 @@ def sweep(
         num_prompts=num_prompts,
         request_rate=float("inf"),
         max_concurrency=max_concurrency,
-        dataset=dataset,
-        prompt=prompt,
-        input_len=input_len,
-        range_ratio=range_ratio,
+        shape=shape,
         tokenizer=tokenizer,
-        max_tokens=max_tokens,
         seed=seed,
         warmups=num_iters_warmup,
         goodput=goodput,
@@ -336,8 +331,7 @@ def sweep(
 @app.command()
 def latency(
     model: Model,
-    prompt: Annotated[str, typer.Option(help="The prompt to generate from.")] = PROMPT,
-    max_tokens: Annotated[int, typer.Option(min=1, help="Output tokens.")] = 128,
+    shape: ShapeName = DEFAULT_SHAPE,
     num_iters: NumIters = 5,
     num_iters_warmup: NumItersWarmup = 3,
     temperature: Annotated[
@@ -390,8 +384,7 @@ def latency(
         raise typer.Exit(
             run_latency(
                 opts,
-                prompt=prompt,
-                max_tokens=max_tokens,
+                shape=_shape(shape),
                 num_iters=num_iters,
                 num_iters_warmup=num_iters_warmup,
                 temperature=temperature,
@@ -412,14 +405,7 @@ def latency(
 def throughput(
     model: Model,
     num_prompts: NumPrompts = 200,
-    dataset: Dataset = "fixed",
-    prompt: Prompt = PROMPT,
-    input_len: InputLen = 512,
-    range_ratio: RangeRatio = 0.3,
-    tokenizer: Tokenizer = None,
-    max_tokens: Annotated[
-        int, typer.Option(min=1, help="Output tokens per request.")
-    ] = 128,
+    shape: ShapeName = DEFAULT_SHAPE,
     max_batch_size: Annotated[
         int,
         typer.Option(
@@ -450,7 +436,7 @@ def throughput(
     time is not its produce time and per-request latency here would be
     fiction; `serve` is where latency under a batch comes from.
 
-    Greedy, and every request held to exactly --max-tokens.
+    Greedy, and every request held to exactly the shape's output length.
     """
     opts = EngineOptions(
         model=model,
@@ -462,19 +448,12 @@ def throughput(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
     )
-    if dataset not in ("fixed", "random"):
-        raise typer.BadParameter("--dataset takes 'fixed' or 'random'")
     try:
         raise typer.Exit(
             run_throughput(
                 opts,
-                dataset=dataset,
+                shape=_shape(shape),
                 num_prompts=num_prompts,
-                prompt=prompt,
-                input_len=input_len,
-                range_ratio=range_ratio,
-                tokenizer=tokenizer,
-                max_tokens=max_tokens,
                 num_iters_warmup=num_iters_warmup,
                 seed=seed,
                 label=label,

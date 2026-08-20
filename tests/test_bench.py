@@ -14,6 +14,7 @@ import pytest
 from typer.testing import CliRunner
 
 from walnut.bench import cli as bench_cli
+from walnut.bench import online
 from walnut.bench.errors import BenchError
 from walnut.bench.metrics import SLO_METRICS, percentile, summarize
 from walnut.bench.online import (
@@ -25,7 +26,13 @@ from walnut.bench.online import (
     run_sweep,
 )
 from walnut.bench.report import report_sweep, shortfall
-from walnut.bench.workload import PROMPT, arrival_delays, goodput_config
+from walnut.bench.workload import (
+    Shape,
+    arrival_delays,
+    build_workload,
+    goodput_config,
+    resolve_shape,
+)
 from walnut.cli import app
 
 runner = CliRunner()
@@ -201,6 +208,24 @@ def test_tpot_is_zero_for_a_single_token_response():
 # -- end to end against a live server ---------------------------------------
 
 
+class _Tokenizer:
+    """Enough of a tokenizer to build a prompt of a given length."""
+
+    vocab_size = 1000
+    all_special_ids = ()
+
+    def decode(self, ids):
+        return " ".join(str(i) for i in ids)
+
+
+@pytest.fixture(autouse=True)
+def _offline_tokenizer(monkeypatch):
+    """Every shape generates its prompts, so every run wants a tokenizer. The
+    stub server has none, and reaching for a real one would put a download in
+    the test suite."""
+    monkeypatch.setattr(online, "load_tokenizer", lambda _: _Tokenizer())
+
+
 def _serve_options(base_url: str, **overrides) -> ServeOptions:
     base = ServeOptions(
         base_url=base_url,
@@ -208,14 +233,11 @@ def _serve_options(base_url: str, **overrides) -> ServeOptions:
         num_prompts=6,
         request_rate=50.0,
         max_concurrency=2,
-        dataset="fixed",
-        prompt=PROMPT,
-        input_len=512,
-        range_ratio=0.3,
+        # The stub echoes the prompt back with one word in front, and every
+        # request is held to the shape's output length — a mismatch is a hard
+        # error by design, so five words in has to mean six out.
+        shape=Shape("stub", 5, 6, 0.0, "echoed back, one word longer"),
         tokenizer=None,
-        # The stub echoes six words whatever it is asked for, and --ignore-eos
-        # is on: a mismatch here is a hard error by design.
-        max_tokens=6,
         seed=0,
         warmups=1,
         goodput={},
@@ -371,15 +393,16 @@ def test_every_bench_subcommand_takes_a_warmup_flag(command):
 
 
 @pytest.mark.parametrize("command", ["serve", "throughput", "latency", "sweep"])
-def test_output_length_is_spelled_the_same_everywhere(command):
-    """One name for one quantity. A flag that is --max-tokens under `serve`
-    and --output-len under `throughput` is a trap for anyone moving between
-    them."""
-    result = runner.invoke(app, ["bench", command, "--help"], env=WIDE)
-    assert result.exit_code == 0
-    help_text = _plain(result.stdout)
-    assert "--max-tokens" in help_text
-    assert "--output-len" not in help_text
+def test_the_workload_is_one_flag_everywhere(command):
+    """One name for one decision. Prompt length, generation length and their
+    spread are not independent choices, and spelling them as separate flags is
+    what let the default land on a shape nothing in production resembles."""
+    help_text = _plain(
+        runner.invoke(app, ["bench", command, "--help"], env=WIDE).stdout
+    )
+    assert "--shape" in help_text
+    for gone in ("--dataset", "--input-len", "--range-ratio", "--max-tokens"):
+        assert gone not in help_text
 
 
 def test_latency_has_no_batch_size_knob():
@@ -391,3 +414,30 @@ def test_latency_has_no_batch_size_knob():
         runner.invoke(app, ["bench", "latency", "m", "--batch-size", "8"]).exit_code
         != 0
     )
+
+
+# -- workload shapes --------------------------------------------------------
+
+
+def test_generated_prompts_vary_below_the_named_length():
+    """Jitter is one-sided, so a shape's name is a ceiling: `chat` sends at
+    most 1024 prompt tokens, never 1100. A claim about a maximum is one a
+    reader can check against a record; a claim about a mean is not.
+
+    Nonzero at all because a batch of identical prompts never pads to its
+    longest member, and so cannot show what a mixed batch costs."""
+    import random
+
+    shape = Shape("wide", 100, 16, 0.2, "test")
+    lengths = {
+        len(p.split())
+        for p in build_workload(shape, 40, _Tokenizer(), random.Random(0))
+    }
+    assert min(lengths) >= 80
+    assert max(lengths) == 100
+    assert len(lengths) > 1
+
+
+def test_an_unknown_shape_is_refused_by_name():
+    with pytest.raises(BenchError, match="chat"):
+        resolve_shape("chatbot")

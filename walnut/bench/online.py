@@ -25,7 +25,7 @@ from walnut.bench.report import (
     shortfall,
     write_record,
 )
-from walnut.bench.workload import build_workload
+from walnut.bench.workload import Shape, build_workload, load_tokenizer
 
 
 @dataclass
@@ -37,12 +37,8 @@ class ServeOptions:
     num_prompts: int
     request_rate: float
     max_concurrency: int | None
-    dataset: str
-    prompt: str
-    input_len: int
-    range_ratio: float
+    shape: Shape
     tokenizer: str | None
-    max_tokens: int
     seed: int
     warmups: int
     goodput: dict[str, float]
@@ -281,7 +277,7 @@ def serve_payload(opts: ServeOptions, model: str) -> dict[str, Any]:
     """
     return {
         "model": model,
-        "max_tokens": opts.max_tokens,
+        "max_tokens": opts.shape.output_len,
         "temperature": 0.0,
         "seed": opts.seed,
         "stream": True,
@@ -351,15 +347,16 @@ def build_serve_record(
         "model": model,
         "base_url": opts.base_url,
         # Workload and traffic shape, kept apart: a latency read against a run
-        # that changed either is the easiest fake result in serving.
-        "workload": opts.dataset,
-        "prompt": opts.prompt if opts.dataset == "fixed" else None,
-        "input_len": opts.input_len if opts.dataset == "random" else None,
-        "range_ratio": opts.range_ratio if opts.dataset == "random" else None,
+        # that changed either is the easiest fake result in serving. The shape
+        # travels by name so two records can be checked for comparability
+        # rather than assumed to be.
+        "shape": opts.shape.name,
+        "input_len": opts.shape.input_len,
+        "jitter": opts.shape.jitter,
         "num_prompts": opts.num_prompts,
         "request_rate": rate,
         "max_concurrency": opts.max_concurrency,
-        "max_tokens": opts.max_tokens,
+        "max_tokens": opts.shape.output_len,
         "seed": opts.seed,
         "warmups": opts.warmups,
         "completed": len(ok),
@@ -416,7 +413,7 @@ async def serve_once(
 ) -> dict[str, Any]:
     """One measured run at one offered rate. `sweep` calls this per rung."""
     print(
-        f"{len(prompts)} prompts at "
+        f"{opts.shape.name}: {len(prompts)} prompts at "
         f"{'unlimited' if rate == float('inf') else rate}"
         f" req/s (Poisson), "
         f"max concurrency {opts.max_concurrency or 'unlimited'}",
@@ -447,15 +444,12 @@ async def _prepare(client: Any, opts: ServeOptions) -> tuple[str, list[str], str
         raise BenchError(f"{base_url}/models advertises no model")
 
     rng = random.Random(opts.seed)
-    prompts = build_workload(
-        opts.dataset,
-        opts.num_prompts,
-        opts.prompt,
-        opts.input_len,
-        opts.range_ratio,
-        opts.tokenizer or opts.model,
-        rng,
+    tokenizer = (
+        load_tokenizer(opts.tokenizer or opts.model or model)
+        if opts.shape.input_len is not None
+        else None
     )
+    prompts = build_workload(opts.shape, opts.num_prompts, tokenizer, rng)
     payload = serve_payload(opts, model)
     await warm_up(client, url, payload, prompts[0], opts)
     return model, prompts, url, payload
@@ -543,6 +537,7 @@ async def run_sweep(
             "mode": "sweep",
             "label": opts.label,
             "model": rungs[0]["model"],
+            "shape": opts.shape.name,
             "rates": ladder,
             "goodput_floor": goodput_floor,
             "stopped": stopped,
