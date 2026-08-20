@@ -26,7 +26,7 @@ from walnut.bench.report import (
     report_throughput,
     write_record,
 )
-from walnut.bench.workload import build_workload
+from walnut.bench.workload import Shape, build_workload
 
 
 @dataclass
@@ -132,8 +132,7 @@ def one_request(engine: Any, prompt: str, params: Any) -> dict[str, Any]:
 
 def run_latency(
     opts: EngineOptions,
-    prompt: str,
-    max_tokens: int,
+    shape: Shape,
     num_iters: int,
     num_iters_warmup: int,
     temperature: float,
@@ -146,6 +145,11 @@ def run_latency(
     from walnut.sampler import SamplingParams
 
     engine = opts.load()
+    # One prompt, built from the shape with the engine's own tokenizer. Under a
+    # long shape the whole prefill lands in this run's TTFT, which is the only
+    # place it is visible without the scheduler in the way.
+    prompt = build_workload(shape, 1, engine.tokenizer, random.Random(seed or 0))[0]
+    max_tokens = shape.output_len
     params = SamplingParams(
         max_new_tokens=max_tokens, temperature=temperature, top_p=top_p, seed=seed
     )
@@ -178,7 +182,7 @@ def run_latency(
         "mode": "latency",
         "label": label,
         **engine_header(engine, opts),
-        "prompt": prompt,
+        "shape": shape.name,
         "prompt_tokens": int(
             engine._encode([Message(role="user", content=prompt)]).shape[1]
         ),
@@ -237,13 +241,8 @@ def _user(content: str) -> Any:
 
 def run_throughput(
     opts: EngineOptions,
-    dataset: str,
+    shape: Shape,
     num_prompts: int,
-    prompt: str,
-    input_len: int,
-    range_ratio: float,
-    tokenizer: str | None,
-    max_tokens: int,
     num_iters_warmup: int,
     seed: int,
     label: str | None,
@@ -256,21 +255,14 @@ def run_throughput(
     # sampling cost is only legible with the scheduler out of the way, which is
     # `latency`, and requests that stopped at different lengths do not describe
     # a batch anyone asked for.
+    max_tokens = shape.output_len
     config = GenerationConfig(
         max_tokens=max_tokens,
         temperature=0.0,
         seed=seed,
         ignore_eos=True,
     )
-    prompts = build_workload(
-        dataset,
-        num_prompts,
-        prompt,
-        input_len,
-        range_ratio,
-        tokenizer or opts.model,
-        random.Random(seed),
-    )
+    prompts = build_workload(shape, num_prompts, engine.tokenizer, random.Random(seed))
 
     # A full batch, not one request: compilation is per decode bucket, and a
     # single-request warm-up leaves larger buckets to compile mid-measurement.
@@ -294,10 +286,9 @@ def run_throughput(
         "label": label,
         **engine_header(engine, opts),
         "max_batch_size": opts.max_batch_size,
-        "workload": dataset,
-        "prompt": prompt if dataset == "fixed" else None,
-        "input_len": input_len if dataset == "random" else None,
-        "range_ratio": range_ratio if dataset == "random" else None,
+        "shape": shape.name,
+        "input_len": shape.input_len,
+        "jitter": shape.jitter,
         "num_prompts": num_prompts,
         "max_tokens": max_tokens,
         "seed": seed,

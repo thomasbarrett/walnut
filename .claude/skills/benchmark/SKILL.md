@@ -35,6 +35,56 @@ judged on and the only one that sees queueing, but it carries enough else that
 a 3% decode win vanishes into it. `latency` makes that 3% visible and hashes
 the output as a correctness check, but never notices a starved stream.
 
+## Pick the shape second
+
+`--shape` is one flag for prompt length, generation length and their spread,
+because those are one decision. It is on `serve`, `sweep`, `throughput` and
+`latency`, and the record carries the name — so two runs can be checked for
+comparability instead of trusted.
+
+| `--shape` | in / out | source | what it is |
+|---|---|---|---|
+| `chat` (default) | ≤1024 / 1024 | InferenceMAX | a conversational turn |
+| `rag` | ≤4096 / 256 | Luminal | retrieval: prefill-heavy, short answer |
+| `reasoning` | ≤1024 / 8192 | InferenceMAX | a long scratchpad, decode-bound |
+| `agentic` | ≤16384 / 256 | Luminal | full history and tool schemas; prefill is the cost |
+
+**The input figure is a ceiling, not a mean.** Prompts are jittered over
+80–100% of it, one-sided, following InferenceMAX — so "`chat` sends at most
+1024 prompt tokens" is a claim a reader can check against a record, where "about
+1024 on average" is not. Output length is exact.
+
+Every size is lifted from a published benchmark rather than invented, so a
+walnut number can be read beside the source it came from. **There is no
+industry standard** — no single publisher uses this exact set, and MLPerf, the
+closest thing to an official one, samples lengths from real datasets instead of
+pinning synthetic shapes. What the field agrees on is looser: ~1k input for
+chat, one long-output case for reasoning, short outputs on the prefill-heavy
+shapes so generation cost cannot mask prompt cost, and a little jitter on input
+so a batch is mixed rather than uniform.
+
+**This is the axis walnut is most sensitive to.** `Scheduler._admit` runs
+prefill alone, one request at a time, unchunked — so a prompt's cost is paid by
+every stream already decoding. Between `reasoning` and `agentic` the
+prefill:decode work ratio moves by two orders of magnitude, and **no conclusion
+drawn at one shape transfers to another**.
+
+**`chat` is the default because it is the cheapest shape anyone actually
+runs.** There is no smaller one worth having: a short synthetic prompt is
+nearly all decode, and a regression gate that only guards decode passes changes
+that ruin prefill.
+
+The generated shapes build prompts from random token ids, which share no
+prefix. That is deliberate today and will need revisiting the moment walnut
+caches prefixes: multi-turn chat is nearly all prefix hits, and a no-hit
+workload would understate it systematically.
+
+The long shapes need room. `agentic` wants `--max-seq-len` past 16k on the
+in-process subcommands, and a server started with enough context.
+
+Prompts are generated from token ids, so every shape needs a tokenizer —
+`--tokenizer`, or the model.
+
 ## Reading the table
 
 Every subcommand with a distribution prints the same shape — one row per
@@ -123,8 +173,8 @@ compile time as a latency; `--num-iters-warmup 0` prints a warning.
 ## serve
 
 ```bash
-walnut bench serve --num-prompts 120 --request-rate 16 --max-tokens 128 \
-  --goodput ttft:250 --goodput tpot:10 -o rate16.json
+walnut bench serve --shape chat --num-prompts 120 --request-rate 16 \
+  --goodput ttft:250 --goodput tpot:10 -o chat-rate16.json
 ```
 
 Start the server first, sized for the load you intend to offer.
@@ -175,10 +225,6 @@ server's `--max-batch-size`, requests were queueing inside the engine.
 served nobody, and each metric alone scores it a success. Keys: `ttft`, `tpot`,
 `itl`, `e2el`. An `itl` SLO is held against the request's **worst** gap.
 
-**Datasets.** `--dataset fixed` (default) sends one prompt every time — cheap,
-reproducible, right for a regression check. `--dataset random --input-len 512
---range-ratio 0.3` varies prompt length, which is what exercises a mixed batch.
-
 **Every request is held to exactly `--max-tokens`**, and there is no way to
 turn that off. A server that does not honour `ignore_eos` is a hard error:
 ragged lengths mean the latencies cannot be compared with each other, and a
@@ -192,7 +238,8 @@ and the numbers from a clean one.
 ## throughput
 
 ```bash
-walnut bench throughput Qwen/Qwen3.5-0.8B --num-prompts 200 --max-batch-size 16
+walnut bench throughput Qwen/Qwen3.5-0.8B --shape chat --num-prompts 200 \
+  --max-batch-size 16
 ```
 
 Every request submitted at once, straight at the engine. No HTTP, no arrival
@@ -208,7 +255,7 @@ here would be fiction. `serve` is where latency under a batch comes from.
 ## sweep
 
 ```bash
-walnut bench sweep --rates 8,16,24,32 --num-prompts 200 \
+walnut bench sweep --shape chat --rates 8,16,24,32 --num-prompts 200 \
   --goodput ttft:250 --goodput tpot:10 -o sweep.json
 ```
 
@@ -237,11 +284,11 @@ sample has a realized mean of its own.
 ## latency
 
 ```bash
-walnut bench latency Qwen/Qwen3.5-0.8B --label baseline -o before.json
+walnut bench latency Qwen/Qwen3.5-0.8B --shape chat --label baseline -o before.json
 ```
 
-128 output tokens, 3 warm-up iterations, 5 measured, greedy, driven straight at
-the model — no scheduler, no HTTP, detokenization after the clock stops. Greedy
+The shape's output length, 3 warm-up iterations, 5 measured, greedy, driven
+straight at the model — no scheduler, no HTTP, detokenization after the clock stops. Greedy
 is what makes the output hash a correctness check; it also never runs the
 sampler's softmax path, so raise `--temperature` (with `--seed`) if the sampler
 is what you changed.
@@ -306,10 +353,11 @@ device, dtype, prompt, token count and flags. Nothing enforces that; check it.
 
 ## What this machine does
 
-RTX 5090, Qwen3.5-0.8B, the default 7-token prompt at 128 output tokens. Every
-number below is conditioned on that shape — a prompt this short is nearly all
-decode, so none of it describes what a 4k or 32k prefill does to the same
-engine. Read the ratios, not the absolutes.
+RTX 5090, Qwen3.5-0.8B, measured before `--shape` existed, on what was then the
+default: a seven-token prompt at 128 output tokens. That shape is gone, and it
+was nearly all decode — so none of this describes what a 1k, 4k or 16k prefill
+does to the same engine. Read the ratios, not the absolutes, and **re-measure
+at `chat` before quoting anything.**
 
 Closed loop (`--request-rate` unset), `--max-concurrency` swept:
 
@@ -339,6 +387,8 @@ the mean misses this.
 - **Prefill, chunking, prompt handling** → `serve` TTFT p50 and p99, at a
   finite `--request-rate` so prefills contend.
 - **Batch sizing** → `throughput` across `--max-batch-size`.
+- **Prefill cost, chunking, admission** → any `serve` metric across `--shape`.
+  `chat` → `agentic` is 16× the prompt work at a quarter of the output.
 - **Capacity, "how many can it take"** → `sweep`. The rung it stops on is the
   answer.
 - **Compilation, autotuning, lazy init** → `startup`.
@@ -349,10 +399,11 @@ the mean misses this.
 ## Method
 
 - **Baseline first**, before you edit.
+- **Say which shape.** A tok/s without one describes an unknown workload.
 - **Quiet machine, same machine.** GPU clocks drift with temperature, and the
   "after" run is always the one at the end of a long session.
-- **Say what the workload was.** `tok/s` without the concurrency, token count
-  and prompt length is not a result. Every record carries all of them.
+- **Say what the workload was.** `tok/s` without the concurrency, shape and
+  token counts is not a result. Every record carries all of them.
 - **Match the profile.** `walnut profile` takes `--temperature` and
   `--max-tokens`; set them to the benchmark's, or the trace describes a
   different workload than the numbers beside it.
