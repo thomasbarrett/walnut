@@ -40,7 +40,7 @@ class _StepModel:
             pages,
         )
 
-    def __call__(self, input_ids, positions, cache):
+    def __call__(self, input_ids, positions, cache, batch=None):
         if self.crash:
             raise BaseException("the loop died")  # noqa: TRY002 - escapes `_step`
         if self.fail:
@@ -50,7 +50,7 @@ class _StepModel:
         # Write the token into the cache and read it back out of the cell the
         # batch names, so a mis-paged write becomes a wrong token.
         value = input_ids.float()[..., None, None].expand(rows, seq, 1, 8)
-        batch = cache.batch(positions)
+        batch = cache.batch(positions) if batch is None else batch
         cache[0].write(batch, torch.zeros_like(value), value.clone())
         last = cache[0].v.reshape(-1, 1, 8)[batch.cells[:, -1], 0, 0]
         logits = torch.zeros(rows, seq, VOCAB)
@@ -339,7 +339,7 @@ class _RecurrentModel:
             [_SumCache(max_batch_size)], max_batch_size, max_seq_len, pages
         )
 
-    def __call__(self, input_ids, positions, cache):
+    def __call__(self, input_ids, positions, cache, batch=None):
         total = cache[0].total
         total += input_ids.float().sum(-1) + 1
         batch, _ = input_ids.shape
@@ -381,7 +381,7 @@ class _Recording(_StepModel):
         self.widths: list[int] = []
         self.positions: list[torch.Tensor] = []
 
-    def __call__(self, input_ids, positions, cache):
+    def __call__(self, input_ids, positions, cache, batch=None):
         self.widths.append(input_ids.shape[1])
         self.positions.append(positions.clone())
         return super().__call__(input_ids, positions=positions, cache=cache)

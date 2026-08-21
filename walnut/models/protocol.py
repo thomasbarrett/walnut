@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     import torch
 
-    from walnut.cache import CachePool, CacheView
+    from walnut.cache import Batch, CachePool, CacheView
     from walnut.runner.sampling import Sampler
 
 
@@ -34,7 +34,15 @@ class Forward(Protocol):
     """One pass over ``input_ids``, reading and writing ``cache``.
 
     ``positions`` is the rotary position of each token, which is not
-    necessarily where it lands in the cache — see `walnut.cache.Batch`.
+    necessarily where it lands in the cache — see `walnut.cache.Batch`. That
+    is what ``batch`` states, and why it is a separate argument rather than
+    something a model can work out: the shape of a position tensor cannot say
+    which rows this pass covers or how many tokens each of them contributes.
+
+    Omitting ``batch`` asks the model to derive one from ``positions``, which
+    is right for a caller that has nothing else to say — a single sequence
+    generating on its own, or a graph capture, which needs the page lookup
+    recorded inside the captured region rather than resolved before it.
     """
 
     def __call__(
@@ -43,6 +51,7 @@ class Forward(Protocol):
         *,
         positions: torch.Tensor,
         cache: CacheView,
+        batch: Batch | None = None,
     ) -> torch.Tensor: ...
 
 

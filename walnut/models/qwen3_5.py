@@ -259,6 +259,7 @@ class Qwen3_5TextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         *,
         cache: CacheView,
+        batch: Batch | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             assert input_ids is not None
@@ -270,8 +271,17 @@ class Qwen3_5TextModel(nn.Module):
         # Rotary reads the positions as given; the cache reads where they land.
         # One `Batch` for the whole pass, so the layout is resolved once rather
         # than re-derived from the position tensor by every mixer.
+        #
+        # A caller that already knows the layout passes it: a serving step
+        # covers rows sitting at unrelated positions, and soon rows
+        # contributing unequal numbers of tokens, neither of which the shape of
+        # a position tensor can state. Deriving it here is the fallback for the
+        # callers that have nothing else to say — `iter_generate`, and a graph
+        # capture, which must build it inside the captured region so the page
+        # lookup is replayed rather than frozen.
         cos, sin = self.rotary(positions)
-        batch = cache.batch(positions)
+        if batch is None:
+            batch = cache.batch(positions)
         for i, layer in enumerate(self.layers):
             h = layer(h, cos, sin, cache[i], batch)
         return self.norm(h)
@@ -606,9 +616,10 @@ class Qwen3_5Model(nn.Module):
         mm_token_type_ids: torch.Tensor | None = None,
         *,
         cache: CacheView,
+        batch: Batch | None = None,
     ) -> torch.Tensor:
         if pixel_values is None:
-            return self.language_model(input_ids, positions, cache=cache)
+            return self.language_model(input_ids, positions, cache=cache, batch=batch)
 
         assert input_ids is not None and image_grid_thw is not None
         inputs_embeds = self.language_model.embed_tokens(input_ids)
@@ -626,7 +637,7 @@ class Qwen3_5Model(nn.Module):
                 input_ids, mm_token_type_ids, image_grid_thw
             )
         return self.language_model(
-            positions=positions, inputs_embeds=inputs_embeds, cache=cache
+            positions=positions, inputs_embeds=inputs_embeds, cache=cache, batch=batch
         )
 
 
@@ -655,6 +666,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         mm_token_type_ids: torch.Tensor | None = None,
         *,
         cache: CacheView,
+        batch: Batch | None = None,
     ) -> torch.Tensor:
         hidden = self.model(
             input_ids,
@@ -663,6 +675,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             image_grid_thw,
             mm_token_type_ids,
             cache=cache,
+            batch=batch,
         )
         return self.lm_head(hidden)
 
