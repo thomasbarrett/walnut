@@ -1,36 +1,4 @@
-"""Continuous batching: many sequences decoded as one batch.
-
-Decode is memory-bound. A step at batch 1 reads every weight in the model to
-produce a single token, so a second sequence riding along costs almost nothing
-— the weights are already in flight. Batching is how a serving engine turns
-that read into throughput, and `Scheduler` is what keeps the batch full.
-
-The batch is continuous rather than static: a request joins at the next decode
-step instead of waiting for the current group to finish, and a finished
-sequence frees its row the step it stops. `max_batch_size` is the number of
-rows, which is what vLLM's ``--max-num-seqs`` and SGLang's
-``--max-running-requests`` bound.
-
-Prefill runs alone, one request at a time, into its own row. Batching prefills
-would mean padding to the longest prompt in the group and paying attention over
-the padding; a prompt already saturates the GPU on its own, so there is nothing
-to win there and a stall to lose. Decode is where the batch is.
-
-It runs a chunk at a time, though, with a decode step between chunks
-(``prefill_chunk``). Alone and unchunked, a prompt stalls every sequence
-already decoding for as long as it takes — half a second at 16k tokens, which
-each of those streams sees as a half-second gap between two of its tokens. The
-chunk bounds that gap without changing what prefill costs in total.
-
-The pool is preallocated and holds two resources. A *row* is a sequence's
-place in the batch — the recurrent state it advances, and the block table it
-addresses its pages through — and `max_batch_size` bounds those because a
-decode step runs them all. *Pages* are 256 tokens of key/value storage apiece,
-drawn from one pool shared by every row, and a request takes only as many as
-its prompt and completion need. A request that does not fit *yet* waits at the
-head of the queue until a running one retires; one that could never fit is
-rejected at `Scheduler.submit`, rather than waiting for room that will not come.
-"""
+"""The loop itself: admit, prefill a chunk, decode a step, deliver, retire."""
 
 from __future__ import annotations
 
@@ -39,72 +7,18 @@ import queue
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from walnut.cache import CachePool, pages_for
-from walnut.graph import DecodeGraphs, buckets
-from walnut.sampler import SamplingParams
+from walnut.runner.graphs import DecodeGraphs, buckets
+from walnut.scheduler.request import DONE, Request, RequestError, Sequence
+
+if TYPE_CHECKING:
+    from walnut.models.protocol import CausalLM
 
 logger = logging.getLogger("walnut.scheduler")
-
-#: Put on a request's queue to end its stream.
-_DONE = object()
-
-
-class RequestError(RuntimeError):
-    """A request that the scheduler could not run."""
-
-
-@dataclass
-class Request:
-    """One sequence in flight, and the channel its tokens leave by."""
-
-    prompt: torch.Tensor
-    params: SamplingParams
-    stop_ids: frozenset[int]
-    generator: torch.Generator | None = None
-    tokens: queue.SimpleQueue = field(default_factory=queue.SimpleQueue)
-    cancelled: threading.Event = field(default_factory=threading.Event)
-
-    def stream(self) -> Any:
-        """Yield this request's token ids until it finishes.
-
-        Closing the iterator early cancels the request, so a disconnected
-        client stops occupying a row at the next decode step.
-        """
-        try:
-            while True:
-                item = self.tokens.get()
-                if item is _DONE:
-                    return
-                if isinstance(item, BaseException):
-                    raise item
-                yield item
-        finally:
-            self.cancelled.set()
-
-
-@dataclass
-class Sequence:
-    """A request that holds a row: what the loop advances, one step at a time.
-
-    Split from `Request` because none of it means anything until admission — a
-    request still in the queue has no row to name and no position to be at.
-    The loop deals in sequences; a caller only ever sees its request.
-    """
-
-    request: Request
-    #: The cache row this sequence owns, until it retires.
-    row: int
-    #: The position its next token is written at.
-    position: int = 0
-    #: Prompt tokens prefilled so far. Equal to the prompt length the moment
-    #: the sequence joins the batch.
-    prefilled: int = 0
-    produced: int = 0
 
 
 class Scheduler:
@@ -116,7 +30,7 @@ class Scheduler:
 
     def __init__(
         self,
-        model: Any,
+        model: CausalLM,
         device: torch.device,
         max_batch_size: int = 8,
         max_seq_len: int = 8192,
@@ -515,4 +429,4 @@ class Scheduler:
         """End a request's stream, with the reason if there was one."""
         if error is not None:
             request.tokens.put(error)
-        request.tokens.put(_DONE)
+        request.tokens.put(DONE)

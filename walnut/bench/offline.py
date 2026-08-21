@@ -146,7 +146,7 @@ def run_latency(
     out: str | None,
 ) -> int:
     from walnut.engine import Message
-    from walnut.sampler import SamplingParams
+    from walnut.scheduler import SamplingParams
 
     engine = opts.load()
     # One prompt, built from the shape with the engine's own tokenizer. Under a

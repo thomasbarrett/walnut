@@ -8,7 +8,7 @@ from torch import nn
 from walnut.layers.linear import FusedLinear
 from walnut.models.loader import copy_weights
 from walnut.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-from walnut.sampler import SamplingParams
+from walnut.scheduler import SamplingParams
 
 
 def _module() -> nn.Module:

@@ -27,11 +27,14 @@ per batch size serves a row at any point in its sequence.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 
 from walnut.cache import CacheView
+
+if TYPE_CHECKING:
+    from walnut.models.protocol import Forward
 
 
 class DecodeGraph:
@@ -46,7 +49,7 @@ class DecodeGraph:
 
     def __init__(
         self,
-        model: Any,
+        model: Forward,
         cache: CacheView,
         device: torch.device,
         batch_size: int = 1,
@@ -62,7 +65,7 @@ class DecodeGraph:
         self.cache = cache.view(0, batch_size)
         self.capture(model, warmup)
 
-    def capture(self, model: Any, warmup: int = 3) -> None:
+    def capture(self, model: Forward, warmup: int = 3) -> None:
         """Warm up and record the decode step into a replayable graph.
 
         Split out of `__init__` so a profile names it, separating capture cost
@@ -136,7 +139,7 @@ class DecodeGraphs:
 
     def __init__(
         self,
-        model: Any,
+        model: Forward,
         cache: CacheView,
         device: torch.device,
         max_batch_size: int,

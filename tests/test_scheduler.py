@@ -12,10 +12,10 @@ import pytest
 import torch
 
 from walnut.cache import PAGE_SIZE, CachePool, StateCache, pages_for
-from walnut.graph import buckets
 from walnut.layers.attention import Attention
-from walnut.sampler import Sampler, SamplingParams
-from walnut.scheduler import Request, RequestError, Scheduler
+from walnut.runner.graphs import buckets
+from walnut.runner.sampling import Sampler
+from walnut.scheduler import Request, RequestError, SamplingParams, Scheduler
 
 VOCAB = 64
 

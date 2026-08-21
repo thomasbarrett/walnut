@@ -25,8 +25,7 @@ from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
 from walnut.models import resolve_model_class
-from walnut.sampler import SamplingParams
-from walnut.scheduler import Request, Scheduler
+from walnut.scheduler import Request, SamplingParams, Scheduler
 
 
 @dataclass(frozen=True)

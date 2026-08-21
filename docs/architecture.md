@@ -6,7 +6,10 @@ interface.
 
 ```
 walnut chat  ──HTTP──▶  server (FastAPI)  ──▶  Engine  ──▶  Scheduler  ──▶  model
-   client.py             server.py            engine.py     scheduler.py   (PyTorch)
+   client.py             server.py            engine.py     scheduler/     (PyTorch)
+                                                                │
+                                                                ▼
+                                                             runner/
 ```
 
 ## The layers
@@ -17,9 +20,15 @@ walnut chat  ──HTTP──▶  server (FastAPI)  ──▶  Engine  ──▶
 - **`walnut/engine.py`** — the engine interface plus `Message`,
   `GenerationConfig`, `Completion`/`Usage`/`Stream`, and the default
   `TorchEngine`.
-- **`walnut/scheduler.py`** — the continuous batching loop: a pool of sequence
+- **`walnut/scheduler/`** — the continuous batching loop: a pool of sequence
   rows, decoded as one batch, that requests join and leave as they arrive and
-  finish.
+  finish. `request.py` holds the vocabulary a caller speaks in — a request,
+  its sampling parameters, and the sequence it becomes once admitted.
+- **`walnut/runner/`** — the device-facing half: CUDA graph capture for the
+  decode step (`graphs.py`) and the token draw itself (`sampling.py`). The
+  runner imports the scheduler's types; the scheduler imports nothing here.
+- **`walnut/models/protocol.py`** — what the loop requires of a model: a
+  forward pass, a cache it builds for itself, and a sampler.
 - **`walnut/cache/`** — where decode state lives: what a layer remembers, which
   rows and pages a sequence holds, and how one forward pass addresses them.
 - **`walnut/client.py`** — a small OpenAI-compatible client used by `walnut chat`.

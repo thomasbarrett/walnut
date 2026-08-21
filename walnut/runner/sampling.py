@@ -1,22 +1,17 @@
-"""Token sampling for generation."""
+"""Drawing the next token, under whatever each row of the batch asked for.
+
+The parameters are a request's (`walnut.scheduler.request.SamplingParams`);
+only the draw is here, because the draw is the part that runs on the device.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 
 import torch
 from torch import nn
 
-
-@dataclass
-class SamplingParams:
-    max_new_tokens: int = 20
-    temperature: float = 0.0
-    top_p: float = 1.0
-    top_k: int = 0
-    stop_token_ids: tuple[int, ...] = field(default_factory=tuple)
-    seed: int | None = None
+from walnut.scheduler.request import SamplingParams
 
 
 class Sampler(nn.Module):

@@ -111,7 +111,7 @@ def _varlen(
     Kept out of the compiled region because dynamo does not preserve the call:
     traced, it decomposes back into a generic attention, which is 8% of TPOT
     and produces the token stream the kernel this replaced produced. The graph
-    break costs one launch per full-attention layer, and `walnut.graph`
+    break costs one launch per full-attention layer, and `walnut.runner.graphs`
     captures across it anyway.
     """
     rows, seq, heads, head_dim = q.shape
