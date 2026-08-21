@@ -119,7 +119,21 @@ KvTokens = Annotated[
         "them back when they finish, so this bounds total context in flight "
         "rather than any one request. Defaults to --max-batch-size times "
         "--max-seq-len, where every request could run to the full context at "
-        "once; lower it to trade that worst case for the memory back.",
+        "once, or to whatever fits in free memory if that is less; lower it to "
+        "trade that worst case for the memory back.",
+    ),
+]
+KvFraction = Annotated[
+    float,
+    typer.Option(
+        min=0.0,
+        max=1.0,
+        envvar="WALNUT_KV_FRACTION",
+        help="Share of free GPU memory the key/value cache may take when "
+        "--kv-tokens is not given. The rest is headroom for what is allocated "
+        "after it: compile workspaces, the decode graph captures, and the "
+        "activations of the largest pass. Ignored off CUDA, and ignored "
+        "entirely when --kv-tokens is set.",
     ),
 ]
 
@@ -144,6 +158,7 @@ def serve(
     max_batch_size: MaxBatchSize = 8,
     max_seq_len: MaxSeqLen = None,
     kv_tokens: KvTokens = None,
+    kv_fraction: KvFraction = 0.85,
     prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Serve MODEL behind an OpenAI-compatible API."""
@@ -169,6 +184,7 @@ def serve(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        kv_fraction=kv_fraction,
         prefill_chunk=prefill_chunk,
     )
     # Compile and capture before the port opens, so the first request meets a
@@ -215,6 +231,7 @@ def profile(
     max_batch_size: MaxBatchSize = 1,
     max_seq_len: MaxSeqLen = None,
     kv_tokens: KvTokens = None,
+    kv_fraction: KvFraction = 0.85,
     prefill_chunk: PrefillChunk = 2048,
 ) -> None:
     """Profile one generation with MODEL and write a Chrome trace.
@@ -243,6 +260,7 @@ def profile(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        kv_fraction=kv_fraction,
         prefill_chunk=prefill_chunk,
     )
     config = GenerationConfig(max_tokens=max_tokens, temperature=temperature)

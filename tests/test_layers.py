@@ -228,7 +228,7 @@ def test_gated_delta_net_incremental_matches_prefill():
 
     full = net(x)
 
-    cache = net.make_cache(1, torch.float32, None)
+    cache = net.cache_spec().build(1, 0, torch.float32, None)
     steps = [net(x[:, i : i + 1], cache) for i in range(seq)]
     incremental = torch.cat(steps, dim=1)
 
@@ -285,7 +285,7 @@ def test_gated_delta_net_writes_cache_buffers_in_place():
     # A captured CUDA graph replays into the buffers it recorded, so the state
     # must stay at one address rather than being rebound to a fresh tensor.
     net = _delta_net()
-    cache = net.make_cache(1, torch.float32, None)
+    cache = net.cache_spec().build(1, 0, torch.float32, None)
     conv, recurrent = cache.conv, cache.recurrent
 
     assert cache.empty

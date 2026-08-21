@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from walnut.cache import CachePool, pages_for
+from walnut.cache import CachePool, pages_for, pages_that_fit
 from walnut.runner.graphs import DecodeGraphs, buckets
 from walnut.scheduler.request import DONE, Request, RequestError, Sequence
 
@@ -39,6 +39,7 @@ class Scheduler:
         autotune: bool = True,
         prefill_chunk: int = 2048,
         kv_tokens: int | None = None,
+        kv_fraction: float = 0.85,
     ) -> None:
         if max_batch_size < 1:
             raise ValueError("max_batch_size must be at least 1")
@@ -53,7 +54,11 @@ class Scheduler:
         self.compile = compile
         self.autotune = autotune
 
-        pages = None if kv_tokens is None else max(1, pages_for(kv_tokens))
+        pages = (
+            self._fit_pages(model, max_batch_size, max_seq_len, kv_fraction)
+            if kv_tokens is None
+            else max(1, pages_for(kv_tokens))
+        )
         self.pool: CachePool = model.make_cache(max_batch_size, max_seq_len, pages)
         # The pool is decoded against from the first step: its rows hold
         # zeros, which is what "no context yet" means to a recurrent state.
@@ -97,6 +102,60 @@ class Scheduler:
         #: not running cannot serve anything, so this turns a later `submit`
         #: into an error rather than a request that waits forever.
         self._stopped: BaseException | None = None
+
+    def _fit_pages(
+        self,
+        model: CausalLM,
+        max_batch_size: int,
+        max_seq_len: int,
+        fraction: float,
+    ) -> int:
+        """How many pages to allocate when the caller did not say.
+
+        Two bounds, and the answer is the smaller.
+
+        The first is *parity*: ``max_batch_size`` rows each able to run to
+        ``max_seq_len``. Nothing above it is reachable, because a row's block
+        table addresses only ``max_seq_len`` and only ``max_batch_size`` rows
+        exist — so this is a ceiling on what the pool could ever hand out, not
+        merely a default.
+
+        The second is what the card has left once the weights are on it.
+        Parity was the whole default before, which made ``--max-batch-size``
+        and ``--max-seq-len`` a joint memory decision: raising either one could
+        turn a working server into one that dies allocating its cache, with
+        nothing in the message to say which knob did it. Sizing to free memory
+        turns that into a smaller pool and a line in the log.
+
+        ``fraction`` is the share of free memory the pool may take. The rest is
+        headroom for what is allocated *after* this — compile workspaces, the
+        graph captures, and the activations of the largest pass the model will
+        run — none of which exists yet to be measured.
+        """
+        parity = max_batch_size * pages_for(max_seq_len)
+        if self.device.type != "cuda":
+            # No allocator to ask, and no fixed budget to fit inside.
+            return parity
+        free, _ = torch.cuda.mem_get_info(self.device)
+        budget = int(free * fraction)
+        fits = pages_that_fit(
+            model.cache_specs(), max_batch_size, budget, model.cache_dtype
+        )
+        if fits < 1:
+            raise RequestError(
+                f"the weights leave {free >> 20} MiB free, which is not enough "
+                f"for one 256-token page of key/value cache across "
+                f"{len(model.cache_specs())} layers; use a smaller model or a "
+                f"larger card"
+            )
+        if fits < parity:
+            logger.info(
+                "kv_pool_fitted_to_memory pages=%d parity=%d free_mib=%d",
+                fits,
+                parity,
+                free >> 20,
+            )
+        return min(parity, fits)
 
     # -- lifecycle ---------------------------------------------------------
 

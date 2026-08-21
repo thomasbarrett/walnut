@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from walnut.cache.batch import Batch
+from walnut.cache.spec import CacheSpec
 from walnut.cache.state import Cache
 
 #: Tokens per page. Not a tuning knob: the paged flash-attention kernel behind
@@ -170,6 +173,30 @@ class CachePool(CacheView):
         self._free_rows = list(range(max_batch_size))
         self._free_pages = list(range(self.SCRATCH + 1, self.pages + 1))
         self._held: dict[int, list[int]] = {}
+
+    @classmethod
+    def from_specs(
+        cls,
+        specs: Sequence[CacheSpec],
+        max_batch_size: int,
+        max_seq_len: int,
+        pages: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None = None,
+    ) -> CachePool:
+        """Allocate a pool from what each layer says it needs.
+
+        One page more than the pool hands out: `SCRATCH`, which idle rows write
+        into and no sequence can hold. It is deliberately not part of `pages` —
+        a caller sizing a pool against free memory is asking how much it can
+        *give away*, and the scratch page is overhead, not inventory.
+        """
+        return cls(
+            [spec.build(max_batch_size, pages + 1, dtype, device) for spec in specs],
+            max_batch_size,
+            max_seq_len,
+            pages,
+        )
 
     def reserve(self, tokens: int) -> int | None:
         """Take a row and the pages for ``tokens``, or None if either is short.

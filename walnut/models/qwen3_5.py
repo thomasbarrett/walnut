@@ -15,7 +15,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from walnut.cache import Batch, Cache, CachePool, CacheView, pages_for
+from walnut.cache import (
+    Batch,
+    Cache,
+    CachePool,
+    CacheSpec,
+    CacheView,
+    pages_for,
+)
 from walnut.layers import (
     Attention,
     FusedLinear,
@@ -90,13 +97,8 @@ class Qwen3_5Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.attn = Attention(self.num_heads, self.num_kv_heads, self.head_dim)
 
-    def make_cache(
-        self,
-        pages: int,
-        dtype: torch.dtype,
-        device: torch.device | str | None,
-    ) -> KVCache:
-        return self.attn.make_cache(pages, dtype, device)
+    def cache_spec(self) -> CacheSpec:
+        return self.attn.cache_spec()
 
     def forward(
         self,
@@ -156,23 +158,18 @@ class Qwen3_5DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def make_cache(
-        self,
-        rows: int,
-        pages: int,
-        dtype: torch.dtype,
-        device: torch.device | str | None,
-    ) -> Cache:
-        """This layer's share of the pool.
+    def cache_spec(self) -> CacheSpec:
+        """What this layer's share of the pool costs, before it is allocated.
 
-        Two sizes because the two mixers hold two kinds of state: full
-        attention takes ``pages`` of the shared key/value pool and no row at
-        all, and linear attention takes a row of recurrent state per sequence
-        and no pages. See `walnut.cache.state`.
+        The two mixers hold two kinds of state and are sized by different
+        things: full attention takes pages of the shared key/value pool and no
+        row at all, and linear attention takes a row of recurrent state per
+        sequence and no pages. Each spec ignores the size it is not sized by.
+        See `walnut.cache.state`.
         """
         if self.block_type == "full_attention":
-            return self.self_attn.make_cache(pages, dtype, device)
-        return self.linear_attn.make_cache(rows, dtype, device)
+            return self.self_attn.cache_spec()
+        return self.linear_attn.cache_spec()
 
     def forward(
         self,
@@ -238,19 +235,18 @@ class Qwen3_5TextModel(nn.Module):
         out — asks the pool for it rather than working it out again.
         """
         pages = max_batch_size * pages_for(max_seq_len) if pages is None else pages
-        return CachePool(
-            [
-                # One page more than the pool hands out: `CachePool.SCRATCH`,
-                # which idle rows write into and no sequence can hold.
-                cast(Qwen3_5DecoderLayer, layer).make_cache(
-                    max_batch_size, pages + 1, dtype, device
-                )
-                for layer in self.layers
-            ],
-            max_batch_size,
-            max_seq_len,
-            pages,
+        return CachePool.from_specs(
+            self.cache_specs(), max_batch_size, max_seq_len, pages, dtype, device
         )
+
+    def cache_specs(self) -> list[CacheSpec]:
+        """Each layer's cache, as a size rather than as storage.
+
+        What `walnut.cache.pages_that_fit` needs to answer "how much of this
+        will the card hold", which is a question that must be answerable
+        without allocating the answer.
+        """
+        return [cast(Qwen3_5DecoderLayer, layer).cache_spec() for layer in self.layers]
 
     def forward(
         self,
@@ -694,6 +690,15 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             device=self.lm_head.weight.device,
             pages=pages,
         )
+
+    def cache_specs(self) -> list[CacheSpec]:
+        """Each layer's cache, as a size. See `Qwen3_5TextModel.cache_specs`."""
+        return self.model.language_model.cache_specs()
+
+    @property
+    def cache_dtype(self) -> torch.dtype:
+        """What a cache built for this model would be stored in."""
+        return self.lm_head.weight.dtype
 
     @torch.no_grad()
     def iter_generate(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -70,6 +71,31 @@ class KVCache(TokenCache):
         self.kv.view(2, -1, heads, dim)[:, cells] = torch.stack(
             (k.reshape(-1, heads, dim), v.reshape(-1, heads, dim))
         )
+
+
+@dataclass(frozen=True)
+class KVCacheSpec:
+    """`KVCache`, as a size and a way to build it.
+
+    Sized by pages and not by rows: keys and values live in one pool that
+    belongs to no row in particular, which is the whole of what paging bought.
+    """
+
+    heads: int
+    dim: int
+
+    def nbytes(self, rows: int, pages: int, dtype: torch.dtype) -> int:
+        # (2, pages, PAGE_SIZE, heads, dim) — keys and values, as one buffer.
+        return 2 * pages * PAGE_SIZE * self.heads * self.dim * dtype.itemsize
+
+    def build(
+        self,
+        rows: int,
+        pages: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> KVCache:
+        return KVCache(pages, self.heads, self.dim, dtype, device)
 
 
 @torch._dynamo.disable
@@ -153,13 +179,9 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scaling = head_dim**-0.5
 
-    def make_cache(
-        self,
-        pages: int,
-        dtype: torch.dtype,
-        device: torch.device | str | None,
-    ) -> KVCache:
-        return KVCache(pages, self.num_kv_heads, self.head_dim, dtype, device)
+    def cache_spec(self) -> KVCacheSpec:
+        """What this layer's keys and values cost, before they are allocated."""
+        return KVCacheSpec(self.num_kv_heads, self.head_dim)
 
     def forward(
         self,
