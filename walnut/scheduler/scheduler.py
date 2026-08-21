@@ -299,7 +299,10 @@ class Scheduler:
         chunk = request.prompt[:, start : start + self.prefill_chunk]
         try:
             positions = torch.arange(start, start + chunk.shape[1], device=self.device)
-            logits = self.model(chunk, positions=positions, cache=self.row_views[row])
+            view = self.row_views[row]
+            logits = self.model(
+                chunk, positions=positions, cache=view, batch=view.batch(positions)
+            )
             sequence.prefilled = start + chunk.shape[1]
             if sequence.prefilled < request.prompt.shape[1]:
                 return
@@ -359,8 +362,12 @@ class Scheduler:
             logits = self.graphs.replay(self.token[:size], rows)
         else:
             positions = rows.to(self.device)
+            view = self.views[size]
             logits = self.decode_forward(
-                self.token[:size], positions=positions, cache=self.views[size]
+                self.token[:size],
+                positions=positions,
+                cache=view,
+                batch=view.batch(positions),
             )
         # Padding rows sample under a live row's settings, so a batch whose
         # requests agree stays a single sampling call. They take no generator:
