@@ -31,6 +31,7 @@ from walnut.bench.online import (
 from walnut.bench.workload import (
     DEFAULT_SHAPE,
     SHAPES,
+    Sharing,
     goodput_config,
     resolve_shape,
 )
@@ -515,6 +516,15 @@ def throughput(
             "--max-seq-len.",
         ),
     ] = None,
+    prefix_checkpoints: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            envvar="WALNUT_PREFIX_CHECKPOINTS",
+            help="Shared prompt prefixes the cache may keep, as `walnut serve` "
+            "takes it. 0 turns prefix reuse off.",
+        ),
+    ] = 16,
     prefill_chunk: Annotated[
         int,
         typer.Option(
@@ -525,6 +535,45 @@ def throughput(
             "every stream already decoding.",
         ),
     ] = 2048,
+    shared_prefix_len: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Leading tokens each prompt shares with others in its group. "
+            "0 sends prompts that agree on nothing, which is what a prefix "
+            "cache cannot help and the right control to measure against.",
+        ),
+    ] = 0,
+    num_prefixes: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Distinct shared prefixes to draw from. 1 is a single system "
+            "prompt behind every request; setting it to --num-prompts means "
+            "no two requests share anything.",
+        ),
+    ] = 1,
+    prefix_distribution: Annotated[
+        str,
+        typer.Option(
+            help="How requests pick their prefix: 'uniform' spreads them "
+            "evenly, 'zipf' concentrates them on the first few, which is how "
+            "prefix popularity actually falls.",
+        ),
+    ] = "uniform",
+    zipf_alpha: Annotated[
+        float, typer.Option(help="Skew for --prefix-distribution zipf.")
+    ] = 1.0,
+    rounds: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Times to run the whole workload, each timed and reported "
+            "separately. The prefix cache is cleared first, so round 1 is cold "
+            "and later rounds are as warm as the workload makes them — which "
+            "is the only honest way to state a prefix-cache speedup.",
+        ),
+    ] = 1,
     num_iters_warmup: NumItersWarmup = 1,
     seed: Annotated[int, typer.Option(help="Seeds prompt generation.")] = 0,
     device: Device = "auto",
@@ -556,6 +605,7 @@ def throughput(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
         prefill_chunk=prefill_chunk,
     )
     try:
@@ -568,6 +618,10 @@ def throughput(
                 seed=seed,
                 label=label,
                 out=out,
+                sharing=Sharing(
+                    shared_prefix_len, num_prefixes, prefix_distribution, zipf_alpha
+                ),
+                rounds=rounds,
             )
         )
     except BenchError as exc:
@@ -604,6 +658,15 @@ def startup(
             "--max-seq-len.",
         ),
     ] = None,
+    prefix_checkpoints: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            envvar="WALNUT_PREFIX_CHECKPOINTS",
+            help="Shared prompt prefixes the cache may keep, as `walnut serve` "
+            "takes it. 0 turns prefix reuse off.",
+        ),
+    ] = 16,
     device: Device = "auto",
     dtype: Dtype = "auto",
     cuda_graph: CudaGraph = True,
@@ -632,6 +695,7 @@ def startup(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         kv_tokens=kv_tokens,
+        prefix_checkpoints=prefix_checkpoints,
     )
     try:
         raise typer.Exit(

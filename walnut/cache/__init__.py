@@ -47,6 +47,7 @@ within those buffers, which is the half that paging and prefix sharing change.
 
 from walnut.cache.batch import Batch
 from walnut.cache.pool import PAGE_SIZE, CachePool, CacheView, pages_for
+from walnut.cache.radix import Checkpoints, PrefixCache
 from walnut.cache.state import Cache, StateCache, TokenCache
 
 __all__ = [
@@ -55,6 +56,8 @@ __all__ = [
     "Cache",
     "CachePool",
     "CacheView",
+    "Checkpoints",
+    "PrefixCache",
     "StateCache",
     "TokenCache",
     "pages_for",

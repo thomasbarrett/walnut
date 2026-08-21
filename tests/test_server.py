@@ -181,3 +181,53 @@ def test_seed_and_ignore_eos_reach_the_engine():
     assert engine.config is not None
     assert engine.config.seed == 7
     assert engine.config.ignore_eos is True
+
+
+class _StubEngine(Engine):
+    """An engine with a prefix cache, as far as the HTTP layer can tell."""
+
+    model_id = "test-model"
+
+    def __init__(self) -> None:
+        self.prefix: dict = {"hits": 0, "tokens_saved": 0, "hit_rate": 0.0}
+
+    def complete(self, messages, config):
+        return Completion(text="ok", usage=Usage(1, 1))
+
+    def prefix_stats(self) -> dict:
+        return dict(self.prefix)
+
+    def reset_prefix_cache(self) -> None:
+        self.prefix = {"hits": 0, "tokens_saved": 0, "hit_rate": 0.0}
+
+
+class _BareEngine(Engine):
+    """An engine that caches nothing, which the endpoints must not pretend
+    otherwise about."""
+
+    model_id = "test-model"
+
+    def complete(self, messages, config):
+        return Completion(text="ok", usage=Usage(1, 1))
+
+
+def test_reset_prefix_cache_reports_what_it_forgot():
+    """A benchmark has to be able to say whether it measured a cold cache; the
+    endpoint returns the counters it is clearing so the caller can record
+    them."""
+    engine = _StubEngine()
+    engine.prefix = {"hits": 3, "tokens_saved": 768, "hit_rate": 0.5}
+    with TestClient(create_app(engine)) as client:
+        assert client.get("/prefix_cache_stats").json()["hits"] == 3
+        body = client.post("/reset_prefix_cache").json()
+        assert body["status"] == "reset"
+        assert body["before"]["tokens_saved"] == 768
+        assert client.get("/prefix_cache_stats").json()["hits"] == 0
+
+
+def test_an_engine_without_a_prefix_cache_says_so():
+    """Rather than reporting a zero hit rate, which reads as a cache that ran
+    and did nothing."""
+    with TestClient(create_app(_BareEngine())) as client:
+        assert client.post("/reset_prefix_cache").status_code == 501
+        assert client.get("/prefix_cache_stats").status_code == 501

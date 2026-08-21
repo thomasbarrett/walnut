@@ -41,6 +41,9 @@ def test_serve_passes_the_speed_flags_through(monkeypatch):
         dtype = "float32"
         max_batch_size = 8
         max_seq_len = 8192
+        kv_capacity = 65536
+        kv_bytes = 1 << 30
+        prefix_bytes = 1 << 28
 
         def start(self):
             pass

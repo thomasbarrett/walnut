@@ -26,7 +26,7 @@ from walnut.bench.report import (
     report_throughput,
     write_record,
 )
-from walnut.bench.workload import Shape, build_workload
+from walnut.bench.workload import Shape, Sharing, build_workload
 
 
 @dataclass
@@ -43,6 +43,7 @@ class EngineOptions:
     max_batch_size: int = 1
     max_seq_len: int | None = None
     kv_tokens: int | None = None
+    prefix_checkpoints: int = 16
     prefill_chunk: int = 2048
 
     def load(self) -> Any:
@@ -63,6 +64,7 @@ class EngineOptions:
             max_batch_size=self.max_batch_size,
             max_seq_len=self.max_seq_len,
             kv_tokens=self.kv_tokens,
+            prefix_checkpoints=self.prefix_checkpoints,
             prefill_chunk=self.prefill_chunk,
         )
 
@@ -251,6 +253,8 @@ def run_throughput(
     seed: int,
     label: str | None,
     out: str | None,
+    sharing: Sharing | None = None,
+    rounds: int = 1,
 ) -> int:
     from walnut.engine import GenerationConfig
 
@@ -266,16 +270,26 @@ def run_throughput(
         seed=seed,
         ignore_eos=True,
     )
-    prompts = build_workload(shape, num_prompts, engine.tokenizer, random.Random(seed))
+    prompts = build_workload(
+        shape, num_prompts, engine.tokenizer, random.Random(seed), sharing
+    )
 
     # A full batch, not one request: compilation is per decode bucket, and a
     # single-request warm-up leaves larger buckets to compile mid-measurement.
     for _ in range(num_iters_warmup):
         drain(engine, prompts[: opts.max_batch_size], GenerationConfig(max_tokens=8))
+    # The warm-up sends the very prompts the measurement is about to send, so
+    # it leaves the prefix cache holding exactly what the run would otherwise
+    # be discovering. Cleared, so round 1 below is honestly cold.
+    engine.reset_prefix_cache()
 
-    start = time.perf_counter()
-    streams, errors = drain(engine, prompts, config)
-    duration = time.perf_counter() - start
+    timed = []
+    for _ in range(rounds):
+        start = time.perf_counter()
+        streams, errors = drain(engine, prompts, config)
+        timed.append((time.perf_counter() - start, engine.prefix_stats()))
+        engine.clear_prefix_stats()
+    duration = timed[-1][0]
 
     completed = [s for s in streams if s.usage.completion_tokens > 0]
     if not completed:
@@ -297,6 +311,12 @@ def run_throughput(
         "max_tokens": max_tokens,
         "seed": seed,
         "num_iters_warmup": num_iters_warmup,
+        "shared_prefix_len": sharing.prefix_len if sharing else 0,
+        "num_prefixes": sharing.groups if sharing else 0,
+        "prefix_distribution": sharing.distribution if sharing else None,
+        "kv_tokens": engine.kv_capacity,
+        "rounds": [{"duration_s": d, **stats} for d, stats in timed],
+        "prefix_cache": timed[-1][1],
         "completed": len(completed),
         "failed": len(streams) - len(completed),
         "errors": sorted(set(errors))[:5],

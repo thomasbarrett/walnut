@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import insort
+from collections.abc import Container
+
 import torch
 
 from walnut.cache.batch import Batch
@@ -171,32 +174,54 @@ class CachePool(CacheView):
         self._free_pages = list(range(self.SCRATCH + 1, self.pages + 1))
         self._held: dict[int, list[int]] = {}
 
-    def reserve(self, tokens: int) -> int | None:
+    def reserve(self, tokens: int, shared: int = 0) -> int | None:
         """Take a row and the pages for ``tokens``, or None if either is short.
 
         Lowest free row first, which keeps the live set dense — a decode step
         runs whole buckets, so a sequence parked in a high row costs every step
         the rows beneath it. Pages come off the free list in whatever order
         they were returned, because a paged read does not care.
+
+        ``shared`` says the first that many pages are coming from somewhere
+        else — a prefix tree lending pages another sequence already built — so
+        they are neither allocated nor written into the block table here. The
+        caller fills them in; see `walnut.cache.radix.PrefixCache`.
         """
         # At least one page even for a zero-token reservation: a row with an
         # empty block table addresses `SCRATCH`, which is not storage anyone
         # may keep a sequence in.
         want = max(1, pages_for(tokens))
-        if not self._free_rows or want > len(self._free_pages) or want > self.per_row:
+        need = want - shared
+        if not self._free_rows or need > len(self._free_pages) or want > self.per_row:
             return None
+        # A sequence always writes somewhere: `shared` counts pages of a prompt
+        # it can skip, and it was never allowed to skip the whole thing.
+        assert need > 0
         row = self._free_rows.pop(0)
-        pages = [self._free_pages.pop() for _ in range(want)]
+        pages = [self._free_pages.pop(0) for _ in range(need)]
         self._held[row] = pages
         table = self.block_table[row]
         # Cleared first, so the pages past this sequence's own point at
         # `SCRATCH` rather than at what the last holder of this row was using.
         table.zero_()
-        table[:want] = torch.tensor(pages, dtype=torch.int32, device=table.device)
+        table[shared:want] = torch.tensor(pages, dtype=torch.int32, device=table.device)
         return row
 
-    def release(self, row: int) -> None:
+    def held(self, row: int) -> tuple[int, ...]:
+        """The pages ``row`` was allocated, in the order it writes them."""
+        return tuple(self._held.get(row, ()))
+
+    def free_page(self, page: int) -> None:
+        """Return one page held outside any row, as a prefix tree holds them."""
+        insort(self._free_pages, page)
+
+    def release(self, row: int, keep: Container[int] = ()) -> None:
         """Give a finished sequence's row and pages back.
+
+        ``keep`` names pages that are not going back to the free list because
+        something outlasting the sequence has taken them over — a prefix tree
+        grafting the cache this sequence built onto a shared trie. They are
+        still this row's to give up; they are just not free afterwards.
 
         Clearing the block table is not tidying: it points the row at `SCRATCH`
         again, which is what keeps the decode steps it goes on taking as an
@@ -206,7 +231,9 @@ class CachePool(CacheView):
         if pages is None:
             return
         self.block_table[row].zero_()
-        self._free_pages.extend(pages)
+        for page in pages:
+            if page not in keep:
+                insort(self._free_pages, page)
         self._free_rows.append(row)
         self._free_rows.sort()
 

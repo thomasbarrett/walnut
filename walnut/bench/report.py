@@ -347,6 +347,7 @@ def report_throughput(record: dict[str, Any]) -> None:
     line("Output throughput (tok/s):", record["output_throughput"], ".2f")
     line("Total throughput (tok/s):", record["total_token_throughput"], ".2f")
     rule()
+    _print_prefix_cache(record)
     if record["failed"]:
         print(f"\n! {record['failed']} requests failed:")
         for error in record["errors"]:
@@ -403,4 +404,62 @@ def startup_warnings(record: dict[str, Any]) -> None:
             "\n! --num-iters-warmup 0: the first measured iteration paid for "
             "compilation and graph\n  capture from cold, which is a first-build "
             "cost, not what a restart pays."
+        )
+
+
+def _print_prefix_cache(record: dict) -> None:
+    """What the prefix cache did, per round, and whether it could have helped.
+
+    Printed rather than buried in the JSON because a prefix-cache measurement
+    fails silently: a run whose cache never hit looks exactly like a run whose
+    cache does not work, and both look like an ordinary throughput number. The
+    hit rate is over prompt tokens, which is what the cache actually skips.
+    """
+    rounds = record.get("rounds") or []
+    stats = record.get("prefix_cache") or {}
+    if not rounds or not stats.get("checkpoint_capacity"):
+        return
+
+    shared = record["shared_prefix_len"]
+    within = (
+        f"{shared} shared tokens x {record['num_prefixes']} prefixes, "
+        f"{record['prefix_distribution']}"
+        if shared
+        else "nothing shared within a round"
+    )
+    print(f"\nPrefix cache ({within}; {len(rounds)} round(s) of the same prompts)")
+    print(
+        f"{'round':>6}{'duration (s)':>14}{'hit rate':>10}"
+        f"{'tokens saved':>14}{'checkpoints':>13}"
+    )
+    for index, entry in enumerate(rounds, start=1):
+        print(
+            f"{index:>6}{entry['duration_s']:>14.2f}"
+            f"{entry['hit_rate']:>9.1%}{entry['tokens_saved']:>14,}"
+            f"{entry['checkpoints']:>8}/{entry['checkpoint_capacity']:<4}"
+        )
+
+    if shared == 0 and len(rounds) > 1:
+        print(
+            "\n! nothing is shared *within* a round, but every round sends the "
+            "same\n  prompts, so rounds after the first are exact repeats — the "
+            "strongest\n  case a prefix cache has, not the control. The control "
+            "is --rounds 1."
+        )
+    elif shared == 0:
+        print(
+            "\n  Nothing was shared, so nothing could be reused. This is the "
+            "control:\n  it says what the cache costs, not what it saves. "
+            "Pass --shared-prefix-len\n  to measure the other half."
+        )
+    elif stats["hit_rate"] == 0.0:
+        held = record["kv_tokens"]
+        print(
+            f"\n! the cache never hit. {held:,} tokens of KV hold the "
+            f"{record['max_batch_size']} running\n  sequences first, and "
+            "cache only what is left over; if a prefix is evicted before\n"
+            "  it comes round again, no round is ever warm. Raise "
+            "--kv-tokens, or\n  --prefix-checkpoints if it is short of "
+            f"those ({stats['checkpoints']}/"
+            f"{stats['checkpoint_capacity']} used)."
         )

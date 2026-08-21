@@ -6,6 +6,8 @@ OpenAI client) needs:
 - ``GET  /v1/models``            — list the loaded model
 - ``POST /v1/chat/completions``  — generate a completion (streaming optional)
 - ``GET  /metrics``              — Prometheus metrics
+- ``POST /reset_prefix_cache``   — forget every cached prefix (benchmarks)
+- ``GET  /prefix_cache_stats``   — what the prefix cache has done since then
 - ``POST /start_profile``        — open a torch profiler window (opt-in)
 - ``POST /stop_profile``         — close it and write a trace
 
@@ -367,6 +369,40 @@ def create_app(engine: Engine, profiler: TorchProfiler | None = None) -> FastAPI
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"status": "stopped", **artifacts.as_dict()}
+
+    @app.post("/reset_prefix_cache", include_in_schema=False)
+    async def reset_prefix_cache() -> dict:
+        """Forget every cached prefix, and the counters describing them.
+
+        For benchmarks, which cannot otherwise say whether a number was
+        measured against a cold cache or one the warm-up had already filled
+        with the very prompts about to be sent. Named as vLLM names it, so a
+        harness driving both does not need to know which it is talking to.
+        """
+        stats = getattr(engine, "prefix_stats", None)
+        reset = getattr(engine, "reset_prefix_cache", None)
+        if reset is None or stats is None:
+            raise HTTPException(
+                status_code=501, detail="this engine has no prefix cache"
+            )
+        before = stats()
+        reset()
+        return {"status": "reset", "before": before}
+
+    @app.get("/prefix_cache_stats", include_in_schema=False)
+    async def prefix_cache_stats() -> dict:
+        """What the prefix cache has done since it was last reset.
+
+        A hit rate is the one number that says whether a prefix-cache
+        measurement measured anything, so it has to be readable from outside
+        the process the engine runs in.
+        """
+        stats = getattr(engine, "prefix_stats", None)
+        if stats is None:
+            raise HTTPException(
+                status_code=501, detail="this engine has no prefix cache"
+            )
+        return stats()
 
     return app
 
