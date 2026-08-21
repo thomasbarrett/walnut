@@ -31,13 +31,20 @@ class _StepModel:
         self.fail = False
         self.crash = False
 
+    cache_dtype = torch.float32
+
+    def cache_specs(self):
+        return [self.attn.cache_spec()]
+
     def make_cache(self, max_batch_size, max_seq_len, pages=None):
         pages = max_batch_size * pages_for(max_seq_len) if pages is None else pages
-        return CachePool(
-            [self.attn.make_cache(pages + 1, torch.float32, None)],
+        return CachePool.from_specs(
+            self.cache_specs(),
             max_batch_size,
             max_seq_len,
             pages,
+            torch.float32,
+            None,
         )
 
     def __call__(self, input_ids, positions, cache, batch=None):

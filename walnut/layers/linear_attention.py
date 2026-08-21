@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -84,6 +85,54 @@ class ConvState(StateCache):
         state.recurrent = self.recurrent[start:stop]
         state.primed = self.primed
         return state
+
+
+@dataclass(frozen=True)
+class ConvStateSpec:
+    """`ConvState`, as a size and a way to build it.
+
+    Sized by rows and not by pages, which is the same statement `StateCache`
+    makes about sharing: a fixed summary per sequence, however long that
+    sequence runs.
+
+    The two halves are not the same dtype. The conv window holds activations
+    and follows the model; the delta rule accumulates in float32 whatever the
+    model is, so a bf16 model still pays four bytes a cell for it.
+    """
+
+    conv_dim: int
+    conv_kernel_size: int
+    num_value_heads: int
+    key_head_dim: int
+    value_head_dim: int
+
+    def nbytes(self, rows: int, pages: int, dtype: torch.dtype) -> int:
+        window = self.conv_dim * (self.conv_kernel_size - 1) * dtype.itemsize
+        recurrent = (
+            self.num_value_heads
+            * self.key_head_dim
+            * self.value_head_dim
+            * torch.float32.itemsize
+        )
+        return rows * (window + recurrent)
+
+    def build(
+        self,
+        rows: int,
+        pages: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None,
+    ) -> ConvState:
+        return ConvState(
+            rows,
+            self.conv_dim,
+            self.conv_kernel_size,
+            self.num_value_heads,
+            self.key_head_dim,
+            self.value_head_dim,
+            dtype,
+            device,
+        )
 
 
 def _recurrent_gated_delta_rule(
@@ -300,27 +349,14 @@ class GatedDeltaNet(nn.Module):
             },
         )
 
-    def make_cache(
-        self,
-        rows: int,
-        dtype: torch.dtype,
-        device: torch.device | str | None,
-    ) -> ConvState:
-        """Fresh recurrent state, one row per sequence in flight.
-
-        No page count and no context length: this state is a fixed summary
-        however long the sequence runs, which is the whole reason it cannot be
-        paged.
-        """
-        return ConvState(
-            rows,
+    def cache_spec(self) -> ConvStateSpec:
+        """What this layer's recurrent state costs, before it is allocated."""
+        return ConvStateSpec(
             self.conv_dim,
             self.conv_kernel_size,
             self.num_v_heads,
             self.head_k_dim,
             self.head_v_dim,
-            dtype,
-            device,
         )
 
     def forward(

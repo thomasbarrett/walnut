@@ -61,6 +61,16 @@ back when it finishes. `--kv-tokens` sizes that pool, defaulting to
 run to the full context at once, which is what the cache cost before it was
 paged.
 
+That figure is a ceiling rather than a demand: nothing above it is reachable,
+since only `--max-batch-size` rows exist and each addresses at most
+`--max-seq-len`. When it does not fit the card, the pool is sized to free
+memory instead and the choice is logged, rather than the server dying while it
+allocates. `--kv-fraction` (default 0.85) is the share of free memory it may
+take; the rest is headroom for what is allocated after it — compile
+workspaces, the decode graph captures, and the activations of the largest pass.
+Setting `--kv-tokens` opts out of the fitting entirely and asks for exactly
+that much.
+
 `--max-seq-len` is now a bound on one sequence rather than on the pool: prompt
 plus completion, defaulting to the checkpoint's own limit capped at 8192. A
 request longer than that is rejected with a 400, as is one that could not fit

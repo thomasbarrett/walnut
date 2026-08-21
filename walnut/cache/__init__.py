@@ -47,6 +47,7 @@ within those buffers, which is the half that paging and prefix sharing change.
 
 from walnut.cache.batch import Batch
 from walnut.cache.pool import PAGE_SIZE, CachePool, CacheView, pages_for
+from walnut.cache.spec import CacheSpec, nbytes, pages_that_fit
 from walnut.cache.state import Cache, StateCache, TokenCache
 
 __all__ = [
@@ -54,8 +55,11 @@ __all__ = [
     "Batch",
     "Cache",
     "CachePool",
+    "CacheSpec",
     "CacheView",
     "StateCache",
     "TokenCache",
+    "nbytes",
     "pages_for",
+    "pages_that_fit",
 ]

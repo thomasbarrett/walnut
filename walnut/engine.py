@@ -361,6 +361,7 @@ class TorchEngine(Engine):
         max_seq_len: int | None = None,
         prefill_chunk: int = 2048,
         kv_tokens: int | None = None,
+        kv_fraction: float = 0.85,
     ) -> None:
         self.model_id = model_id
         self.cuda_graph = cuda_graph
@@ -373,6 +374,7 @@ class TorchEngine(Engine):
         self.max_seq_len = resolve_max_seq_len(max_seq_len, config)
         self.prefill_chunk = prefill_chunk
         self.kv_tokens = kv_tokens
+        self.kv_fraction = kv_fraction
         model_class = resolve_model_class(config)
         with _build_on(self.device, self.dtype):
             model: Any = model_class(config)
@@ -387,6 +389,7 @@ class TorchEngine(Engine):
             max_batch_size=max_batch_size,
             max_seq_len=self.max_seq_len,
             kv_tokens=kv_tokens,
+            kv_fraction=kv_fraction,
             cuda_graph=cuda_graph,
             compile=compile,
             autotune=autotune,
@@ -503,6 +506,7 @@ def load_model(
     max_seq_len: int | None = None,
     prefill_chunk: int = 2048,
     kv_tokens: int | None = None,
+    kv_fraction: float = 0.85,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
@@ -518,7 +522,8 @@ def load_model(
     `walnut.scheduler.Scheduler` and `resolve_max_seq_len`. ``kv_tokens`` is
     how much key/value cache the whole batch shares, defaulting to
     ``max_batch_size * max_seq_len`` — the point at which every request could
-    run to the full context at once. Requests take pages from it as they need
+    run to the full context at once — or to whatever ``kv_fraction`` of free
+    memory holds, if that is less. Requests take pages from it as they need
     them, so a lower figure serves the same batch whenever prompts are shorter
     than the context allows. ``prefill_chunk`` is how many prompt tokens run
     between decode steps, which bounds the gap a prompt puts in every other
@@ -535,4 +540,5 @@ def load_model(
         max_seq_len=max_seq_len,
         prefill_chunk=prefill_chunk,
         kv_tokens=kv_tokens,
+        kv_fraction=kv_fraction,
     )

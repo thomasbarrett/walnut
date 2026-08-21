@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     import torch
 
-    from walnut.cache import Batch, CachePool, CacheView
+    from walnut.cache import Batch, CachePool, CacheSpec, CacheView
     from walnut.runner.sampling import Sampler
 
 
@@ -63,6 +63,9 @@ class CausalLM(Forward, Protocol):
     #: constrained decode) and the loop should not have to know that it does.
     sampler: Sampler
 
+    #: What a cache built for this model would be stored in.
+    cache_dtype: torch.dtype
+
     def make_cache(
         self, max_batch_size: int, max_seq_len: int, pages: int | None = None
     ) -> CachePool:
@@ -70,5 +73,15 @@ class CausalLM(Forward, Protocol):
 
         The model decides what its layers need; the caller decides only how
         much of it there is to go around.
+        """
+        ...
+
+    def cache_specs(self) -> list[CacheSpec]:
+        """The same thing as a size, before any of it is allocated.
+
+        Separate from `make_cache` because a caller that wants to fit the pool
+        to the card has to be able to ask what a pool would cost without
+        building one — finding out by allocating is how a server dies at
+        start-up instead of starting smaller.
         """
         ...
