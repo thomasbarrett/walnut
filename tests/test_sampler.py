@@ -1,6 +1,7 @@
 import torch
 
-from walnut.sampler import Sampler, SamplingParams
+from walnut.runner.sampling import Sampler
+from walnut.scheduler import SamplingParams
 
 sample = Sampler()
 

@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from walnut.cache import Batch, Cache, CachePool, CacheView, pages_for
-from walnut.graph import DecodeGraph
 from walnut.layers import (
     Attention,
     FusedLinear,
@@ -32,7 +31,9 @@ from walnut.layers import (
 from walnut.layers.attention import KVCache
 from walnut.layers.linear_attention import ConvState
 from walnut.models.loader import copy_weights
-from walnut.sampler import Sampler, SamplingParams
+from walnut.runner.graphs import DecodeGraph
+from walnut.runner.sampling import Sampler
+from walnut.scheduler.request import SamplingParams
 
 
 class Qwen3_5MLP(nn.Module):
