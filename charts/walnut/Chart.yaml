@@ -2,7 +2,7 @@ apiVersion: v2
 name: walnut
 description: OpenAI-compatible inference server for walnut.
 type: application
-version: 0.3.0
+version: 1.0.0
 appVersion: 0.1.0
 home: https://github.com/thomasbarrett/walnut
 sources:
