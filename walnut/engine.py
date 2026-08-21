@@ -304,15 +304,16 @@ def _load_hf_weights(model: Any, model_id: str, device: torch.device) -> None:
     model.load_weights(weights())
 
 
-#: Context length to preallocate the KV pool for when nothing says otherwise.
-#: The pool costs ``max_batch_size * max_seq_len`` tokens of KV whether or not
-#: any request is that long, and a checkpoint's own limit is often six figures,
-#: so the default is a serving-shaped one rather than the model's ceiling.
+#: Longest single sequence to allow when nothing says otherwise. It bounds one
+#: request rather than the pool — pages are drawn per request now — but it
+#: still sets the pool's default size, and a checkpoint's own limit is often
+#: six figures, so the default is a serving-shaped one rather than the model's
+#: ceiling.
 DEFAULT_MAX_SEQ_LEN = 8192
 
 
 def resolve_max_seq_len(max_seq_len: int | None, config: Any) -> int:
-    """Context length per slot: the request, else the checkpoint's own limit
+    """Longest single sequence: the request, else the checkpoint's own limit
     capped at `DEFAULT_MAX_SEQ_LEN`."""
     if max_seq_len is not None:
         if max_seq_len < 1:
@@ -360,6 +361,7 @@ class TorchEngine(Engine):
         max_batch_size: int = 8,
         max_seq_len: int | None = None,
         prefill_chunk: int = 2048,
+        kv_tokens: int | None = None,
     ) -> None:
         self.model_id = model_id
         self.cuda_graph = cuda_graph
@@ -371,6 +373,7 @@ class TorchEngine(Engine):
         self.max_batch_size = max_batch_size
         self.max_seq_len = resolve_max_seq_len(max_seq_len, config)
         self.prefill_chunk = prefill_chunk
+        self.kv_tokens = kv_tokens
         model_class = resolve_model_class(config)
         with _build_on(self.device, self.dtype):
             model: Any = model_class(config)
@@ -384,6 +387,7 @@ class TorchEngine(Engine):
             self.device,
             max_batch_size=max_batch_size,
             max_seq_len=self.max_seq_len,
+            kv_tokens=kv_tokens,
             cuda_graph=cuda_graph,
             compile=compile,
             autotune=autotune,
@@ -499,6 +503,7 @@ def load_model(
     max_batch_size: int = 8,
     max_seq_len: int | None = None,
     prefill_chunk: int = 2048,
+    kv_tokens: int | None = None,
 ) -> TorchEngine:
     """Load ``model`` (a Hugging Face id or local path) into a `TorchEngine`.
 
@@ -509,11 +514,16 @@ def load_model(
     has that compile benchmark a Triton template per projection rather than
     take cuBLAS on faith; it is ignored without ``compile``.
 
-    ``max_batch_size`` is how many requests the scheduler decodes as one batch,
-    and ``max_seq_len`` the context each of its slots is preallocated for; see
-    `walnut.scheduler.Scheduler` and `resolve_max_seq_len`. ``prefill_chunk``
-    is how many prompt tokens run between decode steps, which bounds the gap a
-    prompt puts in every other request's token stream.
+    ``max_batch_size`` is how many requests the scheduler decodes as one batch
+    and ``max_seq_len`` the longest single sequence; see
+    `walnut.scheduler.Scheduler` and `resolve_max_seq_len`. ``kv_tokens`` is
+    how much key/value cache the whole batch shares, defaulting to
+    ``max_batch_size * max_seq_len`` — the point at which every request could
+    run to the full context at once. Requests take pages from it as they need
+    them, so a lower figure serves the same batch whenever prompts are shorter
+    than the context allows. ``prefill_chunk`` is how many prompt tokens run
+    between decode steps, which bounds the gap a prompt puts in every other
+    request's token stream.
     """
     return TorchEngine(
         model_id=model,
@@ -525,4 +535,5 @@ def load_model(
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         prefill_chunk=prefill_chunk,
+        kv_tokens=kv_tokens,
     )

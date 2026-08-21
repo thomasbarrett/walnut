@@ -5,20 +5,24 @@ host can issue at the rate the GPU retires them. Capturing the step once and
 replaying it turns those launches into a single call.
 
 Capture requires every buffer the step touches to keep a fixed address, which
-is what `KVCache` and `ConvState` provide. Warm-up and capture run the step for
-real, so a cache holding state a sequence still needs is snapshotted first and
-restored afterwards — see ``restore``, which a pool does not need and cannot
-afford, being the size of every slot at once.
+is what `KVCache` and `ConvState` provide — and, once the cache is paged, what
+the pool's block table provides too: *which* pages a row is holding changes
+under a captured graph every time a sequence retires, and the graph reads them
+because it recorded a lookup into that table rather than the pages it found
+there. Warm-up and capture run the step for real, so a cache holding state a
+sequence still needs is snapshotted first and restored afterwards — see
+``restore``, which a pool does not need and cannot afford, being the size of
+every row and page at once.
 
 A capture also fixes the batch size, which a serving batch does not hold still.
 `DecodeGraphs` answers that the way vLLM does: capture a graph per power-of-two
 batch size, replay the smallest one that fits, and let the spare rows compute
-against slots that belong to no one.
+against pages that belong to no one.
 
 Context length would be a second such axis, except that `Attention` decodes
 through `varlen_attn`, which takes each row's length as a *tensor*. Length is
 therefore data inside the graph rather than shape around it, and one capture
-per batch size serves a slot at any point in its sequence.
+per batch size serves a row at any point in its sequence.
 """
 
 from __future__ import annotations
@@ -53,7 +57,7 @@ class DecodeGraph:
         self.restore = restore
         self.token = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
         self.position = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-        # Views, so a graph over a bucket touches only the slots and positions
+        # Views, so a graph over a bucket addresses only the rows and positions
         # it covers while still writing the pool every other bucket reads.
         self.cache = cache.view(0, batch_size)
         self.capture(model, warmup)
@@ -68,7 +72,7 @@ class DecodeGraph:
         already holds a sequence's state — hence the snapshot. It costs a copy
         of every buffer the graph covers, so ``restore=False`` says the caller
         does not need one: `walnut.scheduler` captures against an empty pool
-        and resets a slot before assigning it, and cloning a whole pool per
+        and resets a row before assigning it, and cloning a whole pool per
         bucket would put peak memory at twice the cache it just allocated.
         """
         buffers = self.cache.buffers() if self.restore else []
@@ -148,8 +152,9 @@ class DecodeGraphs:
         """Run the smallest captured step covering ``token``'s rows.
 
         The padding rows keep the tokens and positions of whatever ran before,
-        which is harmless: a row's arithmetic reads and writes only its own
-        cache slot, and slots outside the live set belong to no sequence.
+        which is harmless: a row's arithmetic reads and writes only the pages
+        its own block table names, and a row outside the live set has an empty
+        table, which names `walnut.cache.CachePool.SCRATCH` and nothing else.
         """
         rows = token.shape[0]
         size = min(s for s in self.graphs if s >= rows)
