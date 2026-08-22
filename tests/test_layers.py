@@ -441,3 +441,101 @@ def test_a_conv_state_view_stays_primed():
     assert state.empty
     state.prime()
     assert not state.empty and not state.view(0, 1).empty
+
+
+def test_fused_linear_joint_and_offset_agree_with_the_split():
+    """`joint` is what `forward` splits, and `offset` says where each part is."""
+    from walnut.layers.linear import FusedLinear
+
+    torch.manual_seed(0)
+    layer = FusedLinear(8, {"a": 3, "b": 5, "c": 2})
+    x = torch.randn(2, 8)
+    joint = layer.joint(x)
+
+    total = 0
+    for name, width in layer.parts.items():
+        assert layer.offset(name) == total
+        total += width
+    assert total == joint.shape[-1]
+
+    for part, (name, width) in zip(layer(x), layer.parts.items(), strict=True):
+        start = layer.offset(name)
+        assert torch.equal(part, joint[..., start : start + width])
+
+    with pytest.raises(KeyError):
+        layer.offset("nope")
+
+
+def test_delta_kernel_declines_shapes_it_cannot_index():
+    """Both head dimensions index a Triton block, so both must be powers of two,
+    and the value heads must partition over the key heads."""
+    from walnut.layers import delta_kernel
+
+    assert delta_kernel.supported(128, 128, 16, 16) is delta_kernel.HAVE_TRITON
+    assert not delta_kernel.supported(96, 128, 16, 16)
+    assert not delta_kernel.supported(128, 96, 16, 16)
+    assert not delta_kernel.supported(128, 128, 5, 16)
+
+
+@cuda_only
+def test_fused_decode_matches_the_pytorch_path():
+    """The Triton decode step is the same arithmetic as the chain it replaces,
+    so it must agree on the output *and* on both cache buffers it advances."""
+    torch.manual_seed(0)
+    net = GatedDeltaNet(
+        hidden_size=64,
+        num_key_heads=4,
+        num_value_heads=4,
+        key_head_dim=16,
+        value_head_dim=16,
+        conv_kernel_dim=4,
+    ).to("cuda", torch.bfloat16)
+    assert net._fusable
+
+    rows, prompt = 3, 7
+    prime = torch.randn(rows, prompt, 64, **_HALF)
+    step = torch.randn(rows, 1, 64, **_HALF)
+
+    def run(fused: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        net._fusable = fused
+        cache = net.make_cache(rows, torch.bfloat16, "cuda")
+        net(prime, cache)
+        out = net(step, cache)
+        return out, cache.conv.clone(), cache.recurrent.clone()
+
+    for want, got in zip(run(False), run(True), strict=True):
+        assert torch.allclose(want.float(), got.float(), atol=2e-2, rtol=2e-2)
+
+
+@cuda_only
+def test_fused_decode_runs_only_for_a_single_position_with_state(monkeypatch):
+    """Prefill fills the GPU on its own and has no state to step from, so the
+    kernel must not claim it -- the chunked rule owns every other shape."""
+    from walnut.layers import delta_kernel
+
+    net = GatedDeltaNet(
+        hidden_size=64,
+        num_key_heads=4,
+        num_value_heads=4,
+        key_head_dim=16,
+        value_head_dim=16,
+        conv_kernel_dim=4,
+    ).to("cuda", torch.bfloat16)
+    calls = []
+    real = delta_kernel.gated_delta_decode
+
+    def spy(*args: Any, **kwargs: Any) -> torch.Tensor:
+        calls.append(len(calls))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(delta_kernel, "gated_delta_decode", spy)
+
+    cache = net.make_cache(1, torch.bfloat16, "cuda")
+    net(torch.randn(1, 5, 64, **_HALF), cache)  # prefill: no state yet
+    assert not calls
+    net(torch.randn(1, 1, 64, **_HALF), cache)  # decode
+    assert len(calls) == 1
+    net(torch.randn(1, 3, 64, **_HALF), cache)  # a chunk, not a position
+    assert len(calls) == 1
+    net(torch.randn(1, 1, 64, **_HALF))  # no cache at all
+    assert len(calls) == 1

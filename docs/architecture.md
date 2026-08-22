@@ -100,6 +100,17 @@ prefill, where causal alignment makes a prompt's own mask. Paging is the other
 half of the same argument: a row's keys are no longer a contiguous run, so the
 kernel is handed the row's block table and follows it page by page.
 
+Almost all of the arithmetic is PyTorch, compiled by Inductor. The one
+exception is the gated delta rule's decode step, in
+`walnut/layers/delta_kernel.py`: a single position through a linear-attention
+layer is a causal conv, a norm and one rank-1 state update, which Inductor
+splits into ten kernels a layer that between them move about a tenth of the
+memory their launches cost. Two hand-written Triton kernels do the same
+arithmetic in the same precisions, and on an RTX 5090 take a decode step from
+355 kernels to 265. Prefill does not go through them -- its sequence axis fills
+the GPU on its own -- and neither does a head shape they cannot index, which
+falls back to the PyTorch path.
+
 Two things follow from batching that a single-request engine does not have.
 Output is **batch-dependent**: the kernels are not batch-invariant, so a greedy
 request can pick a different token when it runs alongside others than it would
