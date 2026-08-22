@@ -386,12 +386,23 @@ class _Recording(_StepModel):
         self.positions.append(positions.clone())
         return super().__call__(input_ids, positions=positions, cache=cache)
 
+    def forget(self) -> None:
+        """Drop what start-up ran, so only the serving passes are asserted on.
+
+        `Scheduler.start` warms the prefill branch, which is a forward like any
+        other and would otherwise read as a chunk of somebody's prompt.
+        """
+        self.widths.clear()
+        self.positions.clear()
+
 
 def test_a_long_prefill_lets_the_batch_decode_between_its_chunks():
     """The point of the chunk. Unchunked, every running sequence waits out the
     whole prompt, and sees the wait as one gap between two of its tokens."""
     model = _Recording()
     scheduler = _scheduler(model=model, prefill_chunk=2)
+    scheduler.start()
+    model.forget()
     running = _request(5, tokens=48)
     try:
         scheduler.submit(running)
@@ -446,6 +457,8 @@ def test_a_stepped_prefill_row_writes_where_its_next_chunk_writes():
     """
     model = _Recording()
     scheduler = _scheduler(model=model, prefill_chunk=2)
+    scheduler.start()
+    model.forget()
     neighbours = [_request(i + 1, tokens=48) for i in range(3)]
     streams = []
     try:

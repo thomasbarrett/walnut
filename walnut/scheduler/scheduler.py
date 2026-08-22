@@ -139,6 +139,7 @@ class Scheduler:
         if self.compile:
             mode = "max-autotune-no-cudagraphs" if self.autotune else None
             self.decode_forward = torch.compile(self.model, mode=mode)
+        self._warm_prefill()
         if self.cuda_graph:
             # No snapshot: the pool is empty at this point and every row is
             # reset before a sequence takes it, so there is nothing capture
@@ -150,6 +151,36 @@ class Scheduler:
                 self.max_batch_size,
                 restore=False,
             )
+
+    def _warm_prefill(self) -> None:
+        """Run one prompt-shaped pass, so the first request does not pay for it.
+
+        `_prefill_chunk` goes through the model eagerly, and its first call is
+        where the prompt shapes get their cuBLAS handles, attention plans and
+        workspaces — a quarter of a second on a 0.8B model, which without this
+        lands on the first request's time to first token rather than on
+        start-up. Decode is already warmed twice over, by the compile above and
+        the capture below; this is the other branch.
+
+        The row goes back immediately. Nothing reads the state left behind:
+        `_begin_prefill` resets whichever row it hands out.
+        """
+        row = self.pool.reserve(self.prefill_chunk)
+        if row is None:
+            # A pool with no room to spare cannot warm a chunk it could not
+            # have run anyway. Start-up is not the place to fail over that.
+            return
+        try:
+            width = min(self.prefill_chunk, self.max_seq_len)
+            chunk = torch.zeros(1, width, dtype=torch.long, device=self.device)
+            positions = torch.arange(width, device=self.device)
+            view = self.row_views[row]
+            with torch.no_grad():
+                self.model(
+                    chunk, positions=positions, cache=view, batch=view.batch(positions)
+                )
+        finally:
+            self.pool.release(row)
 
     # -- submission --------------------------------------------------------
 
