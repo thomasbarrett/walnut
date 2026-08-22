@@ -53,14 +53,32 @@ class FusedLinear(nn.Module):
             bound = 1 / math.sqrt(self.in_features) if self.in_features > 0 else 0
             nn.init.uniform_(self.bias, -bound, bound)
 
+    def joint(self, x: torch.Tensor) -> torch.Tensor:
+        """The one matmul, unsplit: every part concatenated along the last dim.
+
+        For a consumer that would only put the parts back together -- a fused
+        kernel reading several of them -- since splitting first makes each part
+        a strided view that an opaque callee has to have copied out.
+        `offset` names where a part starts.
+        """
+        return F.linear(x, self.weight, self.bias)
+
+    def offset(self, name: str) -> int:
+        """Where ``name`` starts in `joint`'s last dimension."""
+        total = 0
+        for part, width in self.parts.items():
+            if part == name:
+                return total
+            total += width
+        raise KeyError(name)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """One matmul, then one tensor per part along the last dimension.
 
         The parts are strided views, not contiguous: reshaping one needs
         ``reshape`` rather than ``view`` unless the input is a single token.
         """
-        out = F.linear(x, self.weight, self.bias)
-        return out.split(list(self.parts.values()), dim=-1)
+        return self.joint(x).split(list(self.parts.values()), dim=-1)
 
     def extra_repr(self) -> str:
         parts = ", ".join(f"{name}={width}" for name, width in self.parts.items())

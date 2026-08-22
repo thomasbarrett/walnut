@@ -79,6 +79,18 @@ select = [
 # The benchmark harness is not here: it is `walnut.bench`, a package command.
 extra-paths = [".claude/skills/analyze-trace/scripts"]
 
+[[tool.ty.overrides]]
+# Triton's launch protocol is not expressible in the type system: `constexpr`
+# parameters are annotated as the wrapper type but passed as plain ints, and
+# `num_warps` is consumed by the launcher rather than declared by the kernel.
+# Scoped to the one module that launches kernels, so everything else still
+# gets the checks.
+include = ["walnut/layers/delta_kernel.py"]
+
+[tool.ty.overrides.rules]
+invalid-argument-type = "ignore"
+unknown-argument = "ignore"
+
 [tool.pytest.ini_options]
 # The trace-analysis scripts live with the skill that documents them, not in
 # the walnut package; they are still covered by tests.

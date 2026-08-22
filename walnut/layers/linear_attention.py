@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from walnut.cache import StateCache
+from walnut.layers import delta_kernel
 from walnut.layers.linear import FusedLinear
 
 #: Positions per chunk in `_chunked_gated_delta_rule`. The chunk's cost is
@@ -26,8 +27,12 @@ from walnut.layers.linear import FusedLinear
 #: takes `_recurrent_gated_delta_rule`.
 _CHUNK = 256
 
+#: Floor under the query/key L2 norm. Named because `delta_kernel` applies the
+#: same one and the two must not drift apart; it is not the layer norm's eps.
+_L2_EPS = 1e-6
 
-def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+
+def _l2norm(x: torch.Tensor, eps: float = _L2_EPS) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
 
@@ -300,6 +305,15 @@ class GatedDeltaNet(nn.Module):
             },
         )
 
+        # Whether the decode step has a Triton path for this shape. Fixed by
+        # the config, so it is decided once here; whether it *runs* also needs
+        # the tensors to be on CUDA, which construction does not settle.
+        self._fusable = delta_kernel.supported(
+            key_head_dim, value_head_dim, num_key_heads, num_value_heads
+        )
+        self._z_offset = self.in_proj.offset("in_proj_z")
+        self._gate_offset = self.in_proj.offset("in_proj_b")
+
     def make_cache(
         self,
         rows: int,
@@ -323,11 +337,43 @@ class GatedDeltaNet(nn.Module):
             device,
         )
 
+    def _gated(
+        self, core: torch.Tensor, z: torch.Tensor, batch: int, seq: int
+    ) -> torch.Tensor:
+        """The gated norm and out-projection both paths finish with."""
+        core = self.norm(
+            core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
+        )
+        return self.out_proj(core.reshape(batch, seq, -1))
+
     def forward(
         self, hidden_states: torch.Tensor, cache: ConvState | None = None
     ) -> torch.Tensor:
         batch, seq, _ = hidden_states.shape
         pad = self.conv_kernel_size - 1
+
+        fused = self._fusable and hidden_states.is_cuda
+        if fused and seq == 1 and cache is not None and not cache.empty:
+            # One position with state already built is the decode step, and it
+            # is the only shape where the launch count dominates: `delta_kernel`
+            # runs the whole chain in two kernels rather than ten. It reads the
+            # projection unsplit, so nothing has to be copied out for it.
+            proj = self.in_proj.joint(hidden_states)
+            core = delta_kernel.gated_delta_decode(
+                proj,
+                cache.conv,
+                self.conv1d.weight.squeeze(1),
+                self.A_log,
+                self.dt_bias,
+                cache.recurrent,
+                self.num_k_heads,
+                self.head_k_dim,
+                self._gate_offset,
+                _L2_EPS,
+            )
+            cache.primed = True
+            z = proj[..., self._z_offset : self._z_offset + self.value_dim]
+            return self._gated(core, z, batch, seq)
 
         qkv_pre, z, b, a = self.in_proj(hidden_states)
         qkv_pre = qkv_pre.transpose(1, 2)
@@ -370,7 +416,4 @@ class GatedDeltaNet(nn.Module):
         if cache is not None:
             cache.recurrent.copy_(state)
             cache.primed = True
-        core = self.norm(
-            core.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim)
-        )
-        return self.out_proj(core.reshape(batch, seq, -1))
+        return self._gated(core, z, batch, seq)
