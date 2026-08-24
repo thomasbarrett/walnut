@@ -15,7 +15,7 @@ dependencies = [
     "safetensors>=0.8.0",
     "transformers>=5.15.0",
     "typer>=0.27.1",
-    "uvicorn>=0.51.0",
+    "uvicorn>=0.52.4",
 ]
 
 # torch is variant-specific: install exactly one of these extras.
