@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.139.0",
+    "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "huggingface-hub>=1.23.0",
     "prometheus-client>=0.25.0",
