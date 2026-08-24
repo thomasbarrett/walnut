@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.139.0",
     "httpx>=0.28.1",
-    "huggingface-hub>=1.23.0",
+    "huggingface-hub>=1.28.0",
     "prometheus-client>=0.25.0",
     "prometheus-fastapi-instrumentator>=8.0.2",
     "safetensors>=0.8.0",
